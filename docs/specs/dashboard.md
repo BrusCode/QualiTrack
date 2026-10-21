@@ -11,6 +11,89 @@
 
 ## Arquitetura
 
+### Distribuição por equipe e por grupo
+
+O administrador vê **Distribuição por Equipe**, agrupada pela equipe responsável da monitoria (`team_id`). Gestores de qualidade, gestores de atendimento e monitores de qualidade veem **Distribuição por Grupo**, agrupada pelo grupo de origem do ticket (`ticket_group_team_id`) dentro das monitorias já autorizadas e filtradas para cada perfil. O nome é resolvido nos registros de `teams` com `kind = 'group'`. Registros sem grupo válido entram em **Grupo não informado**; a equipe gestora não é usada como substituta. A soma do gráfico corresponde ao total de monitorias do recorte exibido.
+
+### Volume de avaliações por agente
+
+A tabela **Avaliações por Agente** está disponível para administrador, gestores de
+qualidade e suporte e monitores de qualidade, inclusive em Customizar Dashboards.
+Usa as monitorias já filtradas e autorizadas de cada painel: o gestor de suporte
+vê suas equipes e o monitor de qualidade suas próprias avaliações.
+
+As categorias seguem as filas: pesquisa `Positiva`, `Negativa` e `Sem pesquisa`
+(proativa), independentemente da nota. Chamados filhos ficam em **Tickets filhos**;
+registros sem categoria ficam em **Sem classificação**, exibida quando necessária.
+O total soma todas essas categorias.
+Conta cada monitoria salva, ativa e com nota válida uma vez, inclusive nota zero;
+rascunhos de IA e agentes sem monitorias não entram.
+
+O seletor ordena por positivas, negativas, proativas ou total (padrão), com botão
+para alternar maior/menor primeiro. Empates usam total decrescente, nome e ID. A
+busca por agente/equipe preserva a posição no ranking; há dez agentes por página,
+e o rodapé soma todos os agentes encontrados, não apenas a página visível.
+Não há consultas extras nem alteração dos dados salvos; Supabase e MockDb usam
+o mesmo cálculo em `src/lib/agentEvaluationVolume.ts`.
+
+### Histórico de produção por monitor
+
+A tabela **Monitorias por Monitor** conta fichas persistidas por `evaluator_id`,
+com nome atual do cadastro ou nome histórico salvo. Aparece nos painéis de
+administrador e gestor de qualidade com os registros autorizados pelos filtros;
+no painel de qualidade recebe apenas as monitorias do próprio monitor.
+Não aparece nos painéis de suporte ou gestor de suporte para preservar a identidade
+do auditor nesses contextos.
+
+Conta registros ativos uma vez por ID, independentemente da nota ou do andamento:
+nota zero, nota ausente e monitorias pendentes continuam representando fichas criadas.
+Rascunhos de IA não entram. Os filtros atuais de período, equipe, agente, auditor e
+status do dashboard delimitam o histórico; a tabela não limita os dados aos registros recentes.
+
+As colunas **Manuais**, **Por IA** e **Total** distinguem a criação automática
+atribuída ao responsável das fichas criadas manualmente. A identificação por IA usa
+`form_snapshot.automation = positive_csat` ou `ai_evaluation.automatic_positive`;
+conclusão automática por SLA não é confundida com criação por IA. Ordena por total,
+permite inverter a ordem e buscar nome, mantendo o total geral dos filtros no rodapé.
+Supabase e MockDb compartilham o cálculo em `src/lib/auditorEvaluationVolume.ts`,
+sem novas consultas nem alterações nas monitorias salvas.
+
+### Positivas com nota baixa e zeradas por erro crítico
+
+Somente administrador e gestor de qualidade dispõem dos painéis **CSAT positivo ·
+nota abaixo de 75%** e **CSAT positivo · zero por erro crítico**, inclusive no catálogo
+de customização. Recebem as monitorias salvas já autorizadas e filtradas pelo dashboard;
+não consultam rascunhos de IA nem a fila automática. Registros inativos, notas ausentes,
+inválidas ou pesquisas diferentes de `Positiva` ficam fora.
+
+O primeiro lista notas de zero até abaixo de 75%; exatamente 75% não entra. O segundo
+é um subconjunto: nota exatamente zero **e** erro crítico selecionado, flag crítica
+verdadeira no parecer de IA salvo ou pergunta crítica respondida `NAO`. Nota zero sozinha
+não comprova erro crítico. A definição histórica da ficha prevalece sobre a ficha atual.
+
+Cada painel mostra quantidade de tickets e monitorias, agente, nota, motivo crítico e
+observação quando disponíveis, situação real da monitoria e data de criação. Busca por
+ticket/agente/erro e paginação de dez registros não alteram os filtros globais. **Ver
+monitoria** usa o evento interno `qualitrack:focus_monitoria`, sem publicar no Zendesk.
+
+### Ranking de suporte: participação e média
+
+Os rankings **Melhores Suporte** e **Maiores Ofensores** usam a participação do agente
+no total de monitorias do recorte: `índice positivo = (n do agente / n total) × média real`.
+Para os piores, `índice de perdas = (n do agente / n total) × (100 − média real)`;
+assim uma falha isolada não pesa mais do que falhas repetidas. A média real define
+quem está acima ou abaixo da meta, e o índice ordena cada grupo. Média e quantidade
+continuam visíveis; notas originais não são alteradas.
+
+Ao selecionar uma equipe, o denominador contém apenas suas monitorias. No filtro
+**Geral**, inclui todas as equipes autorizadas ao perfil. O filtro de agente restringe
+quem aparece, sem reduzir o denominador; período, auditor, ficha, status e canal
+restringem ambos. O supervisor de atendimento usa somente as equipes vinculadas,
+também no filtro Geral. Monitorias inativas e notas ausentes ou não finitas não entram;
+zero é nota válida. Empates usam quantidade, nome e ID. O arredondamento ocorre só
+na apresentação. O dashboard busca todas as páginas do histórico para não truncar
+o denominador no limite padrão do Supabase.
+
 ```
 DashboardMain
 ├── DashboardProvider (Context + Realtime)
@@ -24,6 +107,29 @@ DashboardMain
 ```
 
 ## DashboardContext
+
+A tabela **Decisões dos Gestores de Atendimento** está disponível para administrador, gestor da qualidade, monitor da qualidade e gestor de atendimento, além de **Customizar Dashboards**. O gestor de atendimento vê apenas decisões das monitorias das equipes vinculadas a ele; os perfis da qualidade e o administrador veem o histórico geral. A restrição do gestor é aplicada na consulta, na tabela e na política de leitura do banco. A tabela filtra por ticket/agente/equipe, tipo de decisão e gestor, com paginação. Na prévia de personalização, o gestor vê uma amostra de uma equipe; os demais perfis veem duas decisões ilustrativas.
+
+A tabela **Erros Críticos por Agente** está disponível nesses mesmos perfis. Ela ordena agentes por quantidade de ocorrências nas monitorias filtradas, separa monitorias afetadas do total avaliado e permite filtrar por tipo de erro, buscar agente/ticket/erro e abrir cada avaliação. Conta questões críticas com resposta `NAO` e erros críticos selecionados separadamente, sem duplicar o mesmo ID na mesma monitoria. O texto é lido do `form_snapshot` quando disponível, preservando a descrição usada na avaliação. Nota zero por si só não é classificada como erro crítico. A prévia em **Customizar Dashboards** usa dados ilustrativos e mostra apenas uma equipe para o gestor de atendimento.
+
+Para monitorias, `team_id` representa a equipe principal do agente avaliado e
+determina o gestor de suporte que pode ver a monitoria e as metricas em que ela
+conta. `ticket_group_team_id` preserva o grupo original do ticket Zendesk. Assim,
+um agente da equipe PJ atendendo um ticket de Escala conta para PJ e permanece
+visivel apenas aos gestores vinculados a PJ. Se a equipe principal do agente
+mudar, as monitorias existentes acompanham a nova equipe gestora.
+
+## Personalização por cargo
+
+O dashboard e a prévia de personalização usam a mesma grade responsiva, mesmo sem configuração salva. A grade respeita a ordem configurada e encaixa cards pequenos nos espaços ao lado dos gráficos. Gráficos de distribuição e rosca usam dois módulos de altura (280 px); gráficos de linha, barras e listas usam três (380 px). Gráficos comuns ocupam duas colunas, enquanto gráficos amplos e tabelas ocupam a largura inteira. A quantidade de colunas depende da largura do painel: uma em telas estreitas, duas a partir de 640 px e quatro a partir de 1000 px. Itens ocultos não reservam espaço. A prévia usa valores simulados, mas preserva a mesma ordem e distribuição do dashboard real.
+
+Em **Customizar Dashboards**, o administrador seleciona um dos cinco cargos e define quais cards, gráficos e tabelas aparecem. Na própria prévia, cada card pode ser arrastado para outra posição ou movido e removido pelos botões da barra superior. A lista completa começa recolhida para deixar a prévia acessível e oferece as mesmas ações; itens retirados ficam em **Disponíveis para adicionar**. **Restaurar ordem** devolve a disposição original. A prévia e o dashboard real consomem a mesma configuração.
+
+Os gráficos de linha de **Performance Histórica** e **Evolução** acompanham a escala selecionada: Dia mostra pontos diários (30 dias), Mês mostra um ponto por mês (12 meses) e Ano mostra pontos anuais (5 anos), sempre até a data selecionada. Os filtros de equipe, agente, auditor, formulário, status e canal continuam aplicados. Performance Histórica mantém as séries de médias global, positivas (nota >= 75%) e negativas (nota < 75%); períodos sem uma categoria não exibem ponto naquela série.
+
+Os botões **Diagnóstico de Causa Raiz** e **Relatório Executivo (PDF)** têm controles de visibilidade independentes por cargo. O cargo `suporte` não tem acesso a essas ações, independentemente da configuração visual.
+
+O catálogo de widgets e a ordem estão em `src/lib/dashboardLayout.ts`; a configuração fica em `quality_configs.config.dashboardLayouts` e `dashboardHiddenActions` (ou MockDb em desenvolvimento). Os IDs usam tipo e título original do widget, de modo que mudar uma descrição explicativa não altera a disposição.
 
 Centraliza dados e filtros para todos os dashboards.
 
@@ -47,8 +153,8 @@ Centraliza dados e filtros para todos os dashboards.
 ### Filtros
 ```typescript
 interface DashboardFilters {
-  startDate: string;  // Default: 30 dias atrás
-  endDate: string;    // Default: hoje
+  startDate: string;  // Default: primeiro dia do mês atual
+  endDate: string;    // Default: último dia do mês atual
   teamId: string;
   agentId: string;
   auditorId: string;
@@ -90,6 +196,8 @@ interface DashboardFilters {
 | `RankingWidget` | Ranking de top/bottom performers | Por categoria | Via prop `accent` → `getIconBg()` |
 | `OfensoresChart` | Critérios mais descumpridos | `AlertOctagon` | `text-functional-error` |
 | `RecentAuditsTable` | Tabela de monitorias recentes | `ClipboardList` | `text-brand-muted` |
+| `ManagerDecisionHistoryTable` | Decisões de gestores, com acesso por equipe | `History` | `text-brand-highlight` |
+| `CriticalErrorsTable` | Ranking de agentes e avaliações com erro crítico | `AlertOctagon` | `text-functional-error` |
 | `ActionDeadlineWidget` | Status de prazo de ação | `Clock` | `text-functional-warning` |
 
 ### `getIconBg()` Map
@@ -119,6 +227,8 @@ Mapeia automaticamente classes `text-*` → `bg-icon-*`:
 > Todos os ícones: tamanho `w-5 h-5`. Container: `w-9 h-9 rounded-xl` com classe `bg-icon-*` derivada via `getIconBg()`. NUNCA usar `bg-brand-*` para fundo de ícone (mesma cor do texto = invisível).
 
 ## Lógica de Reavaliações (History-Based)
+
+No painel do monitor de qualidade, **Total Reav. Recebidas** conta as monitorias do auditor com contestação ou solicitação de reavaliação no histórico, mesmo que a decisão ainda esteja pendente. **Reav. Aprovadas** e **Reav. Recusadas** usam o desfecho final; quando a reavaliação registra `[DE x% PARA y%]`, a mudança de nota define se foi procedente. O aceite administrativo posterior do gestor não substitui esse desfecho. Falhas de modelos de IA recuperadas por fallback aparecem no filtro “Erro ou fallback” dos logs, com a sequência de tentativas e o modelo que concluiu a análise.
 Para garantir a precisão dos rankings de contestações, os widgets não dependem apenas do `status` atual da monitoria (que pode mudar), mas sim de uma varredura no `history` da monitoria em busca de termos chave:
 - **Aceitas/Procedentes:** Busca por "aceita", "procedente", "alterada".
 - **Recusadas/Improcedentes:** Busca por "negada", "recusada", "mantida", "improcedente".

@@ -1,4 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import { usePageCache } from '../hooks/usePageCache';
+import { useBackgroundRefresh } from '../hooks/useBackgroundRefresh';
+import { userCacheScope } from '../lib/pageCache';
+import { PageSkeleton } from './ui/PageSkeleton';
+import React, { useState, useEffect, useMemo } from 'react';
 import { supabase, mockDb } from '../lib/supabase';
 import { User, Team, EvaluationForm, AccessRequest } from '../types';
 import { useStaticData } from '../lib/StaticDataContext';
@@ -11,7 +15,12 @@ import {
   Sliders,
   RefreshCw,
   Calendar,
-  Target
+  Target,
+  Brain,
+  Mail,
+  RotateCcw,
+  Bell,
+  Wrench
 } from 'lucide-react';
 import { m, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
@@ -21,23 +30,103 @@ import TeamsManagement from './admin/TeamsManagement';
 import FormsManagement from './admin/FormsManagement';
 import RequestsManagement from './admin/RequestsManagement';
 import DissatisfactionFieldsManagement from './admin/DissatisfactionFieldsManagement';
+import AIHubManagement from './admin/AIHubManagement';
+import EmailConfigManagement from './admin/EmailConfigManagement';
+import RemovedMonitoriasManagement from './admin/RemovedMonitoriasManagement';
+import DeliveryDashboard from './admin/DeliveryDashboard';
+import NotificationSettingsManagement from './admin/NotificationSettingsManagement';
+import MaintenanceModeManagement from './admin/MaintenanceModeManagement';
 
-export default function AdminPanel({ user: currentUser }: { user: User | null }) {
+export type AdminSubTab = 'users' | 'teams' | 'forms' | 'requests' | 'operacao' | 'metas' | 'campos_extras' | 'ia_hub' | 'emails' | 'notifications' | 'removed_monitorias' | 'deliveries' | 'maintenance';
+
+interface TabItem {
+  key: AdminSubTab;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+}
+
+const ALL_ADMIN_TABS: TabItem[] = [
+  { key: 'users', label: 'Usuários', icon: Users },
+  { key: 'teams', label: 'Equipes', icon: Shield },
+  { key: 'forms', label: 'Formulários', icon: ClipboardList },
+  { key: 'requests', label: 'Solicitações', icon: UserPlus },
+  { key: 'operacao', label: 'Operação', icon: Calendar },
+  { key: 'metas', label: 'Metas', icon: Target },
+  { key: 'campos_extras', label: 'Campos Extras', icon: Sliders },
+  { key: 'ia_hub', label: 'Inteligência Artificial', icon: Brain },
+  { key: 'emails', label: 'E-mails & Disparos', icon: Mail },
+  { key: 'notifications', label: 'Notificações', icon: Bell },
+  { key: 'removed_monitorias', label: 'Monitorias removidas', icon: RotateCcw },
+  { key: 'deliveries', label: 'Entregas Zendesk', icon: BarChart3 },
+  { key: 'maintenance', label: 'Manutenção', icon: Wrench },
+];
+
+function getAvailableTabs(role?: string): TabItem[] {
+  if (role === 'admin') return ALL_ADMIN_TABS;
+  if (role === 'gestor_qualidade') {
+    return ALL_ADMIN_TABS.filter(t => ['teams', 'forms', 'campos_extras', 'ia_hub', 'emails'].includes(t.key));
+  }
+  if (role === 'qualidade') {
+    return ALL_ADMIN_TABS.filter(t => ['teams', 'forms', 'campos_extras', 'ia_hub'].includes(t.key));
+  }
+  if (role === 'gestor_suporte') {
+    return ALL_ADMIN_TABS.filter(t => t.key === 'teams');
+  }
+  return [];
+}
+
+interface AdminPanelProps {
+  user: User | null;
+  initialSubTab?: AdminSubTab;
+}
+
+export default function AdminPanel({ user: currentUser, initialSubTab }: AdminPanelProps) {
   const staticData = useStaticData();
-  const [activeSubTab, setActiveSubTab] = useState<'users' | 'teams' | 'forms' | 'requests' | 'operacao' | 'metas' | 'campos_extras'>('users');
-  const [requests, setRequests] = useState<AccessRequest[]>([]);
-  const [loading, setLoading] = useState(true);
+  const availableTabs = useMemo(() => getAvailableTabs(currentUser?.role), [currentUser?.role]);
+  const [activeSubTab, setActiveSubTab] = useState<AdminSubTab>(() => {
+    if (initialSubTab && getAvailableTabs(currentUser?.role).some(t => t.key === initialSubTab)) {
+      return initialSubTab;
+    }
+    const tabs = getAvailableTabs(currentUser?.role);
+    return tabs[0]?.key || 'users';
+  });
+  const cache = usePageCache<AccessRequest[]>(userCacheScope(currentUser), 'access-requests');
+  const [requests, setRequests] = useState<AccessRequest[]>(() => cache.initial ?? []);
+  const [loading, setLoading] = useState(cache.initial === undefined);
+
+  useEffect(() => {
+    if (initialSubTab && availableTabs.some(t => t.key === initialSubTab)) {
+      setActiveSubTab(initialSubTab);
+    }
+  }, [initialSubTab, availableTabs]);
+
+  useEffect(() => {
+    const handleSwitchSubTab = (e: any) => {
+      const target = e.detail?.subTab as AdminSubTab;
+      if (target && availableTabs.some(t => t.key === target)) {
+        setActiveSubTab(target);
+      }
+    };
+    window.addEventListener('qualitrack:switch_admin_subtab', handleSwitchSubTab);
+    return () => window.removeEventListener('qualitrack:switch_admin_subtab', handleSwitchSubTab);
+  }, [availableTabs]);
+
+  useEffect(() => {
+    if (!availableTabs.some(t => t.key === activeSubTab)) {
+      setActiveSubTab(availableTabs[0]?.key || 'users');
+    }
+  }, [availableTabs, activeSubTab]);
 
   const loadRequests = async () => {
     setLoading(true);
     try {
       if (!supabase) {
         const { data } = await mockDb.get('access_requests');
-        setRequests(data || []);
+        if (cache.isCurrent()) { setRequests(data || []); cache.write(data || []); }
       } else {
         try {
           const { data: r, error: re } = await supabase.from('access_requests').select('*').order('created_at', { ascending: false });
-          if (!re && r) setRequests(r);
+          if (!re && r && cache.isCurrent()) { setRequests(r); cache.write(r); }
         } catch (e) {
           console.warn('[Admin] Falha ao carregar solicitações de acesso.');
         }
@@ -83,37 +172,29 @@ export default function AdminPanel({ user: currentUser }: { user: User | null })
     loadRequests();
   }, []);
 
+  useBackgroundRefresh(loadRequests, currentUser?.role === 'admin');
+
   if (staticData.loading && loading) {
     return (
-      <div className="flex items-center justify-center min-h-[400px]">
-        <RefreshCw className="w-8 h-8 animate-spin text-brand-primary" />
-      </div>
+      <PageSkeleton />
     );
   }
 
   return (
     <div className="space-y-6 animate-fade-in">
       <div className="flex items-center gap-6 border-b border-slate-200 dark:border-slate-800 w-full overflow-x-auto no-scrollbar pb-0">
-        {[
-          { key: 'users', label: 'Usuários', icon: Users },
-          { key: 'teams', label: 'Equipes', icon: Shield },
-          { key: 'forms', label: 'Formulários', icon: ClipboardList },
-          { key: 'requests', label: 'Solicitações', icon: UserPlus },
-          { key: 'operacao', label: 'Operação', icon: Calendar },
-          { key: 'metas', label: 'Metas', icon: Target },
-          { key: 'campos_extras', label: 'Campos Extras', icon: Sliders },
-        ].map((item) => {
+        {availableTabs.map((item) => {
           const Icon = item.icon;
           const active = activeSubTab === item.key;
           return (
             <button
               key={item.key}
-              onClick={() => setActiveSubTab(item.key as any)}
+              onClick={() => setActiveSubTab(item.key)}
               className={`
               flex items-center gap-2 px-1 pb-3 text-sm transition-colors duration-200 -mb-px border-b-2
               ${active
-                ? 'text-slate-900 dark:text-white font-semibold border-slate-900 dark:border-white'
-                : 'text-slate-400 hover:text-slate-600 dark:text-zinc-400 dark:hover:text-zinc-200 border-transparent font-medium'}
+                ? 'text-black dark:text-white font-bold border-black dark:border-white'
+                : 'text-slate-800 hover:text-black dark:text-zinc-400 dark:hover:text-zinc-200 border-transparent font-semibold'}
             `}
             >
               <Icon className="w-4 h-4" />
@@ -132,12 +213,20 @@ export default function AdminPanel({ user: currentUser }: { user: User | null })
           transition={{ duration: 0.2 }}
         >
           {activeSubTab === 'users' && <UsersManagement users={staticData.users} teams={staticData.teams} loadData={loadAllData} />}
-          {activeSubTab === 'teams' && <TeamsManagement teams={staticData.teams} users={staticData.users} loadData={loadAllData} />}
+          {activeSubTab === 'teams' && <TeamsManagement teams={staticData.teams} groups={staticData.groups} teamGroups={staticData.teamGroups} users={staticData.users} loadData={loadAllData} currentUser={currentUser} />}
           {activeSubTab === 'forms' && <FormsManagement currentUser={currentUser} teams={staticData.teams} loadData={loadAllData} />}
           {activeSubTab === 'requests' && <RequestsManagement requests={requests} users={staticData.users} teams={staticData.teams} loadData={loadAllData} />}
           {activeSubTab === 'operacao' && <QualityConfigManagement mode="operacao" />}
           {activeSubTab === 'metas' && <QualityConfigManagement mode="metas" />}
           {activeSubTab === 'campos_extras' && <DissatisfactionFieldsManagement forms={staticData.forms} />}
+          {activeSubTab === 'ia_hub' && <AIHubManagement currentUser={currentUser} />}
+          {activeSubTab === 'emails' && <EmailConfigManagement />}
+          {activeSubTab === 'notifications' && currentUser?.role === 'admin' && (
+            <NotificationSettingsManagement currentUser={currentUser} />
+          )}
+          {activeSubTab === 'removed_monitorias' && currentUser?.role === 'admin' && <RemovedMonitoriasManagement currentUser={currentUser} />}
+          {activeSubTab === 'deliveries' && currentUser?.role === 'admin' && <DeliveryDashboard />}
+          {activeSubTab === 'maintenance' && currentUser?.role === 'admin' && currentUser && <MaintenanceModeManagement currentUser={currentUser} />}
         </m.div>
       </AnimatePresence>
     </div>

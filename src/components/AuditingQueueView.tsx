@@ -1,0 +1,4299 @@
+import { usePageCache } from '../hooks/usePageCache';
+import { useBackgroundRefresh } from '../hooks/useBackgroundRefresh';
+import { userCacheScope } from '../lib/pageCache';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { createPortal } from 'react-dom';
+import {
+  AuditingQueueType,
+  QueueSubTab,
+  AuditingQueueTicket,
+  AgentQueueSummary,
+  TicketCommentMessage,
+  AIEvaluationResult,
+  AIEvaluationGuideline,
+  ChildTicketAiEvaluation,
+  ChildTicketMacroType,
+  User,
+  Monitoria,
+  EvaluationForm,
+  Team,
+} from '../types';
+import {
+  fetchQueueTickets,
+  fetchQueueReconciliation,
+  type QueueReconciliation,
+  computeAgentQueuePriorities,
+  evaluateTicketWithAI,
+  evaluateChildTicketWithAI,
+  fetchTicketDialogue,
+  normalizeChannel,
+  csatStatusToSatisfactionResult,
+  resolveCustomerType,
+  resolveFormAndGuidelineForCustomerType,
+} from '../lib/helpdeskQueue';
+import { getDialogueCategory, normalizeTicketDialogue } from '../lib/zendeskChatParser';
+import { matchesQueueSearchText, normalizeQueueSearchText } from '../lib/queueSearchText';
+import { formatTicketDateTime, toTicketDateInput } from '../lib/ticketDateTime';
+import { useQueueUpdateNotice } from '../hooks/useQueueUpdateNotice';
+import { fetchAIGuidelines, DEFAULT_CHILD_TICKET_GUIDELINE } from '../lib/aiGuidelines';
+import { fetchAIDrafts, fetchOpenAIDrafts, saveAIDraft, deleteAIDraft, removeAIDraft, AIEvaluationDraft } from '../lib/aiDrafts';
+import { claimAIJob, completeAIJob, failAIJob, cancelAIJob, fetchAIJobs, AIEvaluationJob } from '../lib/aiJobs';
+import { fetchPositiveAutomation, mergePositiveAutomation, positiveAutomationLabel } from '../lib/positiveAutomation';
+import { activeMonitoriaTicketIds } from '../lib/activeMonitoriaTickets';
+import {
+  AlertTriangle,
+  Sparkles,
+  CheckCircle2,
+  XCircle,
+  Clock,
+  Activity,
+  Users,
+  User as UserIcon,
+  Tag,
+  ExternalLink,
+  RefreshCw,
+  Search,
+  Bot,
+  Zap,
+  ArrowRight,
+  ShieldCheck,
+  Check,
+  X,
+  BookOpen,
+  Rocket,
+  ChevronLeft,
+  ChevronRight,
+  ChevronDown,
+  SlidersHorizontal,
+  Lock,
+  FileText,
+  GitFork,
+  AlertOctagon,
+  ListChecks,
+  CheckSquare,
+  Eye,
+  MessageSquare,
+  UserCog,
+  Trash2,
+  Hash,
+  Send
+} from 'lucide-react';
+import Card from './ui/Card';
+import Button from './ui/Button';
+import Badge from './ui/Badge';
+import TicketMessageBubble from './TicketMessageBubble';
+import QueueMonitorPresencePanel from './QueueMonitorPresencePanel';
+import QueueMonitorFilter from './QueueMonitorFilter';
+import QueueMonitorAssignmentModal from './QueueMonitorAssignmentModal';
+import QueueAIProgress from './QueueAIProgress';
+import { toast } from 'sonner';
+import { isMockMode, supabase } from '../lib/supabase';
+import {
+  isDistributedQueue,
+  canManageQueueAssignments,
+  fetchMonitorEligibility,
+  setMonitorEligibility as saveMonitorEligibility,
+  fetchQueueAssignments,
+  QueueAssignment,
+  reassignQueueTicket,
+  releaseQueueTicketAssignment,
+  startQueueTicketAssignment,
+  startChildTicketNewEvaluation,
+} from '../lib/queueDistribution';
+import { usePresence } from '../providers/PresenceProvider';
+import { matchesAssignedMonitor } from '../lib/queueMonitorFilter';
+import { calculateAIEvaluationScore, describeAICriticalScore } from '../utils/aiEvaluationScore';
+import { resolveTicketTeamId } from '../lib/ticketTeam';
+import { canAuditTickets } from '../lib/auditPermissions';
+import { getEvaluationOutcome } from '../lib/domainRules';
+import { CHILD_TICKET_FORM_ID, childTicketForm } from '../lib/childTicketForm';
+import HelpdeskSendModal from './HelpdeskSendModal';
+import ChildTicketMonitoriaAction from './ChildTicketMonitoriaAction';
+import ChildTicketReevaluateAction from './ChildTicketReevaluateAction';
+import QueueWithoutMonitoriaFilter from './QueueWithoutMonitoriaFilter';
+
+const PUBLISHABLE_HELPDESK_STATUSES = new Set(['pendente_revisao', 'concluida', 'contestacao_aceita', 'contestacao_negada', 'finalizada_alterada']);
+const MONITORIA_STAGE_LABELS: Record<string, string> = {
+  pendente_revisao: 'Em revisão',
+  em_contestacao: 'Em contestação',
+  aguardando_gestor_suporte: 'Aguardando gestor de suporte',
+  aguardando_revisao_pj: 'Aguardando revisão PJ',
+  aguardando_gestor_qualidade: 'Aguardando gestor de qualidade',
+  concluida: 'Concluída',
+  contestacao_aceita: 'Contestação aceita',
+  contestacao_negada: 'Contestação negada',
+  finalizada_alterada: 'Finalizada com alteração',
+  reavaliacao_solicitada: 'Reavaliação solicitada',
+};
+
+interface AuditingQueueViewProps {
+  agents: User[];
+  teams: Team[];
+  forms: EvaluationForm[];
+  guidelines?: AIEvaluationGuideline[];
+  monitorias: Monitoria[];
+  currentUserId?: string;
+  /** Papel do usuário logado — controla o filtro "só meus chamados" e o painel de presença. */
+  currentUserRole?: string;
+  /** Monitores de qualidade (role 'qualidade'), usados na distribuição 1-para-1 e no painel de presença do supervisor. */
+  qualityMonitors?: User[];
+  onStartAudit: (prefill: {
+    ticket_id: string;
+    ticket_subject?: string;
+    form_id?: string;
+    evaluated_id?: string;
+    team_id?: string;
+    ticket_group_team_id?: string;
+    group_name?: string;
+    channel?: string;
+    ticket_date?: string;
+    satisfaction_result?: string;
+    satisfaction_has_record?: boolean;
+    satisfaction_record_text?: string;
+    aiEvaluation?: AIEvaluationResult;
+    child_evaluation?: ChildTicketAiEvaluation;
+    ticket_fields?: { title: string; value: string }[];
+    isAiLocked?: boolean;
+    customerType?: string;
+    specializedTeamLabel?: string;
+    dialogue?: TicketCommentMessage[];
+    queue_assignment?: { ticket_id: string; queue_type: 'negativas' | 'filhos' };
+  }) => void;
+  onOpenExistingMonitoria?: (monitoriaId: string) => void;
+  onModalStateChange?: (isOpen: boolean) => void;
+  activeSubTab?: QueueSubTab;
+  onSubTabChange?: (tab: QueueSubTab) => void;
+  onPendingNegativesCountChange?: (count: number) => void;
+}
+
+// Gerenciador global de tickets atualmente em avaliação pela IA (persiste mesmo ao alternar abas/telas)
+const globalEvaluatingTickets = new Set<string>();
+const cancelledAIJobIds = new Set<string>();
+const globalEvaluatingListeners = new Set<() => void>();
+
+function notifyGlobalEvaluating() {
+  globalEvaluatingListeners.forEach(fn => {
+    try { fn(); } catch {}
+  });
+}
+
+export default function AuditingQueueView({
+  agents,
+  teams,
+  forms,
+  guidelines,
+  monitorias,
+  currentUserId,
+  currentUserRole,
+  qualityMonitors = [],
+  onStartAudit,
+  onOpenExistingMonitoria,
+  onModalStateChange,
+  activeSubTab = 'negativas',
+  onSubTabChange,
+  onPendingNegativesCountChange,
+}: AuditingQueueViewProps) {
+  const currentSubTab: QueueSubTab = activeSubTab || 'negativas';
+  const [activeQueue, setActiveQueue] = useState<AuditingQueueType>(() => (
+    activeSubTab && activeSubTab !== 'monitores' ? activeSubTab : 'negativas'
+  ));
+  const isSupervisorView = canManageQueueAssignments(currentUserRole);
+  const canAudit = canAuditTickets(currentUserRole);
+  const activeChildGuideline = guidelines?.find(guideline => guideline.active && /filho/i.test(guideline.title))
+    || DEFAULT_CHILD_TICKET_GUIDELINE;
+  const [reconciliation, setReconciliation] = useState<QueueReconciliation | null>(null);
+  const [reconciliationLoading, setReconciliationLoading] = useState(false);
+  const [reconciliationError, setReconciliationError] = useState(false);
+  const [reconciliationRefreshKey, setReconciliationRefreshKey] = useState(0);
+
+  useEffect(() => {
+    if (currentSubTab === 'monitores' || currentUserRole === 'gestor_suporte') return;
+    let cancelled = false;
+    setReconciliation(null);
+    setReconciliationError(false);
+    const refresh = async () => {
+      setReconciliationLoading(true);
+      try {
+        const result = await fetchQueueReconciliation(activeQueue, monitorias);
+        if (!cancelled) { setReconciliation(result); setReconciliationError(false); }
+      } catch (error) {
+        if (!cancelled) { setReconciliationError(true); console.warn('[AuditingQueue] Falha na conciliação da view:', error); }
+      } finally {
+        if (!cancelled) setReconciliationLoading(false);
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 300_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [activeQueue, currentSubTab, currentUserRole, reconciliationRefreshKey, monitorias]);
+
+  // Redireciona monitores comuns para fora da sub-aba de supervisão
+  useEffect(() => {
+    if (activeSubTab === 'monitores' && !isSupervisorView) {
+      onSubTabChange?.('negativas');
+    }
+  }, [activeSubTab, isSupervisorView, onSubTabChange]);
+
+  // Sincroniza activeQueue quando activeSubTab muda a partir da sidebar
+  useEffect(() => {
+    if (activeSubTab && activeSubTab !== 'monitores' && activeSubTab !== activeQueue) {
+      setActiveQueue(activeSubTab);
+    }
+  }, [activeSubTab, activeQueue]);
+  const { onlineUsers } = usePresence();
+  const onlineUserIds = useMemo(() => new Set(onlineUsers.map(user => user.id)), [onlineUsers]);
+  const onlineMonitorKey = useMemo(
+    () => qualityMonitors.filter(monitor => onlineUserIds.has(monitor.id)).map(monitor => monitor.id).sort().join(','),
+    [qualityMonitors, onlineUserIds]
+  );
+  // Distribuição 1-para-1: a habilitação manual do monitor é independente
+  // da presença de login compartilhada; o banco exige as duas condições.
+  const [monitorEligibility, setMonitorEligibility] = useState<Record<string, boolean>>({});
+  const eligibleOnlineMonitors = useMemo(
+    () => qualityMonitors.filter(monitor => monitorEligibility[monitor.id] && onlineUserIds.has(monitor.id)),
+    [qualityMonitors, monitorEligibility, onlineUserIds]
+  );
+  const [assignmentsReady, setAssignmentsReady] = useState<Record<AuditingQueueType, boolean>>({
+    negativas: false,
+    proativas: true,
+    positivas: true,
+    filhos: false,
+    filhos_invalidos: true,
+  });
+  const [queueAssignments, setQueueAssignments] = useState<Record<AuditingQueueType, Record<string, QueueAssignment>>>({
+    negativas: {},
+    proativas: {},
+    positivas: {},
+    filhos: {},
+    filhos_invalidos: {},
+  });
+  const [assignmentModalTicket, setAssignmentModalTicket] = useState<AuditingQueueTicket | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchMonitorEligibility().then(map => { if (!cancelled) setMonitorEligibility(map); });
+
+    if (!supabase) return;
+    const channel = supabase
+      .channel(`queue-distribution-${Math.random().toString(36).slice(2, 9)}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'quality_monitor_presence' }, () => {
+        fetchMonitorEligibility().then(map => { if (!cancelled) setMonitorEligibility(map); });
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'queue_ticket_assignments' }, (payload: any) => {
+        const row = (payload.new || payload.old) as QueueAssignment | undefined;
+        if (!row?.queue_type) return;
+        setQueueAssignments(prev => {
+          const forQueue = { ...prev[row.queue_type as AuditingQueueType] };
+          if (payload.eventType === 'DELETE') {
+            delete forQueue[row.ticket_id];
+          } else {
+            forQueue[row.ticket_id] = row;
+          }
+          return { ...prev, [row.queue_type as AuditingQueueType]: forQueue };
+        });
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'ai_evaluation_jobs' }, (payload: any) => {
+        const job = payload.new as AIEvaluationJob | undefined;
+        if (!job?.ticket_id) return;
+        setAIJobs(previous => ({ ...previous, [job.ticket_id]: job }));
+
+        if (job.status === 'completed' && job.evaluation_type === 'chamado_filho' && job.result) {
+          setTickets(previous => previous.map(ticket => ticket.ticket_id === job.ticket_id
+            ? { ...ticket, child_evaluation: job.result as ChildTicketAiEvaluation } : ticket));
+        }
+        if (job.status === 'completed' && job.evaluation_type === 'atendimento') {
+          fetchAIDrafts([job.ticket_id]).then(found => {
+            if (!cancelled && found[job.ticket_id]) setDrafts(previous => ({ ...previous, ...found }));
+          });
+        }
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'ai_evaluation_drafts' }, (payload: any) => {
+        const draft = payload.new as AIEvaluationDraft | undefined;
+        if (payload.eventType === 'DELETE') {
+          const removed = payload.old as Partial<AIEvaluationDraft>;
+          setDrafts(previous => Object.fromEntries(Object.entries(previous)
+            .filter(([ticketId, entry]) => ticketId !== removed.ticket_id && entry.id !== removed.id)));
+          return;
+        }
+        if (draft?.ticket_id) setDrafts(previous => ({ ...previous, [draft.ticket_id]: draft }));
+      })
+      .subscribe();
+
+    return () => {
+      cancelled = true;
+      supabase?.removeChannel(channel);
+    };
+  }, []);
+
+  const queueScope = JSON.stringify([currentUserId, currentUserRole,
+    userCacheScope(agents.find(agent => agent.id === currentUserId)), teams.map(team => team.id).sort()]);
+  const queueCache = usePageCache<{
+    tickets: AuditingQueueTicket[]; drafts: Record<string, AIEvaluationDraft>;
+    nextCursor: string | null; hasMore: boolean;
+  }>(queueScope, `queue:${activeQueue}`);
+  const visibleRequest = useRef('');
+  const [loading, setLoading] = useState(false);
+  const [tickets, setTickets] = useState<AuditingQueueTicket[]>(() => queueCache.initial?.tickets ?? []);
+  const [helpdeskTicket, setHelpdeskTicket] = useState<AuditingQueueTicket | null>(null);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [selectedAgentFilter, setSelectedAgentFilter] = useState('');
+  const [selectedMonitorFilter, setSelectedMonitorFilter] = useState('');
+
+  // Aguarda a digitação antes de pesquisar todas as páginas da view no Zendesk.
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(searchTerm.trim());
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [searchTerm]);
+
+  // Estado para modal/visualização rápida de IA
+  const [evaluatingTicketId, setEvaluatingTicketId] = useState<string | null>(null);
+  const [aiProgress, setAiProgress] = useState<Record<string, 1 | 2 | 3>>({});
+  const [aiFeedback, setAiFeedback] = useState<Record<string, string>>({});
+  const setTicketProgress = (ticketId: string, step: 1 | 2 | 3) =>
+    setAiProgress(previous => ({ ...previous, [ticketId]: step }));
+  const clearTicketProgress = (ticketId: string) => setAiProgress(previous => {
+    const next = { ...previous };
+    delete next[ticketId];
+    return next;
+  });
+
+  // Escuta mudanças nas avaliações globais que continuam rodando ao trocar de aba
+  const [, setGlobalEvalTick] = useState(0);
+  useEffect(() => {
+    const handleUpdate = () => setGlobalEvalTick(t => t + 1);
+    globalEvaluatingListeners.add(handleUpdate);
+    return () => {
+      globalEvaluatingListeners.delete(handleUpdate);
+    };
+  }, []);
+
+  const isEvaluatingTicket = (ticketId: string) =>
+    globalEvaluatingTickets.has(ticketId) || evaluatingTicketId === ticketId || aiJobs[ticketId]?.status === 'running';
+
+  const ticketProgressStep = (ticketId: string): 1 | 2 | 3 =>
+    aiProgress[ticketId] || (aiJobs[ticketId]?.phase === 'pending' ? 1 : 2);
+
+  const canCancelAIJob = (ticketId: string) => {
+    const job = aiJobs[ticketId];
+    return job?.status === 'running' && (job.started_by === currentUserId || isSupervisorView);
+  };
+
+  const handleCancelAIJob = async (ticketId: string) => {
+    const job = aiJobs[ticketId];
+    if (!job || !canCancelAIJob(ticketId)) return;
+    try {
+      const cancelled = await cancelAIJob(ticketId, job.job_id);
+      if (!cancelled) {
+        setAiFeedback(previous => ({ ...previous, [ticketId]: 'A análise já foi concluída.' }));
+        return;
+      }
+      cancelledAIJobIds.add(job.job_id);
+      globalEvaluatingTickets.delete(ticketId);
+      notifyGlobalEvaluating();
+      setEvaluatingTicketId(previous => previous === ticketId ? null : previous);
+      clearTicketProgress(ticketId);
+      setAIJobs(previous => ({ ...previous, [ticketId]: { ...job, status: 'cancelled', phase: 'cancelled' } }));
+      setAiFeedback(previous => ({ ...previous, [ticketId]: 'Análise interrompida.' }));
+    } catch {
+      setAiFeedback(previous => ({ ...previous, [ticketId]: 'Não foi possível interromper a análise.' }));
+    }
+  };
+
+  const renderCancelAIAction = (ticketId: string) => canCancelAIJob(ticketId) ? (
+    <button type="button" onClick={() => handleCancelAIJob(ticketId)}
+      className="rounded-lg px-2 py-1.5 text-[11px] font-medium text-brand-muted transition-colors hover:bg-surface-subtle hover:text-brand-primary focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-accent/60">
+      Interromper análise
+    </button>
+  ) : null;
+
+  // Estado para auditoria de conformidade de chamados filhos
+  const [childPreviewTicket, setChildPreviewTicket] = useState<AuditingQueueTicket | null>(null);
+  const childPreviewRef = useRef<AuditingQueueTicket | null>(null);
+  childPreviewRef.current = childPreviewTicket;
+  const [validatedChildTickets, setValidatedChildTickets] = useState<Set<string>>(new Set());
+
+  // Popup de seleção do manual antes de avaliar com IA: deixa o monitor
+  // escolher qual(is) manual(is) a IA deve ler para aquele ticket em vez de
+  // sempre mandar todos os ativos — economiza tokens por chamada.
+  const [guidelineOptions, setGuidelineOptions] = useState<AIEvaluationGuideline[]>([]);
+  const [loadingGuidelines, setLoadingGuidelines] = useState(false);
+  const [guidelinePickerTicket, setGuidelinePickerTicket] = useState<AuditingQueueTicket | null>(null);
+  const [selectionOverrideEnabled, setSelectionOverrideEnabled] = useState(false);
+  const [selectedOverrideFormId, setSelectedOverrideFormId] = useState('');
+  const [selectedOverrideGuidelineIds, setSelectedOverrideGuidelineIds] = useState<string[]>([]);
+  const [selectionOverrideReason, setSelectionOverrideReason] = useState('');
+  const [childGuidelineModalTicket, setChildGuidelineModalTicket] = useState<AuditingQueueTicket | null>(null);
+  const [showFullChildManual, setShowFullChildManual] = useState(false);
+
+  // Rascunhos de avaliação da IA já prontos (persistidos), por ticket_id —
+  // evita rodar a IA de novo toda vez que o monitor volta na mesma fila.
+  const [drafts, setDrafts] = useState<Record<string, AIEvaluationDraft>>(() => queueCache.initial?.drafts ?? {});
+  useEffect(() => {
+    if (activeQueue !== 'positivas' && activeQueue !== 'filhos') return;
+    const audited = activeMonitoriaTicketIds(monitorias);
+    setTickets(previous => {
+      const retained = previous.filter(ticket => !ticket.saved_ai_draft || (drafts[ticket.ticket_id] && !audited.has(ticket.ticket_id)));
+      const existing = new Set(retained.map(ticket => ticket.ticket_id));
+      const arrived = Object.values(drafts).filter(draft => draft.source_queue === activeQueue
+        && draft.ticket_snapshot && !existing.has(draft.ticket_id) && !audited.has(draft.ticket_id))
+        .map(draft => ({ ...draft.ticket_snapshot!, ticket_id: draft.ticket_id, saved_ai_draft: true }));
+      return arrived.length || retained.length !== previous.length ? [...arrived, ...retained] : previous;
+    });
+  }, [activeQueue, drafts, monitorias]);
+  const [deletingDraftId, setDeletingDraftId] = useState<string | null>(null);
+  const [aiJobs, setAIJobs] = useState<Record<string, AIEvaluationJob>>({});
+  const childResultFor = (ticket: AuditingQueueTicket): ChildTicketAiEvaluation | undefined => {
+    const job = aiJobs[ticket.ticket_id];
+    return job?.status === 'completed' && job.evaluation_type === 'chamado_filho' && job.result
+      ? job.result as ChildTicketAiEvaluation : drafts[ticket.ticket_id]?.result.child_evaluation || ticket.child_evaluation;
+  };
+  const childAiEvaluation = childPreviewTicket ? childResultFor(childPreviewTicket) : undefined;
+  const loadingChildAi = Boolean(childPreviewTicket && isEvaluatingTicket(childPreviewTicket.ticket_id));
+
+  // Filtro de rascunhos feitos pela IA (Todos | Com Rascunho IA | Sem Rascunho IA)
+  const [aiDraftFilter, setAiDraftFilter] = useState<'all' | 'with_draft' | 'without_draft'>('all');
+  const [onlyWithoutMonitoria, setOnlyWithoutMonitoria] = useState(false);
+  const activeFiltersCount = Number(aiDraftFilter !== 'all') + Number(onlyWithoutMonitoria);
+  const [isFilterDropdownOpen, setIsFilterDropdownOpen] = useState(false);
+  const filterDropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (filterDropdownRef.current && !filterDropdownRef.current.contains(event.target as Node)) {
+        setIsFilterDropdownOpen(false);
+      }
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        setIsFilterDropdownOpen(false);
+      }
+    }
+    if (isFilterDropdownOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+      document.addEventListener('keydown', handleKeyDown);
+    }
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [isFilterDropdownOpen]);
+
+  // Seleção de tickets individuais para avaliação em lote customizada
+  const [selectedTicketIds, setSelectedTicketIds] = useState<Set<string>>(new Set());
+
+  const [showChildDialogueModal, setShowChildDialogueModal] = useState(false);
+  const [childDialogue, setChildDialogue] = useState<TicketCommentMessage[]>([]);
+  const [parentDialogue, setParentDialogue] = useState<TicketCommentMessage[]>([]);
+  const [activeChildDialogueTab, setActiveChildDialogueTab] = useState<'child' | 'parent'>('child');
+  const [loadingChildDialogue, setLoadingChildDialogue] = useState(false);
+  const [childDialogueSearch, setChildDialogueSearch] = useState('');
+  const [childDialogueFilter, setChildDialogueFilter] = useState<'all' | 'end_user' | 'agent' | 'internal'>('all');
+  const [childExpandedMsgIds, setChildExpandedMsgIds] = useState<Record<string, boolean>>({});
+
+  const toggleChildMsgExpand = (id: string | number) => {
+    setChildExpandedMsgIds(prev => ({ ...prev, [String(id)]: !prev[String(id)] }));
+  };
+
+  // Carrega e abre o diálogo do chamado filho
+  const handleOpenChildDialogue = async (tab: 'child' | 'parent' = 'child') => {
+    if (!childPreviewTicket) return;
+    setShowChildDialogueModal(true);
+    setActiveChildDialogueTab(tab);
+    setChildDialogueSearch('');
+
+    if (tab === 'child') {
+      if (childDialogue.length > 0) return;
+      if (childPreviewTicket.dialogue && childPreviewTicket.dialogue.length > 0) {
+        setChildDialogue(childPreviewTicket.dialogue);
+        return;
+      }
+      setLoadingChildDialogue(true);
+      try {
+        const res = await fetchTicketDialogue(childPreviewTicket.ticket_id);
+        const normalized = normalizeTicketDialogue(res.comments || [], childPreviewTicket.agent_name, childPreviewTicket.requester_name);
+        childPreviewTicket.dialogue = normalized;
+        if (childPreviewRef.current?.ticket_id === childPreviewTicket.ticket_id) setChildDialogue(normalized);
+      } catch (e) {
+        console.error('Erro ao buscar conversa do chamado filho:', e);
+        toast.error('Não foi possível carregar as mensagens do chamado filho.');
+      } finally {
+        if (childPreviewRef.current?.ticket_id === childPreviewTicket.ticket_id) setLoadingChildDialogue(false);
+      }
+    } else {
+      if (parentDialogue.length > 0) return;
+      if (!childPreviewTicket.parent_ticket_id) return;
+      setLoadingChildDialogue(true);
+      try {
+        const res = await fetchTicketDialogue(childPreviewTicket.parent_ticket_id);
+        const normalized = normalizeTicketDialogue(res.comments || []);
+        if (childPreviewRef.current?.ticket_id === childPreviewTicket.ticket_id) setParentDialogue(normalized);
+      } catch (e) {
+        console.error('Erro ao buscar conversa do chamado pai:', e);
+        toast.error('Não foi possível carregar as mensagens do chamado pai.');
+      } finally {
+        if (childPreviewRef.current?.ticket_id === childPreviewTicket.ticket_id) setLoadingChildDialogue(false);
+      }
+    }
+  };
+
+  const currentChildDialogueList = activeChildDialogueTab === 'child' ? childDialogue : parentDialogue;
+  const filteredChildDialogue = useMemo(() => {
+    return currentChildDialogueList.filter(msg => {
+      if (childDialogueFilter !== 'all' && getDialogueCategory(msg) !== childDialogueFilter) return false;
+      if (childDialogueSearch.trim()) {
+        const q = childDialogueSearch.toLowerCase();
+        return (msg.body || '').toLowerCase().includes(q) || (msg.author_name || '').toLowerCase().includes(q);
+      }
+      return true;
+    });
+  }, [currentChildDialogueList, childDialogueFilter, childDialogueSearch]);
+
+  // Sincroniza diálogo em cache ou limpa ao abrir/trocar childPreviewTicket
+  useEffect(() => {
+    if (childPreviewTicket?.dialogue && childPreviewTicket.dialogue.length > 0) {
+      setChildDialogue(childPreviewTicket.dialogue);
+    } else {
+      setChildDialogue([]);
+    }
+    setParentDialogue([]);
+    setLoadingChildDialogue(false);
+    setShowChildDialogueModal(false);
+  }, [childPreviewTicket?.ticket_id]);
+
+  const handleCloseChildPreview = () => {
+    childPreviewRef.current = null;
+    setChildPreviewTicket(null);
+    setShowChildDialogueModal(false);
+    setChildDialogue([]);
+    setParentDialogue([]);
+  };
+
+  // Avaliação em lote: processa todos os tickets da página atual sequencialmente.
+  interface BatchItemStatus {
+    ticket_id: string;
+    subject?: string;
+    agent_name?: string;
+    status: 'pending' | 'processing' | 'done' | 'queued' | 'error';
+  }
+
+  const [batchRunning, setBatchRunning] = useState(false);
+  const [batchMinimized, setBatchMinimized] = useState(false);
+  const batchStartingRef = useRef(false);
+  const [batchProgress, setBatchProgress] = useState<{
+    done: number;
+    queued: number;
+    errors: number;
+    total: number;
+    currentTicketId: string;
+    currentSubject?: string;
+    currentAgent?: string;
+    items: BatchItemStatus[];
+  } | null>(null);
+  const batchCancelRef = useRef(false);
+
+  useEffect(() => {
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (showChildDialogueModal) {
+        setShowChildDialogueModal(false);
+      } else if (childPreviewTicket) {
+        setChildPreviewTicket(null);
+      } else if (batchRunning) {
+        setBatchMinimized(true);
+      }
+    };
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [batchRunning, childPreviewTicket, showChildDialogueModal]);
+
+  // Notifica o container pai (App.tsx) se algum modal de prévia está aberto,
+  // para que a barra lateral se recolha automaticamente liberando espaço total da tela.
+  useEffect(() => {
+    const isAnyModalOpen = Boolean(childPreviewTicket || guidelinePickerTicket || childGuidelineModalTicket || assignmentModalTicket || helpdeskTicket);
+    onModalStateChange?.(isAnyModalOpen);
+  }, [childPreviewTicket, guidelinePickerTicket, childGuidelineModalTicket, assignmentModalTicket, helpdeskTicket, onModalStateChange]);
+
+  // Paginação: 25 tickets por página (definido no backend). Views grandes
+  // (Proativas chega a ter centenas de CSAT vazio) não cabem numa carga só
+  // sem arriscar o rate limit do Zendesk. `prevCursors` guarda o histórico
+  // pra "Página Anterior" voltar sem precisar re-buscar do zero.
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [prevCursors, setPrevCursors] = useState<(string | null)[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [pageNumber, setPageNumber] = useState(1);
+  const { hasUpdates: hasQueueUpdates, rememberPage } = useQueueUpdateNotice({
+    activeQueue,
+    enabled: currentSubTab !== 'monitores',
+    searchTerm,
+    loading,
+    batchRunning,
+  });
+
+  const teamsMap = useMemo(() => {
+    const map: Record<string, string> = {};
+    teams.forEach(t => { map[t.id] = t.name; });
+    return map;
+  }, [teams]);
+
+  // Fila balanceada de prioridade de agentes
+  const agentQueue = useMemo(() => {
+    return computeAgentQueuePriorities(agents, monitorias, teamsMap);
+  }, [agents, monitorias, teamsMap]);
+
+  // Sequência das chamadas a loadQueueData — se o auditor troca de fila
+  // antes de uma busca anterior (mais lenta, ex.: Negativas com várias
+  // páginas do Zendesk) terminar, essa resposta atrasada não pode
+  // sobrescrever os tickets da fila mais nova já carregada na tela.
+  const loadSeqRef = useRef(0);
+
+  // targetCursor: null = primeira página. Passar explicitamente (mesmo
+  // sendo null) evita reusar por engano o cursor de uma página anterior ao
+  // trocar de fila ou dar refresh.
+  const loadQueueData = async (targetCursor: string | null = null, searchOverride?: string) => {
+    const seq = ++loadSeqRef.current;
+    const queueAtCallTime = activeQueue;
+    const activeSearch = searchOverride !== undefined ? searchOverride : debouncedSearch;
+
+    const requestKey = JSON.stringify([queueAtCallTime, targetCursor, activeSearch]);
+    if (visibleRequest.current !== requestKey) {
+      const cached = targetCursor === null && !activeSearch ? queueCache.initial : undefined;
+      setTickets(cached?.tickets ?? []);
+      setDrafts(cached?.drafts ?? {});
+      setCursor(cached?.nextCursor ?? null);
+      setHasMore(cached?.hasMore ?? false);
+      visibleRequest.current = requestKey;
+    }
+    setLoading(true);
+    try {
+      const [pageResult, savedResult, automationResult] = await Promise.allSettled([
+        fetchQueueTickets(queueAtCallTime, monitorias, targetCursor, activeSearch || undefined),
+        targetCursor === null ? fetchOpenAIDrafts(queueAtCallTime) : Promise.resolve([]),
+        (queueAtCallTime === 'positivas' || queueAtCallTime === 'filhos') && targetCursor === null && canAudit ? fetchPositiveAutomation(queueAtCallTime) : Promise.resolve([]),
+      ]);
+      if (pageResult.status === 'rejected' && (!['positivas', 'filhos'].includes(queueAtCallTime) || targetCursor !== null
+        || (savedResult.status === 'rejected' && automationResult.status === 'rejected'))) throw pageResult.reason;
+      const { tickets: data, nextCursor, hasMore: more } = pageResult.status === 'fulfilled'
+        ? pageResult.value
+        : { tickets: [], nextCursor: null, hasMore: false };
+      if (pageResult.status === 'rejected') toast.error('Zendesk indisponível. Exibindo as avaliações salvas para revisão.');
+      if (savedResult.status === 'rejected') console.error('Erro ao carregar rascunhos da fila:', savedResult.reason);
+      if (automationResult.status === 'rejected') console.error('Erro ao carregar automações positivas:', automationResult.reason);
+      const saved = savedResult.status === 'fulfilled' ? savedResult.value : [];
+      const auditedIds = activeMonitoriaTicketIds(monitorias);
+      const existingIds = new Set(data.map(ticket => ticket.ticket_id));
+      const search = activeSearch?.trim();
+      const retained = saved
+        .filter(draft => !auditedIds.has(draft.ticket_id) && !existingIds.has(draft.ticket_id))
+        .map(draft => ({
+          ...(draft.ticket_snapshot || {
+            ticket_id: draft.ticket_id,
+            subject: `Ticket #${draft.ticket_id} · rascunho IA recuperado`,
+            agent_name: draft.agent_name,
+            agent_email: draft.agent_email,
+            agent_id: draft.agent_id,
+            team_id: draft.team_id,
+            channel: draft.channel,
+            csat_status: queueAtCallTime === 'positivas' ? 'good' as const : 'unrated' as const,
+            ticket_date: draft.created_at,
+            status: 'archived',
+          }),
+          ticket_id: draft.ticket_id,
+          saved_ai_draft: true,
+          draft_metadata_incomplete: !draft.ticket_snapshot || draft.ticket_snapshot.draft_metadata_incomplete,
+        }))
+        .filter(ticket => !search || matchesQueueSearchText(ticket, search));
+      // Descarta a resposta se já não for mais a busca mais recente — uma
+      // troca de fila nesse meio tempo já disparou outra chamada, com seq
+      // maior.
+      if (seq !== loadSeqRef.current || !queueCache.isCurrent()) return;
+      if (saved.length > 0) {
+        setDrafts(previous => ({ ...previous, ...Object.fromEntries(saved.map(draft => [draft.ticket_id, draft])) }));
+      }
+      const mergedTickets = (queueAtCallTime === 'positivas' || queueAtCallTime === 'filhos') && automationResult.status === 'fulfilled'
+        ? mergePositiveAutomation([...retained, ...data], automationResult.value, auditedIds, activeSearch, queueAtCallTime)
+        : [...retained, ...data];
+      if (queueAtCallTime === 'proativas') {
+        mergedTickets.sort((a, b) =>
+          (Date.parse(b.ticket_date || '') || 0) - (Date.parse(a.ticket_date || '') || 0));
+      }
+      if (targetCursor === null && !activeSearch && pageResult.status === 'fulfilled') {
+        queueCache.write({ tickets: mergedTickets,
+          drafts: Object.fromEntries(saved.map(draft => [draft.ticket_id, draft])),
+          nextCursor, hasMore: more });
+      }
+      setTickets(mergedTickets);
+      setCursor(nextCursor);
+      setHasMore(more);
+      if (targetCursor === null && !activeSearch) rememberPage(queueAtCallTime, data.map(ticket => ticket.ticket_id));
+    } catch (err) {
+      console.error('Erro ao carregar fila:', err);
+      toast.error('Não foi possível carregar a fila de chamados.');
+    } finally {
+      if (seq === loadSeqRef.current && queueCache.isCurrent()) setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if ((activeQueue !== 'positivas' && activeQueue !== 'filhos') || pageNumber !== 1 || !canAudit) return;
+    let cancelled=false;
+    const refresh = async () => {
+      try {
+        const rows=await fetchPositiveAutomation(activeQueue);
+        if (cancelled) return;
+        const audited=new Set(monitorias.filter(m=>m.active!==false).map(m=>m.ticket_id?.trim()));
+        setTickets(previous=>mergePositiveAutomation(previous,rows,audited,debouncedSearch,activeQueue));
+      } catch (error) { console.warn('Falha ao atualizar automações positivas:',error); }
+    };
+    const interval=window.setInterval(()=>void refresh(),30_000);
+    return()=>{cancelled=true;window.clearInterval(interval);};
+  }, [activeQueue,pageNumber,canAudit,monitorias,debouncedSearch]);
+
+  // Refresh only idle first pages: never move a selection or replace an open audit.
+  useBackgroundRefresh(() => loadQueueData(null),
+    currentSubTab !== 'monitores' && pageNumber === 1 && !loading && !searchTerm.trim()
+      && !batchRunning && !evaluatingTicketId && selectedTicketIds.size === 0
+      && !childPreviewTicket && !guidelinePickerTicket && !childGuidelineModalTicket
+      && !assignmentModalTicket && !helpdeskTicket);
+
+  const goToNextPage = () => {
+    if (!hasMore || !cursor) return;
+    setPrevCursors(prev => [...prev, cursor]);
+    setPageNumber(p => p + 1);
+    setCurrentPage(1);
+    loadQueueData(cursor, debouncedSearch);
+  };
+
+  const goToPrevPage = () => {
+    if (prevCursors.length === 0) return;
+    const stack = [...prevCursors];
+    stack.pop(); // remove o cursor da página atual
+    const target = stack.length > 0 ? stack[stack.length - 1] : null;
+    setPrevCursors(stack);
+    setPageNumber(p => Math.max(1, p - 1));
+    setCurrentPage(1);
+    loadQueueData(target, debouncedSearch);
+  };
+
+  const refreshQueue = () => {
+    if (loading) return;
+    setReconciliationRefreshKey(key => key + 1);
+    setPrevCursors([]);
+    setPageNumber(1);
+    setCurrentPage(1);
+    loadQueueData(null);
+  };
+
+  // Reage à busca textual, por ID ou pelo nome do agente em toda a view.
+  const prevDebouncedSearchRef = useRef(debouncedSearch);
+  useEffect(() => {
+    if (prevDebouncedSearchRef.current === debouncedSearch) return;
+    prevDebouncedSearchRef.current = debouncedSearch;
+    setCursor(null);
+    setPrevCursors([]);
+    setPageNumber(1);
+    setCurrentPage(1);
+    loadQueueData(null, debouncedSearch);
+  }, [debouncedSearch]);
+
+  // Ao trocar de fila, carrega uma vez. Mudanças em monitorias são refletidas
+  // localmente; só uma ação explícita substitui a lista atual.
+  const prevQueueRef = useRef(activeQueue);
+  useEffect(() => {
+    if (currentSubTab === 'monitores' || currentSubTab !== activeQueue) return;
+    if (prevQueueRef.current !== activeQueue) {
+      setTickets([]);
+      setCursor(null);
+      setPrevCursors([]);
+      setHasMore(false);
+      setPageNumber(1);
+      setCurrentPage(1);
+      setSearchTerm('');
+      setDebouncedSearch('');
+      prevDebouncedSearchRef.current = '';
+      prevQueueRef.current = activeQueue;
+      loadQueueData(null, '');
+    } else {
+      loadQueueData(null);
+    }
+  }, [activeQueue, currentSubTab]);
+
+  useEffect(() => {
+    const latest = new Map<string, Monitoria>();
+    for (const monitoria of monitorias) {
+      if (monitoria.active === false || !monitoria.ticket_id?.trim()) continue;
+      const ticketId = monitoria.ticket_id.trim();
+      const previous = latest.get(ticketId);
+      if (!previous || monitoria.created_at > previous.created_at) latest.set(ticketId, monitoria);
+    }
+    setTickets(previous => {
+      if (activeQueue === 'negativas' || activeQueue === 'filhos' || activeQueue === 'filhos_invalidos') {
+        return previous.flatMap(ticket => {
+          const monitoria = latest.get(ticket.ticket_id);
+          if ((activeQueue === 'filhos' || activeQueue === 'filhos_invalidos')
+            && monitoria?.status === 'concluida' && monitoria.resolution_type === 'automatic') return [];
+          return [monitoria ? {
+            ...ticket, already_audited: true, monitoria_id: monitoria.id,
+            monitoria_status: monitoria.status, monitoria_score: monitoria.score,
+          } : ticket];
+        });
+      }
+      return previous.filter(ticket => !latest.has(ticket.ticket_id));
+    });
+  }, [monitorias, activeQueue]);
+
+  // Carrega os rascunhos de IA já prontos para os tickets da página atual —
+  // agora ativo nas filas de Negativas, Positivas e Proativas.
+  useEffect(() => {
+    if (!['positivas', 'proativas', 'negativas', 'filhos'].includes(activeQueue) || tickets.length === 0) {
+      setDrafts({});
+      return;
+    }
+    let cancelled = false;
+    fetchAIDrafts(tickets.map(t => t.ticket_id)).then(loaded => {
+      if (cancelled) return;
+      const stillPending: Record<string, AIEvaluationDraft> = {};
+      tickets.forEach(t => {
+        const draft = loaded[t.ticket_id];
+        if (!draft) return;
+        if (t.already_audited) {
+          // Ticket já virou monitoria de verdade — o rascunho não serve
+          // mais pra nada, limpa pra não acumular lixo na tabela nem
+          // mostrar "Lançar Monitoria" de novo num ticket já concluído.
+          deleteAIDraft(t.ticket_id);
+        } else {
+          stillPending[t.ticket_id] = draft;
+        }
+      });
+      setDrafts(previous => {
+        const next: Record<string, AIEvaluationDraft> = {};
+        tickets.forEach(ticket => {
+          if (ticket.already_audited) return;
+          const loadedDraft = stillPending[ticket.ticket_id];
+          const currentDraft = previous[ticket.ticket_id];
+          if (loadedDraft && currentDraft) {
+            next[ticket.ticket_id] = Date.parse(currentDraft.updated_at) > Date.parse(loadedDraft.updated_at)
+              ? currentDraft : loadedDraft;
+          } else if (loadedDraft || currentDraft) {
+            next[ticket.ticket_id] = loadedDraft || currentDraft;
+          }
+        });
+        return next;
+      });
+    });
+    return () => { cancelled = true; };
+  }, [activeQueue, tickets]);
+
+  const ticketIdsKey = tickets.map(ticket => ticket.ticket_id).join(',');
+  useEffect(() => {
+    if (!ticketIdsKey) return;
+    let cancelled = false;
+    fetchAIJobs(ticketIdsKey.split(',')).then(found => {
+      if (cancelled) return;
+      setAIJobs(found);
+      setTickets(previous => previous.map(ticket => {
+        const job = found[ticket.ticket_id];
+        return job?.status === 'completed' && job.evaluation_type === 'chamado_filho' && job.result
+          ? { ...ticket, child_evaluation: job.result as ChildTicketAiEvaluation }
+          : ticket;
+      }));
+    }).catch(error => console.error('[AuditingQueue] Falha ao carregar jobs de IA:', error));
+    return () => { cancelled = true; };
+  }, [activeQueue, ticketIdsKey]);
+
+  // Inclui negativas com monitoria que ainda aguardam publicação no Zendesk.
+  const pendingNegativesCount = useMemo(() => {
+    if (activeQueue === 'negativas') {
+      return tickets.length;
+    }
+    return 0;
+  }, [tickets, activeQueue]);
+
+  useEffect(() => {
+    if (activeQueue === 'negativas') {
+      onPendingNegativesCountChange?.(pendingNegativesCount);
+    }
+  }, [pendingNegativesCount, activeQueue, onPendingNegativesCountChange]);
+
+  // Distribuição 1-para-1: sempre que a fila de Negativas ou Filhos carrega
+  // tickets novos, sincroniza as atribuições já existentes e distribui os
+  // que ainda não têm dono entre os monitores online.
+  const retainedChildReviewKey = activeQueue === 'filhos'
+    ? Object.values(drafts).filter(draft => draft.source_queue === 'filhos').map(draft => draft.ticket_id).sort().join(',')
+    : '';
+  useEffect(() => {
+    if (!isDistributedQueue(activeQueue) || tickets.length === 0) return;
+    let cancelled = false;
+    const queueType = activeQueue;
+    const ticketIds = tickets.map(t => t.ticket_id);
+    setAssignmentsReady(prev => ({ ...prev, [queueType]: false }));
+
+    fetchQueueAssignments(queueType, ticketIds, canAudit)
+      .then(assignments => {
+        if (cancelled) return;
+        setQueueAssignments(prev => ({ ...prev, [queueType]: assignments }));
+      })
+      .catch(error => {
+        if (cancelled) return;
+        console.error('[AuditingQueue] Falha ao sincronizar distribuição:', error);
+        toast.error('Não foi possível sincronizar a distribuição da fila. Atualize e tente novamente.');
+      })
+      .finally(() => {
+        if (!cancelled) setAssignmentsReady(prev => ({ ...prev, [queueType]: true }));
+      });
+
+    return () => { cancelled = true; };
+  }, [ticketIdsKey, activeQueue, onlineMonitorKey, retainedChildReviewKey, canAudit]);
+
+  // Filtro de busca na lista de tickets com suporte a filtro de rascunhos da IA
+  const filteredTickets = useMemo(() => {
+    return tickets.filter(t => {
+      if (['closed', 'archived'].includes(t.status?.toLowerCase() || '')
+        && !(activeQueue === 'filhos' && (t.saved_ai_draft
+          || ['review_required', 'blocked'].includes(t.child_automation?.status || '')))) return false;
+      if (onlyWithoutMonitoria && (t.already_audited || t.monitoria_id)) return false;
+      if (isDistributedQueue(activeQueue)) {
+        if (!assignmentsReady[activeQueue]) return false;
+        if (queueAssignments[activeQueue][t.ticket_id]?.status === 'completed'
+          && !(['negativas', 'filhos', 'filhos_invalidos'].includes(activeQueue) && t.already_audited)) return false;
+      }
+
+      const matchesSearch = matchesQueueSearchText(t, searchTerm);
+
+      const matchesAgent = !selectedAgentFilter || Boolean(t.agent_name &&
+        normalizeQueueSearchText(t.agent_name).includes(normalizeQueueSearchText(selectedAgentFilter)));
+
+      const hasDraft = t.saved_ai_draft || !!drafts[t.ticket_id] || (activeQueue === 'filhos' && (!!t.child_evaluation || validatedChildTickets.has(t.ticket_id)));
+      if (aiDraftFilter === 'with_draft' && !hasDraft) return false;
+      if (aiDraftFilter === 'without_draft' && hasDraft) return false;
+
+      // Distribuição 1-para-1: monitor de qualidade só vê os chamados
+      // atribuídos a ele nas filas de Negativas/Filhos. Supervisor e Admin
+      // continuam vendo a fila inteira (com o selo de quem é o dono).
+      if (isDistributedQueue(activeQueue) && currentUserRole === 'qualidade' && currentUserId) {
+        const assignment = queueAssignments[activeQueue][t.ticket_id];
+        if (!assignmentsReady[activeQueue] || assignment?.assigned_to !== currentUserId) return false;
+      }
+
+      if (!matchesAssignedMonitor(activeQueue, currentUserRole, selectedMonitorFilter, t.ticket_id,
+        isDistributedQueue(activeQueue) ? queueAssignments[activeQueue] : {}, assignmentsReady[activeQueue])) return false;
+
+      return matchesSearch && matchesAgent;
+    });
+  }, [tickets, searchTerm, selectedAgentFilter, selectedMonitorFilter, drafts, activeQueue, validatedChildTickets, aiDraftFilter, onlyWithoutMonitoria, queueAssignments, assignmentsReady, currentUserRole, currentUserId, isSupervisorView]);
+
+  // Paginação configurável por página (5, 10, 15, 20) com padrão 5
+  const [pageSize, setPageSize] = useState<number>(5);
+  const [currentPage, setCurrentPage] = useState<number>(1);
+
+  // Reseta para a primeira página e limpa seleção quando muda a busca, filtro de agente, rascunho, tamanho de página ou fila
+  useEffect(() => {
+    setCurrentPage(1);
+    setSelectedTicketIds(new Set());
+  }, [searchTerm, selectedAgentFilter, selectedMonitorFilter, activeQueue, pageSize, aiDraftFilter, onlyWithoutMonitoria]);
+
+  const totalItems = filteredTickets.length;
+  const totalLocalPages = Math.max(1, Math.ceil(totalItems / pageSize));
+  const validCurrentPage = Math.min(Math.max(1, currentPage), totalLocalPages);
+  const startIndex = (validCurrentPage - 1) * pageSize;
+  const endIndex = Math.min(startIndex + pageSize, totalItems);
+
+  const paginatedTickets = useMemo(() => {
+    return filteredTickets.slice(startIndex, endIndex);
+  }, [filteredTickets, startIndex, endIndex]);
+
+  const evaluableTicketsCount = useMemo(() => {
+    return paginatedTickets.filter(t => !t.saved_ai_draft && !drafts[t.ticket_id] && !t.already_audited
+      && !globalEvaluatingTickets.has(t.ticket_id) && aiJobs[t.ticket_id]?.status !== 'running'
+      && !((activeQueue === 'filhos' || activeQueue === 'filhos_invalidos') && (t.child_evaluation || aiJobs[t.ticket_id]?.status === 'completed'))).length;
+  }, [paginatedTickets, drafts, aiJobs, activeQueue]);
+
+  const toggleTicketSelection = (ticketId: string) => {
+    setSelectedTicketIds(prev => {
+      const next = new Set(prev);
+      if (next.has(ticketId)) {
+        next.delete(ticketId);
+      } else {
+        next.add(ticketId);
+      }
+      return next;
+    });
+  };
+
+  const handleToggleSelectAllCurrentPage = () => {
+    const pageIds = paginatedTickets.filter(ticket => !ticket.already_audited).map(ticket => ticket.ticket_id);
+    const allSelected = pageIds.length > 0 && pageIds.every(id => selectedTicketIds.has(id));
+
+    setSelectedTicketIds(prev => {
+      const next = new Set(prev);
+      if (allSelected) {
+        pageIds.forEach(id => next.delete(id));
+      } else {
+        pageIds.forEach(id => next.add(id));
+      }
+      return next;
+    });
+  };
+
+  const beginAssignedWork = async (ticket: AuditingQueueTicket, newChildEvaluation = false) => {
+    if (!isDistributedQueue(activeQueue)) return undefined;
+    const queueType = activeQueue;
+    const assignment = queueAssignments[queueType][ticket.ticket_id];
+    const canOverrideAssignment = canManageQueueAssignments(currentUserRole);
+    const isResponsibleMonitor = currentUserRole === 'qualidade' && assignment?.assigned_to === currentUserId;
+    if (!assignment) {
+      throw new Error('Este ticket ainda não foi atribuído a um monitor. Aguarde a distribuição da fila.');
+    }
+    if (!currentUserId || (!canOverrideAssignment && !isResponsibleMonitor)) {
+      throw new Error('Somente o monitor responsável pode iniciar a avaliação deste ticket.');
+    }
+    const started = newChildEvaluation && queueType === 'filhos'
+      ? await startChildTicketNewEvaluation(ticket.ticket_id)
+      : await startQueueTicketAssignment(ticket.ticket_id, queueType);
+    setQueueAssignments(prev => ({
+      ...prev,
+      [queueType]: { ...prev[queueType], [ticket.ticket_id]: started },
+    }));
+    return { ticket_id: ticket.ticket_id, queue_type: queueType };
+  };
+
+  const releaseAssignedWork = async (ticket: AuditingQueueTicket) => {
+    if (!isDistributedQueue(activeQueue)) return;
+    const queueType = activeQueue;
+    await releaseQueueTicketAssignment(ticket.ticket_id, queueType);
+    setQueueAssignments(prev => {
+      const current = prev[queueType][ticket.ticket_id];
+      if (!current || current.started_by !== currentUserId) return prev;
+      return {
+        ...prev,
+        [queueType]: {
+          ...prev[queueType],
+          [ticket.ticket_id]: { ...current, status: 'pending', started_at: null, started_by: null },
+        },
+      };
+    });
+  };
+
+
+  // Abre o popup de confirmação da avaliação da IA com a seleção automática
+  // de ficha e manual baseada no tipo de cliente (organização no Zendesk).
+  const openGuidelinePicker = async (ticket: AuditingQueueTicket) => {
+    if (!canAudit) return;
+    setGuidelinePickerTicket(ticket);
+    setSelectionOverrideEnabled(false);
+    setSelectedOverrideFormId('');
+    setSelectedOverrideGuidelineIds([]);
+    setSelectionOverrideReason('');
+    setLoadingGuidelines(true);
+    try {
+      const all = await fetchAIGuidelines();
+      setGuidelineOptions(all.filter(g => g.active));
+    } catch (e) {
+      console.error('Erro ao carregar manuais:', e);
+      setGuidelineOptions([]);
+    } finally {
+      setLoadingGuidelines(false);
+    }
+  };
+
+  // Ação de avaliar com IA — roda a IA com a ficha e manual auto-selecionados
+  // e SALVA o resultado como rascunho persistido.
+  const handleEvaluateWithAI = async (
+    ticket: AuditingQueueTicket,
+    formToUse: EvaluationForm,
+    guidelineIds: string[],
+    // Lotes mantêm as mesmas etapas contextuais em cada card.
+    silent = false,
+    selectionContext?: Record<string, unknown>
+  ) => {
+    if (!canAudit) return;
+    if (globalEvaluatingTickets.has(ticket.ticket_id)) {
+      const duplicateError = new Error(`O ticket #${ticket.ticket_id} já está sendo avaliado com IA.`);
+      if (!silent) setAiFeedback(previous => ({ ...previous, [ticket.ticket_id]: 'Este ticket já está em análise.' }));
+      throw duplicateError;
+    }
+
+    let jobId: string;
+    try {
+      const job = await claimAIJob(ticket.ticket_id, 'atendimento', currentUserId);
+      if (!job.claimed) throw new Error(`O ticket #${ticket.ticket_id} já está sendo analisado com IA.`);
+      jobId = job.jobId;
+      setAIJobs(previous => ({ ...previous, [ticket.ticket_id]: {
+        ticket_id: ticket.ticket_id, job_id: jobId, evaluation_type: 'atendimento',
+        status: 'running', started_by: currentUserId || '', result: null,
+      } }));
+    } catch (error) {
+      if (!silent) setAiFeedback(previous => ({ ...previous, [ticket.ticket_id]: 'Não foi possível iniciar a análise.' }));
+      throw error;
+    }
+
+    // Encontra o agente correspondente pelo e-mail (chave universal) ou nome
+    const matchedAgent = agents.find(a =>
+      (ticket.agent_email && a.email.toLowerCase() === ticket.agent_email.toLowerCase()) ||
+      (ticket.agent_name && a.name.toLowerCase() === ticket.agent_name.toLowerCase())
+    );
+    const teamId = resolveTicketTeamId(ticket, matchedAgent);
+    const agentId = ticket.agent_id || matchedAgent?.id;
+    const draftMeta = {
+      source_queue: activeQueue,
+      form_id: formToUse.id,
+      agent_name: matchedAgent?.name || ticket.agent_name,
+      agent_email: matchedAgent?.email || ticket.agent_email,
+      agent_id: agentId,
+      team_id: teamId,
+      channel: ticket.channel,
+      satisfaction_comment: ticket.csat_comment,
+      guideline_ids: guidelineIds,
+      selection_context: selectionContext,
+    };
+
+    globalEvaluatingTickets.add(ticket.ticket_id);
+    notifyGlobalEvaluating();
+    setEvaluatingTicketId(ticket.ticket_id);
+    setTicketProgress(ticket.ticket_id, 1);
+    setAiFeedback(previous => ({ ...previous, [ticket.ticket_id]: '' }));
+
+    try {
+      const { comments: dialogue, ticketFields, tags, organizationName, organizationTags } = await fetchTicketDialogue(ticket.ticket_id);
+      if (cancelledAIJobIds.has(jobId)) return 'cancelled' as const;
+
+      // Atualiza tags e organização caso venham enriquecidos da busca individual
+      if ((tags && tags.length > 0) || organizationName || (organizationTags && organizationTags.length > 0)) {
+        ticket.tags = tags || ticket.tags;
+        ticket.organization_name = organizationName || ticket.organization_name;
+        ticket.organization_tags = organizationTags || ticket.organization_tags;
+      }
+      ticket.ticket_fields = ticketFields;
+      ticket.dialogue = dialogue;
+
+      setTicketProgress(ticket.ticket_id, 2);
+
+      const aiResult = await evaluateTicketWithAI(ticket.ticket_id, formToUse, dialogue, {
+        name: matchedAgent?.name || ticket.agent_name,
+        email: matchedAgent?.email || ticket.agent_email,
+        team_name: teamId ? teamsMap[teamId] : undefined,
+        channel: ticket.channel,
+      }, guidelineIds, ticketFields, jobId, draftMeta);
+      if (cancelledAIJobIds.has(jobId)) return 'cancelled' as const;
+
+      if ('queued' in aiResult) {
+        setAiFeedback(previous => ({ ...previous, [ticket.ticket_id]: 'Pendente · Nova tentativa automática agendada.' }));
+        return 'queued' as const;
+      }
+
+      aiResult.ticket_fields = ticketFields;
+      aiResult.dialogue = dialogue;
+
+      setTicketProgress(ticket.ticket_id, 3);
+      // A resposta já foi persistida pelo backend; esta curta permanência
+      // permite perceber a etapa final antes de trocar o botão de estado.
+      await new Promise(resolve => setTimeout(resolve, 350));
+
+      // Em produção, a Edge Function salva o rascunho e conclui o job de
+      // forma atômica; o navegador pode sair sem perder o resultado.
+      if (isMockMode) await completeAIJob(ticket.ticket_id, jobId, aiResult);
+      if (isMockMode) await saveAIDraft({
+        ticketId: ticket.ticket_id, formId: formToUse.id,
+        agentName: matchedAgent?.name || ticket.agent_name,
+        agentEmail: matchedAgent?.email || ticket.agent_email,
+        agentId, teamId, channel: ticket.channel,
+        satisfactionComment: ticket.csat_comment, result: aiResult,
+        guidelineIds, createdBy: currentUserId,
+        sourceQueue: activeQueue, ticketSnapshot: ticket,
+      });
+      setAIJobs(previous => ({ ...previous, [ticket.ticket_id]: {
+        ...previous[ticket.ticket_id], status: 'completed', result: aiResult,
+      } }));
+
+      setDrafts(prev => ({
+        ...prev,
+        [ticket.ticket_id]: {
+          id: prev[ticket.ticket_id]?.id || ticket.ticket_id,
+          ticket_id: ticket.ticket_id,
+          form_id: formToUse.id,
+          agent_name: matchedAgent?.name || ticket.agent_name,
+          agent_email: matchedAgent?.email || ticket.agent_email,
+          agent_id: agentId,
+          team_id: teamId,
+          channel: ticket.channel,
+          satisfaction_comment: ticket.csat_comment,
+          result: aiResult,
+          guideline_ids: guidelineIds,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        }
+      }));
+
+      setAiFeedback(previous => ({ ...previous, [ticket.ticket_id]: '' }));
+    } catch (err: any) {
+      if (cancelledAIJobIds.has(jobId)) return 'cancelled' as const;
+      console.error('Erro na avaliação com IA:', err);
+      await failAIJob(ticket.ticket_id, jobId, err?.message || 'Falha na análise').catch(jobError => {
+        console.error('[AuditingQueue] Falha ao registrar erro do job de IA:', jobError);
+      });
+      // Um erro de rede no navegador não cancela a execução já iniciada na
+      // Edge Function. O estado definitivo chega pelo Realtime do backend.
+      if (isMockMode) setAIJobs(previous => ({ ...previous, [ticket.ticket_id]: {
+        ...previous[ticket.ticket_id], status: 'failed',
+      } }));
+      const feedback = /HTTP 402|limite de créditos/i.test(err?.message || '')
+        ? 'IA indisponível: saldo do OpenRouter insuficiente. Avise o administrador.'
+        : (err?.message || 'A análise falhou. Tente novamente neste ticket.');
+      setAiFeedback(previous => ({ ...previous, [ticket.ticket_id]: feedback }));
+      if (!silent) toast.error(feedback);
+      throw err; // relança para o batch capturar individualmente
+    } finally {
+      globalEvaluatingTickets.delete(ticket.ticket_id);
+      notifyGlobalEvaluating();
+      setEvaluatingTicketId(null);
+      clearTicketProgress(ticket.ticket_id);
+    }
+  };
+
+  // Avaliação em LOTE — se houver tickets selecionados via checkbox, avalia apenas eles.
+  // Caso contrário, avalia todos os tickets elegíveis visíveis da página atual.
+  const handleBatchEvaluate = async () => {
+    if (!canAudit || batchStartingRef.current) return;
+    const isChildBatch = activeQueue === 'filhos' || activeQueue === 'filhos_invalidos';
+    const candidateTickets = selectedTicketIds.size > 0
+      ? paginatedTickets.filter(t => selectedTicketIds.has(t.ticket_id))
+      : paginatedTickets;
+
+    const pending = candidateTickets.filter(t => {
+      if (isEvaluatingTicket(t.ticket_id) || (isChildBatch && childResultFor(t))) return false;
+      if (t.saved_ai_draft || drafts[t.ticket_id] || t.already_audited) return false;
+      return true;
+    });
+
+    if (pending.length === 0) {
+      toast.info(selectedTicketIds.size > 0
+        ? 'Os chamados selecionados já possuem avaliação ou foram auditados.'
+        : 'Todos os chamados visíveis desta página já possuem avaliação ou foram auditados.');
+      return;
+    }
+
+    batchStartingRef.current = true;
+    setBatchRunning(true);
+    setBatchMinimized(false);
+    const allGuidelines = isChildBatch ? [] : await fetchAIGuidelines().catch(() => [] as AIEvaluationGuideline[]);
+    const activeGuidelineIds = allGuidelines.filter(g => g.active).map(g => g.id);
+
+    const initialItems: BatchItemStatus[] = pending.map(p => ({
+      ticket_id: p.ticket_id,
+      subject: p.subject,
+      agent_name: p.agent_name,
+      status: 'pending',
+    }));
+
+    setBatchRunning(true);
+    batchCancelRef.current = false;
+    setBatchProgress({
+      done: 0,
+      queued: 0,
+      errors: 0,
+      total: pending.length,
+      currentTicketId: pending[0]?.ticket_id || '',
+      currentSubject: pending[0]?.subject,
+      currentAgent: pending[0]?.agent_name,
+      items: initialItems,
+    });
+
+    let done = 0;
+    let queued = 0;
+    let errors = 0;
+
+    for (let i = 0; i < pending.length; i++) {
+      if (batchCancelRef.current) break;
+      const ticket = pending[i];
+
+      const customerType = resolveCustomerType(ticket.tags, ticket.organization_tags);
+      const { form: autoForm, guideline: autoGuideline } = resolveFormAndGuidelineForCustomerType(
+        customerType,
+        forms,
+        allGuidelines
+      );
+      if (!autoForm && !isChildBatch) {
+        errors++;
+        initialItems[i].status = 'error';
+        setBatchProgress(prev => prev ? { ...prev, errors, items: [...initialItems] } : null);
+        continue;
+      }
+      const guidelineIds = autoGuideline ? [autoGuideline.id] : activeGuidelineIds;
+      const batchSelectionContext = {
+        detected_customer_type: customerType,
+        suggested_form_id: autoForm?.id,
+        suggested_form_title: autoForm?.title,
+        suggested_guideline_ids: guidelineIds,
+        suggested_guideline_titles: allGuidelines.filter(guideline => guidelineIds.includes(guideline.id)).map(guideline => guideline.title),
+        selected_form_id: autoForm?.id,
+        selected_form_title: autoForm?.title,
+        selected_guideline_ids: guidelineIds,
+        selected_guideline_titles: allGuidelines.filter(guideline => guidelineIds.includes(guideline.id)).map(guideline => guideline.title),
+        overridden: false,
+        override_reason: null,
+        source: 'automatic',
+      };
+
+      initialItems[i].status = 'processing';
+      setBatchProgress({
+        done,
+        queued,
+        errors,
+        total: pending.length,
+        currentTicketId: ticket.ticket_id,
+        currentSubject: ticket.subject,
+        currentAgent: ticket.agent_name,
+        items: [...initialItems],
+      });
+
+      try {
+        const outcome = isChildBatch
+          ? await handleEvaluateChildTicket(ticket, true)
+          : await handleEvaluateWithAI(ticket, autoForm!, guidelineIds, true, batchSelectionContext);
+        if (outcome === 'queued') {
+          queued++;
+          initialItems[i].status = 'queued';
+        } else if (outcome === 'cancelled') {
+          initialItems[i].status = 'error';
+          errors++;
+        } else {
+          done++;
+          initialItems[i].status = 'done';
+        }
+      } catch {
+        errors++;
+        initialItems[i].status = 'error';
+      }
+
+      setBatchProgress(prev => prev ? {
+        ...prev,
+        done,
+        queued,
+        errors,
+        items: [...initialItems],
+      } : null);
+    }
+
+    batchStartingRef.current = false;
+    setBatchRunning(false);
+    const cancelled = batchCancelRef.current;
+    batchCancelRef.current = false;
+    setBatchProgress(null);
+
+    if (cancelled) {
+      toast.warning(`⏸ Lote interrompido — ${done}/${pending.length} tickets avaliados.`, { duration: 5000 });
+    } else if (errors > 0) {
+      toast.warning(`Lote concluído — ${done} avaliados, ${queued} pendentes de reprocessamento, ${errors} falharam.`, { duration: 8000 });
+    } else if (queued > 0) {
+      toast.info(`Lote concluído — ${done} avaliados, ${queued} pendentes de reprocessamento automático.`, { duration: 8000 });
+    } else {
+      toast.success(`✅ Lote concluído — ${done}/${pending.length} tickets avaliados com sucesso!`, { duration: 6000 });
+    }
+  };
+
+  // Avaliação de conformidade com IA para tickets filhos
+  const handleEvaluateChildTicket = async (ticket: AuditingQueueTicket, silent = false): Promise<'completed' | 'queued' | 'cancelled'> => {
+    if (!canAudit) return 'cancelled';
+    if (globalEvaluatingTickets.has(ticket.ticket_id)) return 'queued';
+    globalEvaluatingTickets.add(ticket.ticket_id);
+    notifyGlobalEvaluating();
+    if (!silent) setChildPreviewTicket(ticket);
+    let jobId: string;
+    try {
+      const job = await claimAIJob(ticket.ticket_id, 'chamado_filho', currentUserId);
+      if (!job.claimed) {
+        toast.info(`O chamado filho #${ticket.ticket_id} já está em análise com IA.`);
+        globalEvaluatingTickets.delete(ticket.ticket_id);
+        notifyGlobalEvaluating();
+        return 'queued';
+      }
+      jobId = job.jobId;
+      setAIJobs(previous => ({ ...previous, [ticket.ticket_id]: {
+        ticket_id: ticket.ticket_id, job_id: jobId, evaluation_type: 'chamado_filho',
+        status: 'running', started_by: currentUserId || '', result: null,
+      } }));
+    } catch (error) {
+      setAiFeedback(previous => ({ ...previous, [ticket.ticket_id]: 'Não foi possível iniciar esta análise.' }));
+      globalEvaluatingTickets.delete(ticket.ticket_id);
+      notifyGlobalEvaluating();
+      if (silent) throw error;
+      return 'cancelled';
+    }
+    setTicketProgress(ticket.ticket_id, 1);
+    setAiFeedback(previous => ({ ...previous, [ticket.ticket_id]: '' }));
+
+    try {
+      const { comments, ticketFields } = await fetchTicketDialogue(ticket.ticket_id);
+      if (cancelledAIJobIds.has(jobId)) return 'cancelled';
+      const normalizedComments = normalizeTicketDialogue(comments || [], ticket.agent_name, ticket.requester_name);
+      ticket.dialogue = normalizedComments;
+      if (childPreviewRef.current?.ticket_id === ticket.ticket_id) setChildDialogue(normalizedComments);
+      ticket.ticket_fields = ticketFields;
+      setTicketProgress(ticket.ticket_id, 2);
+
+      const result = await evaluateChildTicketWithAI(
+        ticket.ticket_id,
+        ticket.subject,
+        comments,
+        ticketFields,
+        ticket.child_macro_type,
+        jobId,
+        ticket.status
+      );
+      if (cancelledAIJobIds.has(jobId)) return 'cancelled';
+
+      if ('queued' in result) {
+        setAiFeedback(previous => ({ ...previous, [ticket.ticket_id]: 'Pendente · Nova tentativa automática agendada.' }));
+        return 'queued';
+      }
+
+      setTicketProgress(ticket.ticket_id, 3);
+      await new Promise(resolve => setTimeout(resolve, 350));
+      if (cancelledAIJobIds.has(jobId)) return 'cancelled';
+      if (isMockMode) await completeAIJob(ticket.ticket_id, jobId, result);
+      setAIJobs(previous => ({ ...previous, [ticket.ticket_id]: {
+        ...previous[ticket.ticket_id], status: 'completed', result,
+      } }));
+      setTickets(previous => previous.map(item => item.ticket_id === ticket.ticket_id
+        ? { ...item, child_evaluation: result, dialogue: normalizedComments, ticket_fields: ticketFields } : item));
+      ticket.child_evaluation = result;
+      setAiFeedback(previous => ({ ...previous, [ticket.ticket_id]: '' }));
+      return 'completed';
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Falha na análise';
+      if (cancelledAIJobIds.has(jobId)) return 'cancelled';
+      console.error('Erro ao auditar chamado filho:', err);
+      await failAIJob(ticket.ticket_id, jobId, message).catch(jobError => {
+        console.error('[AuditingQueue] Falha ao registrar erro do job de IA:', jobError);
+      });
+      setAIJobs(previous => ({ ...previous, [ticket.ticket_id]: {
+        ...previous[ticket.ticket_id], status: 'failed',
+      } }));
+      const feedback = /HTTP 402|limite de créditos/i.test(message)
+        ? 'IA indisponível: saldo do OpenRouter insuficiente. Avise o administrador.'
+        : message;
+      setAiFeedback(previous => ({ ...previous, [ticket.ticket_id]: feedback }));
+      if (!silent) toast.error(feedback);
+      if (silent) throw err;
+      return 'cancelled';
+    } finally {
+      globalEvaluatingTickets.delete(ticket.ticket_id);
+      notifyGlobalEvaluating();
+      clearTicketProgress(ticket.ticket_id);
+    }
+  };
+
+  // Abre a ficha de monitoria com o rascunho da IA já salvo pra esse
+  // ticket — com o form_id bloqueado para alteração manual.
+  const handleRemoveDraft = async (ticket: AuditingQueueTicket) => {
+    if (!canAudit || deletingDraftId || !drafts[ticket.ticket_id]) return;
+    if (!window.confirm(`Excluir o rascunho de IA do ticket #${ticket.ticket_id}? Esta ação não exclui o ticket nem uma monitoria salva.`)) return;
+    setDeletingDraftId(ticket.ticket_id);
+    try {
+      const deleted = await removeAIDraft(ticket.ticket_id);
+      if (!deleted) throw new Error('Rascunho não encontrado ou sem permissão para excluir.');
+      setDrafts(previous => {
+        const next = { ...previous };
+        delete next[ticket.ticket_id];
+        return next;
+      });
+      setTickets(previous => previous.filter(item => item.ticket_id !== ticket.ticket_id || !item.saved_ai_draft));
+      toast.success(`Rascunho de IA do ticket #${ticket.ticket_id} excluído.`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Não foi possível excluir o rascunho.');
+    } finally {
+      setDeletingDraftId(null);
+    }
+  };
+
+  const handleLaunchMonitoria = async (ticket: AuditingQueueTicket) => {
+    if (!canAudit) return;
+    const draft = drafts[ticket.ticket_id];
+    if (!draft) return;
+
+    if (ticket.draft_metadata_incomplete) {
+      toast.warning('Rascunho antigo recuperado: confira a data e os dados do ticket antes de salvar a monitoria.');
+    }
+
+    let queueAssignment;
+    try {
+      queueAssignment = await beginAssignedWork(ticket);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Não foi possível abrir esta avaliação.');
+      return;
+    }
+
+    const customerType = resolveCustomerType(ticket.tags, ticket.organization_tags);
+
+    const specInfo = getSpecializedTeamInfo(ticket);
+
+    onStartAudit({
+      ticket_id: ticket.ticket_id,
+      ticket_subject: ticket.subject,
+      form_id: draft.form_id,
+      evaluated_id: draft.agent_id,
+      team_id: resolveTicketTeamId(
+        { ticket_group_team_id: ticket.ticket_group_team_id, team_id: draft.team_id },
+        agents.find(agent => agent.id === draft.agent_id),
+      ),
+      ticket_group_team_id: ticket.ticket_group_team_id,
+      group_name: ticket.group_name,
+      channel: normalizeChannel(draft.channel),
+      ticket_date: toTicketDateInput(ticket.ticket_date),
+      satisfaction_result: csatStatusToSatisfactionResult(ticket.csat_status),
+      satisfaction_has_record: !!draft.satisfaction_comment,
+      satisfaction_record_text: draft.satisfaction_comment,
+      aiEvaluation: draft.result,
+      ticket_fields: draft.result?.ticket_fields || ticket.ticket_fields,
+      isAiLocked: true,
+      customerType,
+      specializedTeamLabel: specInfo.label || undefined,
+      dialogue: draft.result?.dialogue || ticket.dialogue,
+      queue_assignment: queueAssignment,
+    });
+  };
+
+  // Inicia auditoria manual direta (sem IA prévia) abrindo o fluxo oficial 1-2-3-4
+  const handleStartManualAudit = async (ticket: AuditingQueueTicket) => {
+    if (!canAudit) return;
+    let queueAssignment;
+    try {
+      queueAssignment = await beginAssignedWork(ticket);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Não foi possível abrir esta avaliação.');
+      return;
+    }
+    const specInfo = getSpecializedTeamInfo(ticket);
+    const matchedAgent = agents.find(a =>
+      (ticket.agent_email && a.email.toLowerCase() === ticket.agent_email.toLowerCase()) ||
+      (ticket.agent_name && a.name.toLowerCase() === ticket.agent_name.toLowerCase())
+    );
+    const customerType = resolveCustomerType(ticket.tags, ticket.organization_tags);
+    const { form: autoForm } = resolveFormAndGuidelineForCustomerType(customerType, forms, []);
+
+    onStartAudit({
+      ticket_id: ticket.ticket_id,
+      ticket_subject: ticket.subject,
+      form_id: autoForm?.id,
+      evaluated_id: ticket.agent_id || matchedAgent?.id,
+      team_id: resolveTicketTeamId(ticket, matchedAgent),
+      ticket_group_team_id: ticket.ticket_group_team_id,
+      group_name: ticket.group_name,
+      channel: normalizeChannel(ticket.channel),
+      // O Zendesk devolve o timestamp de criação. O datepicker recebe apenas
+      // yyyy-MM-dd no fuso de São Paulo para não reinterpretar o dia pela timezone do navegador.
+      ticket_date: toTicketDateInput(ticket.ticket_date),
+      satisfaction_result: csatStatusToSatisfactionResult(ticket.csat_status),
+      satisfaction_has_record: !!ticket.csat_comment,
+      satisfaction_record_text: ticket.csat_comment,
+      ticket_fields: ticket.ticket_fields,
+      customerType,
+      specializedTeamLabel: specInfo.label || undefined,
+      dialogue: ticket.dialogue,
+      queue_assignment: queueAssignment,
+    });
+  };
+
+  const handleStartManualChildAudit = async (ticket: AuditingQueueTicket) => {
+    if (!canAudit) return;
+    const savedDraft = drafts[ticket.ticket_id];
+    const selectedChildForm = childTicketForm(forms)
+      || forms.find(form => form.id === CHILD_TICKET_FORM_ID && form.active !== false);
+    if (!selectedChildForm) {
+      toast.error('A ficha manual de chamados filhos não está disponível. Avise a Gestão da Qualidade.');
+      return;
+    }
+    let queueAssignment;
+    try {
+      queueAssignment = await beginAssignedWork(ticket, Boolean(ticket.already_audited || ticket.monitoria_id));
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Não foi possível abrir a avaliação manual.');
+      return;
+    }
+    const matchedAgent = agents.find(agent => agent.id === ticket.agent_id
+      || (ticket.agent_email && agent.email.toLowerCase() === ticket.agent_email.toLowerCase())
+      || (ticket.agent_name && agent.name.toLowerCase() === ticket.agent_name.toLowerCase()));
+    onStartAudit({
+      ticket_id: ticket.ticket_id,
+      ticket_subject: ticket.subject,
+      form_id: selectedChildForm.id,
+      evaluated_id: ticket.agent_id || savedDraft?.agent_id || matchedAgent?.id,
+      team_id: resolveTicketTeamId({ ...ticket, team_id: ticket.team_id || savedDraft?.team_id }, matchedAgent),
+      ticket_group_team_id: ticket.ticket_group_team_id,
+      group_name: ticket.group_name,
+      channel: normalizeChannel(ticket.channel || savedDraft?.channel),
+      ticket_date: toTicketDateInput(ticket.ticket_date),
+      satisfaction_result: 'Sem pesquisa',
+      ticket_fields: savedDraft?.result.ticket_fields || ticket.ticket_fields,
+      dialogue: savedDraft?.result.dialogue || ticket.dialogue,
+      queue_assignment: queueAssignment,
+    });
+  };
+
+  // E-mails dos 5 agentes mais prioritários (mais tempo sem monitoria) —
+  // usado só pra destacar visualmente esses tickets na fila Proativa, sem
+  // depender de "sortear" um ticket específico (a fila agora é paginada;
+  // um agente prioritário pode estar em qualquer página).
+  const topPriorityEmails = useMemo(() => {
+    return new Set(agentQueue.slice(0, 5).map(a => a.agent_email?.toLowerCase()).filter(Boolean));
+  }, [agentQueue]);
+
+  // Nota sugerida pela IA — mostrada em cima, ao lado do badge de CSAT
+  // (Bom/Vazio), não mais colada na data lá embaixo. Maior que um Badge
+  // "xs" comum pra ficar legível de relance no card.
+  const renderScoreBadge = (ticket: AuditingQueueTicket) => {
+    const draft = drafts[ticket.ticket_id];
+    const automation = ticket.positive_automation || ticket.child_automation;
+    if (!draft) return automation ? (
+      <span className="inline-flex flex-wrap items-center gap-1.5">
+        <Badge variant={automation.status === 'blocked' ? 'warning' : 'info'} size="sm">
+          {positiveAutomationLabel(automation.status)}
+        </Badge>
+        {automation.last_error && <span className="text-xs text-brand-muted">{automation.last_error}</span>}
+      </span>
+    ) : null;
+
+    const selectedForm = forms.find(form => form.id === draft.form_id);
+    const calculatedScore = calculateAIEvaluationScore(draft.result, selectedForm);
+    const criticalScore = describeAICriticalScore(draft.result, selectedForm);
+    const needsPositiveReview = (activeQueue === 'positivas' || activeQueue === 'filhos') && Number.isFinite(calculatedScore) && calculatedScore < 75;
+    const reviewReason = (activeQueue === 'positivas' || activeQueue === 'filhos') && 'automation_review_reason' in draft.result
+      && typeof draft.result.automation_review_reason === 'string' ? draft.result.automation_review_reason : undefined;
+
+    return (
+      <span className="inline-flex items-center gap-1.5 flex-wrap">
+        {needsPositiveReview && <Badge variant="warning" size="sm" title="Avaliação preservada mesmo se o ticket sair da view do Zendesk">Revisão necessária · abaixo de 75%</Badge>}
+        {reviewReason && !needsPositiveReview && <Badge variant="warning" size="sm" title={reviewReason}>Conferência necessária</Badge>}
+        {ticket.saved_ai_draft && <Badge variant="warning" size="xs">{ticket.draft_metadata_incomplete ? 'Rascunho recuperado · conferir dados' : 'Rascunho IA salvo'}</Badge>}
+        <Badge variant="neutral" size="xs">Ficha: {selectedForm?.title || 'não encontrada'}</Badge>
+        <span
+          title="Nota calculada pelas respostas da IA usando os pesos da ficha"
+          className={`inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-mono font-black flex-shrink-0 ${needsPositiveReview ? 'bg-amber-500/10 text-amber-700 dark:text-amber-400' : 'bg-functional-success text-functional-success'}`}
+        >
+          {Number.isFinite(calculatedScore) ? `${calculatedScore.toLocaleString('pt-BR', { maximumFractionDigits: 2 })}%` : 'Nota indisponível'}
+        </span>
+        {criticalScore && <span className="w-full text-xs text-brand-muted">
+          <span className="font-semibold">Pontuação normal: {criticalScore.criteriaScore.toLocaleString('pt-BR', { maximumFractionDigits: 2 })}%. A IA marcou pontos de atenção para revisão humana, sem zerar a nota.</span>
+          {criticalScore.reasons.map((reason, index) => <span key={index} className="mt-1 block">{reason}</span>)}
+        </span>}
+      </span>
+    );
+  };
+
+  // Largura mínima compartilhada pelos botões de ação de IA — sem ela,
+  // "Reavaliar" e "Lançar Monitoria" ficavam com tamanhos bem diferentes
+  // (cada Button só cresce até caber o próprio texto).
+  const AI_ACTION_BUTTON_CLASS = 'justify-center min-w-[132px]';
+
+  // Identifica se o ticket/atendente pertence à equipe TEF, Contábil ou Fiscal.
+  // Liberado para avaliação da IA e auditoria manual com as fichas ativas disponíveis,
+  // com sinalização destacada em amarelo no card e nas observações.
+  const getSpecializedTeamInfo = (ticket: AuditingQueueTicket) => {
+    const matchedAgent = agents.find(a =>
+      (ticket.agent_email && a.email?.toLowerCase() === ticket.agent_email.toLowerCase()) ||
+      (ticket.agent_name && a.name?.toLowerCase() === ticket.agent_name.toLowerCase()) ||
+      (ticket.agent_id && a.id === ticket.agent_id)
+    );
+
+    const teamNames: string[] = [];
+    if (ticket.team_id && teamsMap[ticket.team_id]) {
+      teamNames.push(teamsMap[ticket.team_id]);
+    }
+    if (matchedAgent?.primary_team_id && teamsMap[matchedAgent.primary_team_id]) {
+      teamNames.push(teamsMap[matchedAgent.primary_team_id]);
+    }
+    if (Array.isArray(matchedAgent?.team_ids)) {
+      matchedAgent.team_ids.forEach(tid => {
+        if (teamsMap[tid]) teamNames.push(teamsMap[tid]);
+      });
+    }
+
+    const teamString = teamNames.join(' ').toLowerCase();
+    const tagsList = (ticket.tags || []).map(t => (t || '').toLowerCase());
+
+    if (/cont[aá]bil/i.test(teamString) || tagsList.includes('contabil') || tagsList.includes('contabilidade') || tagsList.some(t => t.includes('contabil'))) {
+      return { isSpecialized: true, label: 'Contábil' };
+    }
+    if (/fiscal/i.test(teamString) || tagsList.includes('fiscal') || tagsList.some(t => t.includes('fiscal'))) {
+      return { isSpecialized: true, label: 'Fiscal' };
+    }
+    if (/\btef\b/i.test(teamString) || tagsList.includes('tef') || tagsList.some(t => t.includes('tef'))) {
+      return { isSpecialized: true, label: 'TEF' };
+    }
+
+    return { isSpecialized: false, label: '' };
+  };
+  const getPendingFormInfo = getSpecializedTeamInfo;
+
+  // Exibição consistente e destacada do atendente: caso o ticket não possua atendente individual
+  // atribuído (atribuído apenas a um grupo no Zendesk), exibe um badge visual de alerta.
+  const renderAgentInfo = (ticket: AuditingQueueTicket) => {
+    const rawName = (ticket.agent_name || '').trim();
+    const hasAgent = rawName.length > 0 &&
+      !/^não\s*atribu[ií]do$/i.test(rawName) &&
+      !/^sem\s*atendente$/i.test(rawName) &&
+      rawName.toLowerCase() !== 'agente' &&
+      rawName.toLowerCase() !== 'n/d';
+
+    if (!hasAgent) {
+      return (
+        <span
+          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-700 dark:text-amber-400 font-bold text-[10px]"
+          title="Chamado atribuído apenas a Grupo de atendimento no Zendesk, sem analista específico atribuído."
+        >
+          <AlertTriangle className="w-3 h-3 text-amber-500 shrink-0" />
+          <span>Sem atendente atribuído (Apenas Grupo)</span>
+        </span>
+      );
+    }
+
+    return (
+      <span className="flex items-center gap-1 text-brand-secondary font-semibold">
+        <UserIcon className="w-3 h-3 text-brand-highlight shrink-0" />
+        <span>{ticket.agent_name}</span>
+      </span>
+    );
+  };
+
+  const renderTicketResolution = (ticket: AuditingQueueTicket) => {
+    const resolvedAt = ticket.status?.toLowerCase() === 'solved'
+      ? formatTicketDateTime(ticket.solved_at)
+      : '—';
+    const label = resolvedAt !== '—'
+      ? `Resolvido: ${resolvedAt}`
+      : ticket.status?.toLowerCase() === 'solved' ? 'Resolução indisponível' : 'Ainda não resolvido';
+    const details = [`Criado: ${formatTicketDateTime(ticket.ticket_date)}`];
+    if (ticket.csat_rated_at) details.push(`Avaliação CSAT: ${formatTicketDateTime(ticket.csat_rated_at)}`);
+    return (
+      <span className="flex items-center gap-1" title={details.join(' | ')}>
+        <Clock className="w-3 h-3 opacity-60" />
+        {label}
+      </span>
+    );
+  };
+
+  // Selo "Atribuído a" da distribuição 1-para-1, visível só para Supervisor
+  // de Qualidade e Admin (o monitor comum já só enxerga os seus na lista).
+  const renderAssignedMonitorBadge = (ticket: AuditingQueueTicket) => {
+    if (!isSupervisorView || !isDistributedQueue(activeQueue)) return null;
+    const assignment = queueAssignments[activeQueue][ticket.ticket_id];
+    if (!assignment) return null;
+    const monitor = qualityMonitors.find(m => m.id === assignment.assigned_to);
+    return (
+      <span className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5">
+        <Badge
+          variant="info"
+          size="xs"
+          className="min-w-0 max-w-full text-[9px] font-black uppercase tracking-wider bg-brand-accent/10 text-brand-accent border border-brand-accent/25 inline-flex items-center gap-1 shadow-2xs"
+          title={`${assignment.assignment_source === 'manual' ? 'Atribuição manual' : 'Distribuição automática'}${assignment.status === 'in_progress' ? ' · Em avaliação' : ''}`}
+        >
+          <UserIcon className="w-2.5 h-2.5 shrink-0" />
+          <span className="min-w-0 max-w-[12rem] truncate">{monitor?.name || 'Monitor'}</span>
+          {assignment.status === 'in_progress' && <span aria-label="Em avaliação" className="h-1.5 w-1.5 rounded-full bg-functional-warning" />}
+        </Badge>
+        <button
+          type="button"
+          onClick={() => setAssignmentModalTicket(ticket)}
+          className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-md border border-surface-border bg-surface-card text-brand-muted transition-colors hover:border-brand-accent/40 hover:bg-surface-subtle hover:text-brand-primary focus:outline-none focus:ring-1 focus:ring-brand-accent/30 shadow-2xs"
+          title="Alterar o monitor responsável"
+          aria-label="Alterar o monitor responsável"
+        >
+          <UserCog className="h-2.5 w-2.5" />
+        </button>
+      </span>
+    );
+  };
+
+  // Bloco de botões de ação de IA (Avaliar com IA / Reavaliar / Verificar Avaliação)
+  // Após avaliado com IA, o botão é "Verificar Avaliação" (em verde esmeralda) e abre
+  // diretamente o formulário oficial no fluxo das 4 etapas (1-2-3-4) para ir batendo os dados.
+  // Se ainda não avaliado, o botão principal é "Avaliar com IA" (índigo/roxo) ou "Auditar Manual".
+  const renderAiActions = (ticket: AuditingQueueTicket, accentClass: string) => {
+    if (ticket.already_audited) {
+      if (activeQueue === 'filhos' || activeQueue === 'filhos_invalidos') {
+        const valid = ticket.monitoria_status === 'concluida';
+        return <div className="flex flex-wrap items-center gap-2">
+          <Badge variant={valid ? 'warning' : 'neutral'} size="xs">
+            {valid ? 'Macro do filho pendente' : 'Monitoria do filho em revisão'}
+          </Badge>
+          {canAudit && <Button size="sm" variant="outline" onClick={() => handleStartManualChildAudit(ticket)}>
+            <FileText className="w-3.5 h-3.5" /> Nova avaliação manual
+          </Button>}
+          {ticket.monitoria_id && onOpenExistingMonitoria &&
+            <Button size="sm" variant="outline" onClick={() => onOpenExistingMonitoria(ticket.monitoria_id!)}>
+              <Eye className="w-3.5 h-3.5" /> Abrir monitoria
+            </Button>}
+        </div>;
+      }
+      const publishable = Boolean(ticket.monitoria_status && PUBLISHABLE_HELPDESK_STATUSES.has(ticket.monitoria_status));
+      const underReview = ticket.monitoria_status === 'pendente_revisao';
+      const owner = monitorias.find(monitoria => monitoria.id === ticket.monitoria_id)?.evaluator_id;
+      const mayPublish = currentUserRole === 'admin' || currentUserRole === 'gestor_qualidade'
+        || (currentUserRole === 'qualidade' && owner === currentUserId);
+      return <div className="flex flex-wrap items-center gap-2">
+        <Badge variant={publishable ? 'warning' : 'neutral'} size="xs">
+          {publishable ? `${underReview ? 'Em revisão' : 'Macro pendente'} · ${typeof ticket.monitoria_score === 'number' && Number.isFinite(ticket.monitoria_score)
+            ? getEvaluationOutcome(ticket.monitoria_score) === 'positiva' ? 'Válido' : 'Invalidado'
+            : 'Nota pendente'}` : 'Aguardando decisão da contestação'}
+        </Badge>
+        {publishable && mayPublish && ticket.monitoria_id && typeof ticket.monitoria_score === 'number' && Number.isFinite(ticket.monitoria_score) &&
+          <Button size="sm" variant="primary" onClick={() => setHelpdeskTicket(ticket)}>
+            <Send className="w-3.5 h-3.5" /> Revisar macro
+          </Button>}
+        {ticket.monitoria_id && onOpenExistingMonitoria &&
+          <Button size="sm" variant="outline" onClick={() => onOpenExistingMonitoria(ticket.monitoria_id!)}>
+            <Eye className="w-3.5 h-3.5" /> Abrir monitoria
+          </Button>}
+      </div>;
+    }
+    if (!canAudit) return null;
+    const isEvaluating = isEvaluatingTicket(ticket.ticket_id);
+
+    // Se o ticket está em processo de avaliação (mesmo que o usuário tenha mudado de tela/aba),
+    // mantém o botão em loading ativo até concluir!
+    if (isEvaluating) {
+      return (
+        <div className="flex min-w-0 flex-wrap items-center justify-end gap-1.5" role="status" aria-live="polite">
+          <Button
+            size="sm"
+            variant="primary"
+            disabled={true}
+            className="flex min-w-0 items-center justify-center gap-1.5 bg-indigo-600/80 text-white font-semibold shadow-xs cursor-not-allowed"
+          >
+            <QueueAIProgress step={ticketProgressStep(ticket.ticket_id)} waiting={aiJobs[ticket.ticket_id]?.phase === 'retry_pending'} fallback={aiJobs[ticket.ticket_id]?.phase === 'running_gemma' || aiJobs[ticket.ticket_id]?.phase === 'fallback_gemini'} />
+          </Button>
+          {renderCancelAIAction(ticket.ticket_id)}
+        </div>
+      );
+    }
+
+    const draft = drafts[ticket.ticket_id];
+
+    if (isDistributedQueue(activeQueue) && !queueAssignments[activeQueue][ticket.ticket_id]) {
+      return (
+        <div className="flex items-center gap-1.5 flex-wrap justify-end">
+          <Badge variant="warning" size="xs">Aguardando atribuição a um monitor</Badge>
+          {draft && canManageQueueAssignments(currentUserRole) && (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={deletingDraftId === ticket.ticket_id}
+              onClick={() => void handleRemoveDraft(ticket)}
+              aria-label={`Excluir rascunho de IA do ticket #${ticket.ticket_id}`}
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>Excluir rascunho</span>
+            </Button>
+          )}
+        </div>
+      );
+    }
+
+    if (ticket.saved_ai_draft && !draft) {
+      return <Badge variant="warning" size="xs">Carregando rascunho IA...</Badge>;
+    }
+
+    if (draft) {
+      return (
+        <div className="flex items-center gap-1.5 flex-wrap justify-end">
+          <Button
+            size="sm"
+            variant="primary"
+            onClick={() => handleLaunchMonitoria(ticket)}
+            className="flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold shadow-xs justify-center min-w-[145px]"
+            title="Abrir formulário oficial (fluxo 1-2-3-4) para conferir e bater as respostas da IA"
+          >
+            <CheckSquare className="w-3.5 h-3.5" />
+            <span>Verificar Avaliação</span>
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={deletingDraftId === ticket.ticket_id}
+            onClick={() => void handleRemoveDraft(ticket)}
+            className="flex items-center gap-1.5 border-functional-error/30 text-functional-error hover:bg-functional-error/10"
+            title="Excluir somente o rascunho de IA deste ticket"
+            aria-label={`Excluir rascunho de IA do ticket #${ticket.ticket_id}`}
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            <span>Excluir rascunho</span>
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={isEvaluating}
+            onClick={() => openGuidelinePicker(ticket)}
+            className="flex items-center gap-1 border-amber-400 text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/30 text-[11px] font-medium"
+            title="Escolher outra ficha ou manual e gerar um novo rascunho"
+          >
+            <Bot className={`w-3 h-3 ${isEvaluating ? 'animate-spin' : ''}`} />
+            <span>Reavaliar</span>
+          </Button>
+        </div>
+      );
+    }
+
+    return (
+      <div className="flex min-w-0 flex-wrap items-center justify-end gap-1.5">
+        {aiFeedback[ticket.ticket_id] && (
+          <span role="status" className="basis-full text-right text-[10px] text-brand-muted">
+            {aiFeedback[ticket.ticket_id]}
+          </span>
+        )}
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => activeQueue === 'filhos' || activeQueue === 'filhos_invalidos'
+            ? handleStartManualChildAudit(ticket) : handleStartManualAudit(ticket)}
+          className="flex items-center gap-1 text-[11px] text-brand-muted hover:text-brand-primary"
+          title={activeQueue === 'filhos' || activeQueue === 'filhos_invalidos'
+            ? 'Abrir a ficha de chamados filhos para avaliação manual, sem IA'
+            : 'Abrir monitoria manual no fluxo oficial 1-2-3-4'}
+        >
+          <FileText className="w-3.5 h-3.5" />
+          <span>{activeQueue === 'filhos' || activeQueue === 'filhos_invalidos' ? 'Avaliar Filho Manualmente' : 'Auditar Manual'}</span>
+        </Button>
+        <Button
+          size="sm"
+          variant="primary"
+          disabled={isEvaluating}
+          onClick={() => openGuidelinePicker(ticket)}
+          className={`flex items-center gap-1.5 ${accentClass || 'bg-indigo-600 hover:bg-indigo-700'} text-white font-semibold shadow-xs justify-center min-w-[135px]`}
+          title="Avaliar chamado com Inteligência Artificial"
+        >
+          <Bot className={`w-3.5 h-3.5 ${isEvaluating ? 'animate-spin' : ''}`} />
+          <span>{isEvaluating ? 'Analisando...' : 'Avaliar com IA'}</span>
+        </Button>
+      </div>
+    );
+  };
+
+  const getMacroBadge = (type?: ChildTicketMacroType) => {
+    switch (type) {
+      case 'nova_demanda':
+        return <Badge variant="primary" size="xs" className="font-bold">Nova Demanda</Badge>;
+      case 'analise_tecnica':
+        return <Badge variant="info" size="xs" className="font-bold">Análise Técnica N2</Badge>;
+      case 'apoio_tecnico':
+        return <Badge variant="warning" size="xs" className="font-bold">Apoio Técnico N2</Badge>;
+      case 'produtividade':
+        return <Badge variant="success" size="xs" className="font-bold">Produtividade</Badge>;
+      default:
+        return <Badge variant="neutral" size="xs" className="font-bold">Filho Geral</Badge>;
+    }
+  };
+
+  const getChildStatusBadge = (status?: 'conforme' | 'nao_conforme' | 'atencao') => {
+    switch (status) {
+      case 'conforme':
+        return <Badge variant="success" size="xs" className="font-black uppercase tracking-wider">Conforme</Badge>;
+      case 'nao_conforme':
+        return <Badge variant="error" size="xs" className="font-black uppercase tracking-wider">Não Conforme</Badge>;
+      case 'atencao':
+        return <Badge variant="warning" size="xs" className="font-black uppercase tracking-wider">Atenção</Badge>;
+      default:
+        return null;
+    }
+  };
+
+  const handleStartChildAudit = async (ticket: AuditingQueueTicket) => {
+    if (!canAudit) return;
+    const savedDraft = drafts[ticket.ticket_id];
+    const selectedChildForm = childTicketForm(forms);
+    if (!selectedChildForm) {
+      toast.error('A ficha única de chamados filhos não está disponível. Avise a Gestão da Qualidade.');
+      return;
+    }
+    let queueAssignment;
+    try {
+      queueAssignment = await beginAssignedWork(ticket, Boolean(ticket.already_audited || ticket.monitoria_id));
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Não foi possível abrir esta avaliação.');
+      return;
+    }
+    const matchedAgent = agents.find(a =>
+      a.id === (ticket.agent_id || savedDraft?.agent_id) ||
+      (ticket.agent_email && a.email.toLowerCase() === ticket.agent_email.toLowerCase()) ||
+      (ticket.agent_name && a.name.toLowerCase() === ticket.agent_name.toLowerCase())
+    );
+    handleCloseChildPreview();
+    onStartAudit({
+      ticket_id: ticket.ticket_id,
+      ticket_subject: ticket.subject,
+      form_id: selectedChildForm.id,
+      evaluated_id: ticket.agent_id || savedDraft?.agent_id || matchedAgent?.id,
+      team_id: resolveTicketTeamId({ ...ticket, team_id: ticket.team_id || savedDraft?.team_id }, matchedAgent),
+      ticket_group_team_id: ticket.ticket_group_team_id,
+      group_name: ticket.group_name,
+      channel: normalizeChannel(ticket.channel || savedDraft?.channel),
+      ticket_date: toTicketDateInput(ticket.ticket_date),
+      satisfaction_result: 'Sem pesquisa',
+      isAiLocked: true,
+      ticket_fields: savedDraft?.result.ticket_fields || ticket.ticket_fields,
+      child_evaluation: childResultFor(ticket),
+      dialogue: savedDraft?.result.dialogue || ticket.dialogue,
+      queue_assignment: queueAssignment,
+    });
+  };
+
+  // Controles de paginação com seletor de itens por página (5, 10, 15, 20) — padrão 10
+  const renderPagination = () => {
+    if (totalItems === 0 && !hasMore && prevCursors.length === 0) return null;
+
+    const canGoPrev = validCurrentPage > 1 || prevCursors.length > 0;
+    const canGoNext = validCurrentPage < totalLocalPages || hasMore;
+
+    const handlePrev = () => {
+      if (validCurrentPage > 1) {
+        setCurrentPage(p => Math.max(1, p - 1));
+      } else if (prevCursors.length > 0) {
+        goToPrevPage();
+      }
+    };
+
+    const handleNext = () => {
+      if (validCurrentPage < totalLocalPages) {
+        setCurrentPage(p => p + 1);
+      } else if (hasMore) {
+        goToNextPage();
+      }
+    };
+
+    return (
+      <div className="flex flex-col sm:flex-row items-center justify-between gap-3 px-3 py-3 border border-surface-border rounded-xl bg-surface-card shadow-premium-sm">
+        <div className="flex flex-wrap items-center gap-3 text-xs text-brand-muted">
+          <div className="flex items-center gap-1.5">
+            <span className="text-[11px] font-medium text-brand-muted">Exibir:</span>
+            <select
+              value={pageSize}
+              onChange={(e) => {
+                setPageSize(Number(e.target.value));
+                setCurrentPage(1);
+              }}
+              className="bg-surface-card border border-surface-border rounded-lg px-2.5 py-1 text-xs font-bold text-brand-primary focus:outline-none focus:ring-1 focus:ring-brand-highlight cursor-pointer hover:border-brand-highlight/50 transition-colors"
+            >
+              <option value={5} className="bg-surface-card text-brand-primary">5 por página</option>
+              <option value={10} className="bg-surface-card text-brand-primary">10 por página</option>
+              <option value={15} className="bg-surface-card text-brand-primary">15 por página</option>
+              <option value={20} className="bg-surface-card text-brand-primary">20 por página</option>
+            </select>
+          </div>
+          <span className="text-[11px] text-brand-muted">
+            {totalItems === 0 ? '0 chamados nesta página' : <>Mostrando <strong className="text-brand-primary font-bold">{startIndex + 1}–{endIndex}</strong> de <strong className="text-brand-primary font-bold">{totalItems}</strong> chamados</>}
+          </span>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] font-bold text-brand-muted mr-1">
+            Página {validCurrentPage} de {totalLocalPages}
+          </span>
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={!canGoPrev || loading}
+            onClick={handlePrev}
+            className="flex items-center gap-1 text-[11px] h-8 px-2.5"
+          >
+            <ChevronLeft className="w-3.5 h-3.5" />
+            <span>Anterior</span>
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={!canGoNext || loading}
+            onClick={handleNext}
+            className="flex items-center gap-1 text-[11px] h-8 px-2.5"
+          >
+            <span>Próxima</span>
+            <ChevronRight className="w-3.5 h-3.5" />
+          </Button>
+        </div>
+      </div>
+    );
+  };
+
+  const renderSkeletonGrid = () => (
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 animate-fade-in">
+      {[1, 2, 3, 4].map(idx => (
+        <Card key={idx} className="p-4 space-y-3.5 border-surface-border bg-surface-card/70 relative overflow-hidden">
+          {/* Shimmer sweep */}
+          <div className="absolute inset-0 -translate-x-full animate-shimmer bg-gradient-to-r from-transparent via-brand-highlight/10 to-transparent pointer-events-none" />
+          
+          <div className="flex items-start justify-between gap-3">
+            <div className="space-y-2 flex-1 min-w-0">
+              <div className="flex items-center gap-2">
+                <div className="h-4 w-16 rounded-md bg-surface-subtle animate-pulse" />
+                <div className="h-4 w-24 rounded-full bg-surface-subtle animate-pulse" />
+                <div className="h-3.5 w-12 rounded bg-surface-subtle animate-pulse" />
+              </div>
+              <div className="h-4 w-5/6 rounded-md bg-surface-subtle animate-pulse" />
+            </div>
+            <div className="h-6 w-20 rounded-full bg-surface-subtle animate-pulse flex-shrink-0" />
+          </div>
+
+          <div className="h-10 rounded-xl bg-surface-subtle/50 animate-pulse border border-surface-border/40" />
+
+          <div className="flex items-center justify-between pt-2.5 border-t border-surface-border">
+            <div className="flex items-center gap-3">
+              <div className="w-5 h-5 rounded-full bg-surface-subtle animate-pulse" />
+              <div className="h-3 w-28 rounded bg-surface-subtle animate-pulse" />
+              <div className="h-3 w-16 rounded bg-surface-subtle animate-pulse" />
+            </div>
+            <div className="h-7 w-24 rounded-lg bg-surface-subtle animate-pulse" />
+          </div>
+        </Card>
+      ))}
+    </div>
+  );
+
+  return (
+    <div className={currentSubTab === 'monitores'
+      ? 'space-y-6 animate-fade-in'
+      : 'flex min-h-[calc(100dvh-11rem)] md:min-h-[calc(100dvh-8.5rem)] flex-col gap-6 animate-fade-in'}>
+      {currentSubTab === 'monitores' ? (
+        !isSupervisorView ? (
+          <Card className="p-8 text-center border-amber-500/20 bg-amber-500/5 rounded-2xl">
+            <AlertTriangle className="w-10 h-10 text-amber-500 mx-auto mb-3" />
+            <h3 className="text-base font-bold text-brand-primary">Acesso Restrito</h3>
+            <p className="text-xs text-brand-muted mt-1 max-w-md mx-auto">
+              A visualização de Monitores na Triagem é exclusiva para Administradores e Supervisores de Qualidade.
+            </p>
+          </Card>
+        ) : (
+          <div className="space-y-6">
+            {/* Card de Boas-vindas / Contexto da Supervisão */}
+            <div className="p-6 rounded-2xl bg-surface-card border border-surface-border shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4">
+              <div className="flex items-start gap-4">
+                <div className="w-12 h-12 rounded-2xl bg-brand-highlight/10 text-brand-highlight flex items-center justify-center shrink-0">
+                  <Users className="w-6 h-6" />
+                </div>
+                <div className="space-y-1">
+                  <h3 className="text-base font-bold text-brand-primary">Painel de Supervisão e Presença dos Monitores</h3>
+                  <p className="text-xs text-brand-muted max-w-2xl leading-relaxed">
+                    Gerencie a presença em tempo real e a elegibilidade da equipe para a distribuição 1-para-1 de chamados. Apenas monitores marcados como <strong className="text-brand-primary">Aptos</strong> e que estejam <strong className="text-emerald-500">Online</strong> recebem chamados em rodízio das filas <strong className="text-brand-primary">CSAT Negativas</strong> e <strong className="text-brand-primary">Chamados Filhos</strong>.
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 self-start md:self-center shrink-0">
+                <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-surface-subtle border border-surface-border text-xs font-bold text-brand-primary">
+                  <span className="relative flex h-2 w-2">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+                  </span>
+                  {eligibleOnlineMonitors.length} de {qualityMonitors.length} aptos online
+                </span>
+              </div>
+            </div>
+
+            {/* Grid de Métricas Principais (4 Bento Cards) */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+              <Card className="p-4 rounded-xl border-surface-border/70 flex items-center gap-3.5">
+                <div className="w-10 h-10 rounded-xl bg-blue-500/10 text-blue-600 dark:text-blue-400 flex items-center justify-center shrink-0">
+                  <Users className="w-5 h-5" />
+                </div>
+                <div>
+                  <p className="text-[11px] font-semibold text-brand-muted uppercase tracking-wider">Total de Monitores</p>
+                  <p className="text-xl font-black text-brand-primary mt-0.5">{qualityMonitors.length}</p>
+                  <p className="text-[10px] text-brand-muted">Equipe de Qualidade cadastrada</p>
+                </div>
+              </Card>
+
+              <Card className="p-4 rounded-xl border-surface-border/70 flex items-center gap-3.5">
+                <div className="w-10 h-10 rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 flex items-center justify-center shrink-0">
+                  <Activity className="w-5 h-5" />
+                </div>
+                <div>
+                  <p className="text-[11px] font-semibold text-brand-muted uppercase tracking-wider">Monitores Online</p>
+                  <p className="text-xl font-black text-brand-primary mt-0.5">
+                    {qualityMonitors.filter(m => onlineUserIds.has(m.id)).length}
+                  </p>
+                  <p className="text-[10px] text-brand-muted">Conectados agora no sistema</p>
+                </div>
+              </Card>
+
+              <Card className="p-4 rounded-xl border-surface-border/70 flex items-center gap-3.5">
+                <div className="w-10 h-10 rounded-xl bg-brand-highlight/10 text-brand-highlight flex items-center justify-center shrink-0">
+                  <ShieldCheck className="w-5 h-5" />
+                </div>
+                <div>
+                  <p className="text-[11px] font-semibold text-brand-muted uppercase tracking-wider">Aptos na Distribuição</p>
+                  <p className="text-xl font-black text-brand-primary mt-0.5">
+                    {eligibleOnlineMonitors.length}
+                  </p>
+                  <p className="text-[10px] text-brand-muted">Habilitados e online no rodízio</p>
+                </div>
+              </Card>
+
+              <Card className="p-4 rounded-xl border-surface-border/70 flex items-center gap-3.5">
+                <div className="w-10 h-10 rounded-xl bg-purple-500/10 text-purple-600 dark:text-purple-400 flex items-center justify-center shrink-0">
+                  <GitFork className="w-5 h-5" />
+                </div>
+                <div>
+                  <p className="text-[11px] font-semibold text-brand-muted uppercase tracking-wider">Filas Automatizadas</p>
+                  <p className="text-xl font-black text-brand-primary mt-0.5">2 Filas</p>
+                  <p className="text-[10px] text-brand-muted">CSAT Negativas & Chamados Filhos</p>
+                </div>
+              </Card>
+            </div>
+
+            {/* Tabela Interativa de Monitores */}
+            <Card className="rounded-2xl border-surface-border overflow-hidden shadow-sm">
+              <div className="p-4 sm:p-5 border-b border-surface-border bg-surface-subtle/30 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <h4 className="text-sm font-bold text-brand-primary flex items-center gap-2">
+                    <UserCog className="w-4 h-4 text-brand-highlight" />
+                    Elegibilidade e Distribuição Individual
+                  </h4>
+                  <p className="text-xs text-brand-muted mt-0.5">
+                    Clique no botão de status para habilitar ou pausar a atribuição de novos tickets para cada monitor.
+                  </p>
+                </div>
+              </div>
+
+              <div className="divide-y divide-surface-border">
+                {qualityMonitors.length === 0 ? (
+                  <div className="p-8 text-center text-brand-muted text-xs">
+                    Nenhum monitor de qualidade cadastrado no sistema.
+                  </div>
+                ) : (
+                  qualityMonitors.map(monitor => {
+                    const isOnline = onlineUserIds.has(monitor.id);
+                    const isEnabled = Boolean(monitorEligibility[monitor.id]);
+                    const assignedNegativas = Object.values(queueAssignments.negativas).filter(a => a.assigned_to === monitor.id).length;
+                    const assignedFilhos = Object.values(queueAssignments.filhos).filter(a => a.assigned_to === monitor.id).length;
+                    const totalAssigned = assignedNegativas + assignedFilhos;
+
+                    return (
+                      <div
+                        key={monitor.id}
+                        className="p-4 sm:px-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:bg-surface-subtle/20 transition-colors"
+                      >
+                        {/* Avatar & Identificação */}
+                        <div className="flex items-center gap-3.5 min-w-0">
+                          <div className="w-10 h-10 rounded-xl bg-brand-highlight/10 text-brand-highlight flex items-center justify-center font-bold text-sm shrink-0">
+                            {monitor.name.substring(0, 2).toUpperCase()}
+                          </div>
+                          <div className="min-w-0">
+                            <p className="text-xs font-bold text-brand-primary truncate">{monitor.name}</p>
+                            <p className="text-[11px] text-brand-muted truncate">{monitor.email}</p>
+                          </div>
+                        </div>
+
+                        {/* Status de Presença Realtime */}
+                        <div className="flex items-center gap-3 flex-wrap">
+                          {isOnline ? (
+                            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border border-emerald-500/20">
+                              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                              Online
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-surface-subtle text-brand-muted border border-surface-border">
+                              <span className="w-2 h-2 rounded-full bg-brand-muted/40" />
+                              Offline
+                            </span>
+                          )}
+
+                          {/* Carga Atribuída */}
+                          <div className="flex items-center gap-1.5 text-[11px] text-brand-muted bg-surface-subtle/60 px-2.5 py-1 rounded-lg border border-surface-border">
+                            <span>Carga:</span>
+                            <span className="font-bold text-brand-primary">{totalAssigned} tickets</span>
+                            {totalAssigned > 0 && (
+                              <span className="text-[10px] text-brand-muted">
+                                ({assignedNegativas} neg. / {assignedFilhos} fil.)
+                              </span>
+                            )}
+                          </div>
+
+                          {/* Botão de Toggle de Elegibilidade */}
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              const next = !isEnabled;
+                              setMonitorEligibility(prev => ({ ...prev, [monitor.id]: next }));
+                              try {
+                                await saveMonitorEligibility(monitor.id, next);
+                                toast.success(`Monitor ${monitor.name} ${next ? 'habilitado para' : 'pausado na'} distribuição.`);
+                              } catch (e: any) {
+                                setMonitorEligibility(prev => ({ ...prev, [monitor.id]: isEnabled }));
+                                toast.error('Erro ao atualizar status do monitor.');
+                              }
+                            }}
+                            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer border ${
+                              isEnabled
+                                ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/25'
+                                : 'bg-surface-subtle border-surface-border text-brand-muted hover:text-brand-primary hover:bg-surface-card'
+                            }`}
+                          >
+                            {isEnabled ? (
+                              <>
+                                <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                                <span>Apto na Distribuição</span>
+                              </>
+                            ) : (
+                              <>
+                                <X className="w-3.5 h-3.5 text-brand-muted" />
+                                <span>Pausado na Fila</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </Card>
+          </div>
+        )
+      ) : (
+        <>
+
+      {/* 2. Barra Superior da Fila — Toolbar Compacta e Coesa */}
+      <div className="sticky top-0 z-30 flex flex-wrap md:flex-nowrap items-center gap-2 p-2 rounded-xl bg-surface-card/95 backdrop-blur-md border border-surface-border shadow-premium-sm transition-all">
+        {/* Campo de Busca (elemento de maior largura) */}
+        <div className="relative flex-1 min-w-[200px] max-w-none sm:max-w-md">
+          <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-brand-muted pointer-events-none" />
+          <input
+            type="text"
+            aria-label="Buscar"
+            placeholder="Buscar por ID, assunto ou agente..."
+            value={searchTerm}
+            onChange={e => setSearchTerm(e.target.value)}
+            className="w-full h-9 pl-8 pr-7 text-xs rounded-lg bg-surface-subtle/50 hover:bg-surface-subtle/70 focus:bg-surface-subtle border border-surface-border text-brand-primary placeholder:text-brand-muted/70 focus:outline-none focus:border-brand-highlight/60 transition-all"
+          />
+          {searchTerm && (
+            <button
+              type="button"
+              onClick={() => setSearchTerm('')}
+              aria-label="Limpar busca"
+              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-brand-muted hover:text-brand-primary cursor-pointer p-0.5"
+            >
+              <X className="w-3 h-3" />
+            </button>
+          )}
+        </div>
+
+        {/* Seletor de Monitor (imediatamente ao lado da busca) */}
+        {isSupervisorView && isDistributedQueue(activeQueue) && (
+          <QueueMonitorFilter
+            monitors={qualityMonitors}
+            value={selectedMonitorFilter}
+            onChange={setSelectedMonitorFilter}
+            found={totalItems}
+            assignmentsReady={assignmentsReady[activeQueue]}
+          />
+        )}
+
+        {/* Dropdown Compacto de Filtros (Todos, Com Rascunho IA, Sem Rascunho) */}
+        <div className="relative shrink-0" ref={filterDropdownRef}>
+          <button
+            type="button"
+            onClick={() => setIsFilterDropdownOpen(prev => !prev)}
+            aria-expanded={isFilterDropdownOpen}
+            aria-haspopup="true"
+            className={`h-9 px-3 rounded-lg border text-xs font-medium inline-flex items-center gap-1.5 transition-all cursor-pointer ${
+              activeFiltersCount > 0
+                ? 'bg-brand-highlight/10 border-brand-highlight/30 text-brand-primary font-semibold'
+                : 'bg-surface-subtle/50 hover:bg-surface-subtle/70 border-surface-border text-brand-muted hover:text-brand-primary'
+            }`}
+          >
+            <SlidersHorizontal className="w-3.5 h-3.5" />
+            <span>{activeFiltersCount === 0 ? 'Filtros' : `Filtros · ${activeFiltersCount}`}</span>
+            <ChevronDown className={`w-3 h-3 text-brand-muted transition-transform duration-200 ${isFilterDropdownOpen ? 'rotate-180' : ''}`} />
+          </button>
+
+          {isFilterDropdownOpen && (
+            <div
+              role="menu"
+              className="absolute top-full left-0 mt-1.5 z-30 min-w-[240px] p-1.5 rounded-xl bg-surface-card border border-surface-border shadow-xl backdrop-blur-md animate-fade-in"
+            >
+              <div className="px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-brand-muted">
+                Status de Rascunho
+              </div>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setAiDraftFilter('all');
+                  setIsFilterDropdownOpen(false);
+                }}
+                className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs text-left transition-colors cursor-pointer ${
+                  aiDraftFilter === 'all'
+                    ? 'bg-surface-subtle text-brand-primary font-semibold'
+                    : 'text-brand-muted hover:text-brand-primary hover:bg-surface-subtle/50'
+                }`}
+              >
+                <span>Todos</span>
+                {aiDraftFilter === 'all' && <Check className="w-3.5 h-3.5 text-brand-highlight" />}
+              </button>
+
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setAiDraftFilter('with_draft');
+                  setIsFilterDropdownOpen(false);
+                }}
+                className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs text-left transition-colors cursor-pointer ${
+                  aiDraftFilter === 'with_draft'
+                    ? 'bg-surface-subtle text-brand-primary font-semibold'
+                    : 'text-brand-muted hover:text-brand-primary hover:bg-surface-subtle/50'
+                }`}
+              >
+                <span className="flex items-center gap-1.5">
+                  <Bot className="w-3.5 h-3.5 text-brand-highlight" />
+                  <span>Com Rascunho IA</span>
+                </span>
+                {aiDraftFilter === 'with_draft' && <Check className="w-3.5 h-3.5 text-brand-highlight" />}
+              </button>
+
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setAiDraftFilter('without_draft');
+                  setIsFilterDropdownOpen(false);
+                }}
+                className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-xs text-left transition-colors cursor-pointer ${
+                  aiDraftFilter === 'without_draft'
+                    ? 'bg-surface-subtle text-brand-primary font-semibold'
+                    : 'text-brand-muted hover:text-brand-primary hover:bg-surface-subtle/50'
+                }`}
+              >
+                <span className="flex items-center gap-1.5">
+                  <FileText className="w-3.5 h-3.5 text-brand-muted" />
+                  <span>Sem Rascunho</span>
+                </span>
+                {aiDraftFilter === 'without_draft' && <Check className="w-3.5 h-3.5 text-brand-highlight" />}
+              </button>
+              <QueueWithoutMonitoriaFilter checked={onlyWithoutMonitoria} onChange={checked => {
+                setOnlyWithoutMonitoria(checked);
+                setIsFilterDropdownOpen(false);
+              }} />
+            </div>
+          )}
+        </div>
+
+        {/* Espaço flexível para empurrar ações para a direita */}
+        <div className="flex-1 hidden md:block" />
+
+        {/* Ações da Toolbar */}
+        <div className="flex items-center gap-2 shrink-0 ml-auto md:ml-0">
+          {/* Seleção de tickets da página atual */}
+          {canAudit && paginatedTickets.some(ticket => !ticket.already_audited) && (
+            <label
+              className="h-9 inline-flex items-center gap-1.5 px-2.5 rounded-lg border border-surface-border bg-surface-subtle/40 hover:bg-surface-subtle text-xs font-medium text-brand-muted hover:text-brand-primary cursor-pointer transition-colors shrink-0 select-none"
+              title={paginatedTickets.filter(t => !t.already_audited).every(t => selectedTicketIds.has(t.ticket_id)) ? 'Desmarcar todos os chamados da página' : 'Selecionar todos os chamados da página'}
+            >
+              <input
+                type="checkbox"
+                checked={paginatedTickets.filter(t => !t.already_audited).every(t => selectedTicketIds.has(t.ticket_id))}
+                onChange={handleToggleSelectAllCurrentPage}
+                disabled={batchRunning}
+                className="w-3.5 h-3.5 rounded text-brand-highlight focus:ring-brand-highlight border-surface-border cursor-pointer"
+              />
+              <span className="hidden sm:inline">
+                {paginatedTickets.filter(t => !t.already_audited).every(t => selectedTicketIds.has(t.ticket_id)) ? 'Desmarcar' : 'Selecionar'}
+              </span>
+              {selectedTicketIds.size > 0 && (
+                <span className="px-1.5 py-0.2 rounded-full bg-brand-highlight text-white text-[10px] font-bold">
+                  {selectedTicketIds.size}
+                </span>
+              )}
+            </label>
+          )}
+
+          {/* Botão Avaliar Página / Selecionados */}
+          {canAudit && (activeQueue === 'positivas' || activeQueue === 'proativas' || activeQueue === 'negativas' || activeQueue === 'filhos' || activeQueue === 'filhos_invalidos') && (
+            <button
+              type="button"
+              onClick={handleBatchEvaluate}
+              disabled={loading || (paginatedTickets.length === 0 && selectedTicketIds.size === 0) || (evaluableTicketsCount === 0 && selectedTicketIds.size === 0) || batchRunning}
+              className={`h-9 px-3 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 shrink-0 transition-all cursor-pointer ${
+                loading || (paginatedTickets.length === 0 && selectedTicketIds.size === 0) || (evaluableTicketsCount === 0 && selectedTicketIds.size === 0) || batchRunning
+                  ? 'opacity-40 cursor-not-allowed bg-surface-subtle/40 border border-surface-border text-brand-muted shadow-none'
+                  : activeQueue === 'negativas'
+                  ? 'bg-rose-500/15 border border-rose-500/30 text-rose-600 dark:text-rose-400 hover:bg-rose-500/25'
+                  : activeQueue === 'proativas'
+                  ? 'bg-violet-500/15 border border-violet-500/30 text-violet-600 dark:text-violet-400 hover:bg-violet-500/25'
+                  : 'bg-emerald-500/15 border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/25'
+              }`}
+              title={
+                evaluableTicketsCount === 0 && selectedTicketIds.size === 0
+                  ? 'Nenhum chamado pendente de avaliação nesta página'
+                  : 'Avaliar chamados com IA'
+              }
+            >
+              <Zap className="w-3.5 h-3.5" />
+              <span>
+                {selectedTicketIds.size > 0
+                  ? `Avaliar Selecionados (${selectedTicketIds.size})`
+                  : `Avaliar Página (${evaluableTicketsCount})`}
+              </span>
+            </button>
+          )}
+
+          {/* Botão Atualizar (ação secundária discreta com tooltip) */}
+          <button
+            type="button"
+            onClick={refreshQueue}
+            disabled={loading}
+            aria-label="Atualizar"
+            title={loading ? 'Sincronizando com Zendesk...' : 'Atualizar fila'}
+            className={`h-9 w-9 p-0 inline-flex items-center justify-center shrink-0 rounded-lg border border-surface-border bg-surface-subtle/50 hover:bg-surface-subtle text-brand-muted hover:text-brand-primary transition-colors cursor-pointer ${
+              loading ? 'cursor-not-allowed opacity-80' : ''
+            }`}
+          >
+            <RefreshCw className={`w-3.5 h-3.5 transition-transform ${loading ? 'animate-spin text-brand-highlight' : ''}`} />
+          </button>
+        </div>
+
+        {/* Linha de Pulso de Sincronização integrada à borda inferior (Zero Layout Shift) */}
+        <div
+          className={`absolute bottom-0 left-0 right-0 h-0.5 overflow-hidden rounded-b-xl transition-opacity duration-300 pointer-events-none ${
+            loading ? 'opacity-100' : 'opacity-0'
+          }`}
+        >
+          <div className="w-full h-full bg-gradient-to-r from-transparent via-brand-highlight to-transparent animate-shimmer" />
+        </div>
+      </div>
+
+      {currentUserRole !== 'gestor_suporte' && (reconciliation || reconciliationLoading || reconciliationError) && (
+        <section aria-label="Conciliação da fila com o Zendesk"
+          className="rounded-xl border border-surface-border bg-surface-card px-4 py-3 text-brand-primary">
+          {reconciliation ? (
+            <>
+              <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-xs">
+                <span><strong className="tabular-nums text-base">{reconciliation.zendesk_view_count}</strong> na view do Zendesk</span>
+                <span><strong className="tabular-nums text-base">{reconciliation.without_monitoria_count}</strong> sem monitoria na view</span>
+                <span><strong className="tabular-nums text-base">{reconciliation.monitored_count}</strong> já têm monitoria</span>
+                {reconciliationLoading && <span className="text-brand-muted">Atualizando…</span>}
+              </div>
+              {reconciliation.monitored_count > 0 && (
+                <details className="mt-2 border-t border-surface-border pt-2 text-xs">
+                  <summary className="cursor-pointer font-semibold text-brand-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-highlight">
+                    Ver tickets que já têm monitoria e a etapa de cada um
+                  </summary>
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {Object.entries(reconciliation.monitoria_statuses).map(([status, count]) => (
+                      <span key={status} className="rounded-md bg-surface-subtle px-2 py-1 text-brand-muted">
+                        {MONITORIA_STAGE_LABELS[status] || status.replaceAll('_', ' ')}: {count}
+                      </span>
+                    ))}
+                  </div>
+                  <ul className="mt-2 max-h-48 space-y-1 overflow-y-auto" aria-label="Tickets com monitoria">
+                    {reconciliation.monitored_tickets.map(item => (
+                      <li key={item.ticket_id}>
+                        <button type="button" disabled={!onOpenExistingMonitoria}
+                          onClick={() => onOpenExistingMonitoria?.(item.monitoria_id)}
+                          className="w-full rounded-md px-2 py-1.5 text-left hover:bg-surface-subtle disabled:cursor-default focus-visible:outline-2 focus-visible:outline-brand-highlight">
+                          <span className="font-semibold">Ticket #{item.ticket_id}</span>
+                          <span className="ml-2 text-brand-muted">{MONITORIA_STAGE_LABELS[item.status] || item.status.replaceAll('_', ' ')}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              )}
+              <p className="mt-2 text-[11px] text-brand-muted">
+                A distribuição entre monitores e os filtros do QWP podem mostrar menos cards que a view.
+              </p>
+            </>
+          ) : reconciliationLoading ? (
+            <p className="text-xs text-brand-muted">Conferindo os tickets da view com as monitorias salvas…</p>
+          ) : (
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+              <span>Não foi possível conferir a view agora.</span>
+              <button type="button" onClick={() => setReconciliationRefreshKey(key => key + 1)}
+                className="font-semibold text-brand-highlight hover:underline focus-visible:outline-2 focus-visible:outline-brand-highlight">
+                Tentar novamente
+              </button>
+            </div>
+          )}
+        </section>
+      )}
+
+      {hasQueueUpdates && (
+        <div role="status" className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-brand-accent/30 bg-brand-accent/10 px-3 py-2 text-xs text-brand-primary">
+          <span>Há novidades na fila. Atualize para ver os chamados mais recentes.</span>
+          <button type="button" onClick={refreshQueue} disabled={loading}
+            className="font-bold text-brand-accent hover:underline disabled:opacity-50">
+            Atualizar agora
+          </button>
+        </div>
+      )}
+
+      {/* Conteúdo da Fila: NEGATIVAS */}
+      {activeQueue === 'negativas' && (
+        <div className="flex flex-1 flex-col gap-4">
+          {loading && paginatedTickets.length === 0 ? (
+            renderSkeletonGrid()
+          ) : paginatedTickets.length === 0 ? (
+            <>
+              <div className="p-8 text-center bg-surface-subtle/30 rounded-2xl border border-dashed border-surface-border">
+                <AlertTriangle className="w-8 h-8 mx-auto text-brand-muted/50 mb-2" />
+                <p className="text-xs font-bold text-brand-muted">
+                  {selectedMonitorFilter ? 'Nenhum ticket deste monitor nesta página da fila.' : 'Nenhum chamado com CSAT Ruim pendente nesta fila.'}
+                </p>
+              </div>
+              {renderPagination()}
+            </>
+          ) : (
+            <>
+              {/* Lista de Tickets Negativos */}
+              <div className={`grid grid-cols-1 md:grid-cols-2 gap-4 transition-opacity duration-200 `}>
+            {paginatedTickets.map(ticket => (
+              <Card key={ticket.ticket_id} className={`grid h-full grid-rows-[auto_1fr_auto] gap-3 p-4 hover:border-brand-highlight/40 transition-all ${selectedTicketIds.has(ticket.ticket_id) ? 'ring-2 ring-brand-highlight/40 border-brand-highlight/50 bg-brand-highlight/3' : ''}`}>
+                <div className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2.5 gap-y-2">
+                    {canAudit && !ticket.already_audited ? <input
+                      type="checkbox"
+                      checked={selectedTicketIds.has(ticket.ticket_id)}
+                      onChange={() => toggleTicketSelection(ticket.ticket_id)}
+                      disabled={batchRunning}
+                      className="w-4 h-4 mt-0.5 rounded text-brand-highlight focus:ring-brand-highlight border-surface-border cursor-pointer flex-shrink-0"
+                      title="Selecionar para avaliação"
+                    /> : <span className="w-4 h-4" aria-hidden="true" />}
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <QueueTicketNumber ticketId={ticket.ticket_id} />
+                        {getSpecializedTeamInfo(ticket).label && (
+                          <Badge variant="warning" size="xs" className="text-[9px] font-black uppercase tracking-wider bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/30 inline-flex items-center gap-1 shadow-2xs" title={`Atendimento da equipe ${getSpecializedTeamInfo(ticket).label} — avaliado com as fichas ativas`}>
+                            <AlertTriangle className="w-2.5 h-2.5 text-amber-500 shrink-0" />
+                            <span>{getSpecializedTeamInfo(ticket).label}</span>
+                          </Badge>
+                        )}
+                        <a
+                          href={ticket.url || `https://webposto.zendesk.com/agent/tickets/${ticket.ticket_id}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-[10px] font-bold text-brand-highlight hover:underline"
+                          title="Abrir no Zendesk"
+                        >
+                          <ExternalLink className="w-2.5 h-2.5" />
+                          <span>Zendesk</span>
+                        </a>
+                        {ticket.already_audited && <Badge variant="warning" size="xs" className="text-[9px]">Macro pendente</Badge>}
+                      </div>
+                      <h4 className="text-xs font-bold text-brand-primary mt-1 line-clamp-1">
+                        {ticket.subject}
+                      </h4>
+                    </div>
+                  <div className="col-start-2 flex min-w-0 flex-wrap items-center gap-1.5">
+                    {renderAssignedMonitorBadge(ticket)}
+                    {renderScoreBadge(ticket)}
+                    <Badge variant="error" size="xs" className="uppercase font-black tracking-widest flex-shrink-0">
+                      CSAT Ruim
+                    </Badge>
+                  </div>
+                </div>
+
+                <div aria-label="Comentário de satisfação do cliente" className="p-2.5 rounded-xl bg-functional-error/5 border border-functional-error/15 text-[11px] font-medium text-brand-primary italic">
+                  "{ticket.csat_comment?.trim() || ''}"
+                </div>
+
+                <div className="row-start-3 flex flex-col items-stretch gap-2 border-t border-surface-border pt-2.5 text-[10px] font-bold text-brand-muted">
+                  <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+                    {renderAgentInfo(ticket)}
+                    {renderTicketResolution(ticket)}
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    {renderAiActions(ticket, 'action-primary')}
+                  </div>
+                </div>
+              </Card>
+            ))}
+          </div>
+          {renderPagination()}
+          </>
+        )}
+        </div>
+      )}
+
+      {/* Conteúdo da Fila: PROATIVAS (Amostragem Justa) */}
+      {activeQueue === 'proativas' && (
+        <div className="flex flex-1 flex-col gap-4">
+          {loading && paginatedTickets.length === 0 ? (
+            renderSkeletonGrid()
+          ) : paginatedTickets.length === 0 ? (
+            <div className="p-8 text-center bg-surface-subtle/30 rounded-2xl border border-dashed border-surface-border">
+              <Zap className="w-8 h-8 mx-auto text-brand-muted/50 mb-2" />
+              <p className="text-xs font-bold text-brand-muted">Nenhum chamado com CSAT Vazio pendente nesta fila.</p>
+            </div>
+          ) : (
+            <>
+              {/* Lista de Chamados com CSAT Vazio */}
+              <div className={`grid grid-cols-1 md:grid-cols-2 gap-4 transition-opacity duration-200 `}>
+                {paginatedTickets.map(ticket => {
+                  const isPriority = ticket.agent_email && topPriorityEmails.has(ticket.agent_email.toLowerCase());
+                  return (
+                    <Card key={ticket.ticket_id} className={`grid h-full grid-rows-[auto_1fr_auto] gap-3 p-4 hover:border-info/40 transition-all ${selectedTicketIds.has(ticket.ticket_id) ? 'ring-2 ring-info/40 border-info/50 bg-info/3' : ''}`}>
+                      <div className="flex items-start justify-between gap-2.5">
+                        <div className="flex items-start gap-2.5 flex-1 min-w-0">
+                          {canAudit ? <input
+                            type="checkbox"
+                            checked={selectedTicketIds.has(ticket.ticket_id)}
+                            onChange={() => toggleTicketSelection(ticket.ticket_id)}
+                            disabled={batchRunning}
+                            className="w-4 h-4 mt-0.5 rounded text-info focus:ring-info border-surface-border cursor-pointer flex-shrink-0"
+                            title="Selecionar para avaliação"
+                          /> : <span className="w-4 h-4 shrink-0" aria-hidden="true" />}
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <QueueTicketNumber ticketId={ticket.ticket_id} />
+                              {getSpecializedTeamInfo(ticket).label && (
+                                <Badge variant="warning" size="xs" className="text-[9px] font-black uppercase tracking-wider bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/30 inline-flex items-center gap-1 shadow-2xs" title={`Atendimento da equipe ${getSpecializedTeamInfo(ticket).label} — avaliado com as fichas ativas`}>
+                                  <AlertTriangle className="w-2.5 h-2.5 text-amber-500 shrink-0" />
+                                  <span>{getSpecializedTeamInfo(ticket).label}</span>
+                                </Badge>
+                              )}
+                              <a
+                                href={ticket.url || `https://webposto.zendesk.com/agent/tickets/${ticket.ticket_id}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1 text-[10px] font-bold text-info hover:underline"
+                                title="Abrir no Zendesk"
+                              >
+                                <ExternalLink className="w-2.5 h-2.5" />
+                                <span>Zendesk</span>
+                              </a>
+                              {ticket.already_audited && (
+                                <Badge variant="success" size="xs" className="text-[9px]">
+                                  Auditado
+                                </Badge>
+                              )}
+                              {isPriority && (
+                                <Badge variant="warning" size="xs" className="text-[9px]">
+                                  Prioritário
+                                </Badge>
+                              )}
+                            </div>
+                            <h4 className="text-xs font-bold text-brand-primary mt-1 line-clamp-1">
+                              {ticket.subject}
+                            </h4>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2.5 flex-shrink-0">
+                          {renderScoreBadge(ticket)}
+                          <Badge variant="neutral" size="xs" className="uppercase font-black tracking-widest flex-shrink-0">
+                            CSAT Vazio
+                          </Badge>
+                        </div>
+                      </div>
+
+                      <div className="row-start-3 flex flex-col items-stretch gap-2 border-t border-surface-border pt-2.5 text-[10px] font-bold text-brand-muted">
+                        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+                          {renderAgentInfo(ticket)}
+                          {renderTicketResolution(ticket)}
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-2">
+                          {renderAiActions(ticket, 'bg-gradient-to-r from-info to-info/80')}
+                        </div>
+                      </div>
+                    </Card>
+                  );
+                })}
+              </div>
+              {renderPagination()}
+            </>
+          )}
+          {!loading && paginatedTickets.length === 0 && renderPagination()}
+        </div>
+      )}
+
+      {/* Conteúdo da Fila: POSITIVAS (+ IA Copilot) */}
+      {activeQueue === 'positivas' && (
+        <div className="flex flex-1 flex-col gap-4">
+          {loading && paginatedTickets.length === 0 ? (
+            renderSkeletonGrid()
+          ) : paginatedTickets.length === 0 ? (
+            <div className="p-8 text-center bg-surface-subtle/30 rounded-2xl border border-dashed border-surface-border">
+              <Sparkles className="w-8 h-8 mx-auto text-brand-muted/50 mb-2" />
+              <p className="text-xs font-bold text-brand-muted">Nenhum chamado com CSAT Bom pendente nesta fila.</p>
+            </div>
+          ) : (
+            <>
+              {/* Lista de Chamados Positivos */}
+              <div className={`grid grid-cols-1 md:grid-cols-2 gap-4 transition-opacity duration-200 `}>
+                {paginatedTickets.map(ticket => (
+                  <Card key={ticket.ticket_id} className={`grid h-full grid-rows-[auto_1fr_auto] gap-3 p-4 hover:border-functional-success/40 transition-all ${selectedTicketIds.has(ticket.ticket_id) ? 'ring-2 ring-emerald-500/40 border-emerald-500/50 bg-emerald-500/3' : ''}`}>
+                    <div className="flex flex-col gap-2">
+                      <div className="flex items-start gap-2.5 min-w-0">
+                        {canAudit ? <input
+                          type="checkbox"
+                          checked={selectedTicketIds.has(ticket.ticket_id)}
+                          onChange={() => toggleTicketSelection(ticket.ticket_id)}
+                          disabled={batchRunning}
+                          className="w-4 h-4 mt-0.5 rounded text-emerald-600 focus:ring-emerald-500 border-surface-border cursor-pointer flex-shrink-0"
+                          title="Selecionar para avaliação"
+                        /> : <span className="w-4 h-4 shrink-0" aria-hidden="true" />}
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <QueueTicketNumber ticketId={ticket.ticket_id} />
+                            {getSpecializedTeamInfo(ticket).label && (
+                              <Badge variant="warning" size="xs" className="text-[9px] font-black uppercase tracking-wider bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/30 inline-flex items-center gap-1 shadow-2xs" title={`Atendimento da equipe ${getSpecializedTeamInfo(ticket).label} — avaliado com as fichas ativas`}>
+                                <AlertTriangle className="w-2.5 h-2.5 text-amber-500 shrink-0" />
+                                <span>{getSpecializedTeamInfo(ticket).label}</span>
+                              </Badge>
+                            )}
+                            <a
+                              href={ticket.url || `https://webposto.zendesk.com/agent/tickets/${ticket.ticket_id}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 text-[10px] font-bold text-brand-highlight hover:underline"
+                              title="Abrir no Zendesk"
+                            >
+                              <ExternalLink className="w-2.5 h-2.5" />
+                              <span>Zendesk</span>
+                            </a>
+                            {ticket.already_audited && (
+                              <Badge variant="success" size="xs" className="text-[9px]">
+                                Auditado
+                              </Badge>
+                            )}
+                          </div>
+                          <h4 className="text-xs font-bold text-brand-primary mt-1 line-clamp-1">
+                            {ticket.subject}
+                          </h4>
+                        </div>
+                      </div>
+                      <div className="flex min-w-0 flex-wrap items-center gap-1.5 pl-[26px]">
+                        {renderScoreBadge(ticket)}
+                        <Badge variant="success" size="xs" className="uppercase font-black tracking-widest flex-shrink-0">
+                          CSAT Bom
+                        </Badge>
+                      </div>
+                    </div>
+
+                    <div aria-label="Comentário de satisfação do cliente" className="p-2.5 rounded-xl bg-functional-success/5 border border-functional-success/15 text-[11px] font-medium text-brand-primary italic">
+                      "{ticket.csat_comment?.trim() || ''}"
+                    </div>
+
+                    <div className="row-start-3 flex flex-col items-stretch gap-2 border-t border-surface-border pt-2.5 text-[10px] font-bold text-brand-muted">
+                      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+                        {renderAgentInfo(ticket)}
+                        {renderTicketResolution(ticket)}
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        {renderAiActions(ticket, 'bg-gradient-to-r from-emerald-600 to-teal-600')}
+                      </div>
+                    </div>
+                  </Card>
+                ))}
+              </div>
+              {renderPagination()}
+            </>
+          )}
+          {!loading && paginatedTickets.length === 0 && renderPagination()}
+        </div>
+      )}
+
+      {/* Conteúdo da Fila: CHAMADOS FILHOS */}
+      {activeQueue === 'filhos' && (
+        <div className="flex flex-1 flex-col gap-4">
+
+          {loading && paginatedTickets.length === 0 ? (
+            renderSkeletonGrid()
+          ) : filteredTickets.length === 0 ? (
+            <>
+              <div className="p-8 text-center bg-surface-subtle/30 rounded-2xl border border-dashed border-surface-border">
+                <GitFork className="w-8 h-8 mx-auto text-brand-muted/50 mb-2" />
+                <p className="text-xs font-bold text-brand-muted">
+                  {selectedMonitorFilter ? 'Nenhum ticket deste monitor nesta página da fila.' : 'Nenhum chamado filho pendente nesta fila.'}
+                </p>
+              </div>
+              {renderPagination()}
+            </>
+          ) : (
+            <>
+              <div className={`grid grid-cols-1 md:grid-cols-2 gap-4 transition-opacity duration-200 `}>
+                {paginatedTickets.map(ticket => {
+                  const isValidated = validatedChildTickets.has(ticket.ticket_id);
+                  const evaluation = childResultFor(ticket);
+
+                  return (
+                    <Card key={ticket.ticket_id} className={`grid h-full grid-rows-[auto_1fr_auto] gap-3 p-4 hover:border-brand-highlight/40 transition-all ${selectedTicketIds.has(ticket.ticket_id) ? 'ring-2 ring-brand-highlight/40 border-brand-highlight/50 bg-brand-highlight/3' : ''}`}>
+                      <div className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2.5 gap-y-2">
+                          {canAudit ? <input
+                            type="checkbox"
+                            checked={selectedTicketIds.has(ticket.ticket_id)}
+                            onChange={() => toggleTicketSelection(ticket.ticket_id)}
+                            disabled={batchRunning}
+                            className="w-4 h-4 mt-0.5 rounded text-brand-highlight focus:ring-brand-highlight border-surface-border cursor-pointer flex-shrink-0"
+                            title="Selecionar para avaliação"
+                          /> : <span className="w-4 h-4" aria-hidden="true" />}
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <QueueTicketNumber ticketId={ticket.ticket_id} />
+                              {ticket.parent_ticket_id && (
+                                <span className="text-[9px] font-mono font-bold px-1.5 py-0.5 rounded bg-surface-subtle border border-surface-border text-brand-muted" title="Chamado Pai">
+                                  Pai: #{ticket.parent_ticket_id}
+                                </span>
+                              )}
+                              <a
+                                href={ticket.url || `https://webposto.zendesk.com/agent/tickets/${ticket.ticket_id}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1 text-[10px] font-bold text-brand-highlight hover:underline"
+                                title="Abrir no Zendesk"
+                              >
+                                <ExternalLink className="w-2.5 h-2.5" />
+                                <span>Zendesk</span>
+                              </a>
+                              {getSpecializedTeamInfo(ticket).label && (
+                                <Badge variant="warning" size="xs" className="text-[9px] font-black uppercase tracking-wider bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/30 inline-flex items-center gap-1 shadow-2xs" title={`Atendimento da equipe ${getSpecializedTeamInfo(ticket).label}`}>
+                                  <AlertTriangle className="w-2.5 h-2.5 text-amber-500 shrink-0" />
+                                  <span>{getSpecializedTeamInfo(ticket).label}</span>
+                                </Badge>
+                              )}
+                              {isValidated && (
+                                <Badge variant="success" size="xs" className="text-[9px]">
+                                  Validado
+                                </Badge>
+                              )}
+                            </div>
+                            <h4 className="text-xs font-bold text-brand-primary mt-1 line-clamp-1">
+                              {ticket.subject}
+                            </h4>
+                          </div>
+
+                        <div className="col-start-2 flex min-w-0 flex-wrap items-center gap-1.5">
+                          {renderAssignedMonitorBadge(ticket)}
+                          {ticket.child_macro_type && getMacroBadge(ticket.child_macro_type)}
+                          {evaluation && getChildStatusBadge(evaluation.status)}
+                          {renderScoreBadge(ticket)}
+                        </div>
+                      </div>
+
+                      <div className="row-start-3 flex flex-col items-stretch gap-2 border-t border-surface-border pt-2.5 text-[10px] font-bold text-brand-muted">
+                        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+                          {renderAgentInfo(ticket)}
+                          {renderTicketResolution(ticket)}
+                        </div>
+
+                        <div className="flex min-w-0 flex-col items-end gap-1.5" role="status" aria-live="polite">
+                          <ChildTicketMonitoriaAction
+                            ticket={{ ...ticket, child_evaluation: evaluation }}
+                            onOpen={onOpenExistingMonitoria}
+                            onStart={canAudit && evaluation ? () => { void handleStartChildAudit(ticket); } : undefined}
+                            onStartManual={canAudit ? () => { void handleStartManualChildAudit(ticket); } : undefined}
+                            loading={isEvaluatingTicket(ticket.ticket_id)}
+                          />
+                          {(canAudit || evaluation) && <Button
+                            size="sm"
+                            variant={isValidated ? "outline" : "primary"}
+                            onClick={() => {
+                              if (evaluation || isEvaluatingTicket(ticket.ticket_id)) {
+                                setChildPreviewTicket(ticket);
+                              } else {
+                                setChildGuidelineModalTicket(ticket);
+                              }
+                            }}
+                            className="flex items-center gap-1.5 text-xs font-bold"
+                          >
+                            {isEvaluatingTicket(ticket.ticket_id) ? (
+                              <QueueAIProgress step={ticketProgressStep(ticket.ticket_id)} waiting={aiJobs[ticket.ticket_id]?.phase === 'retry_pending'} fallback={aiJobs[ticket.ticket_id]?.phase === 'running_gemma' || aiJobs[ticket.ticket_id]?.phase === 'fallback_gemini'} />
+                            ) : (
+                              <><Bot className="w-3.5 h-3.5" /><span>{evaluation ? 'Ver Parecer IA' : 'Conferir com IA'}</span></>
+                            )}
+                          </Button>}
+                          <ChildTicketReevaluateAction
+                            ticket={{ ...ticket, child_evaluation: evaluation }}
+                            loading={isEvaluatingTicket(ticket.ticket_id)}
+                            onReevaluate={canAudit ? () => setChildGuidelineModalTicket(ticket) : undefined}
+                          />
+                          {renderCancelAIAction(ticket.ticket_id)}
+                          {aiFeedback[ticket.ticket_id] && <span className="max-w-56 text-right text-[10px] text-brand-muted">{aiFeedback[ticket.ticket_id]}</span>}
+                        </div>
+                      </div>
+                    </Card>
+                  );
+                })}
+              </div>
+              {renderPagination()}
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Conteúdo da Fila: FILHOS INVÁLIDOS */}
+      {activeQueue === 'filhos_invalidos' && (
+        <div className="flex flex-1 flex-col gap-4">
+          <div className="p-4 rounded-2xl bg-functional-error/10 border border-functional-error/25 flex items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-functional-error text-white flex items-center justify-center flex-shrink-0 shadow-sm">
+                <AlertOctagon className="w-5 h-5 animate-pulse" />
+              </div>
+              <div>
+                <h3 className="text-xs font-black uppercase tracking-wider text-functional-error">
+                  Fila de Chamados Filhos Inválidos
+                </h3>
+                <p className="text-[11px] font-semibold text-brand-primary/80">
+                  Chamados abertos fora do padrão ou com inconsistências de destinatário ou detalhamento.
+                </p>
+              </div>
+            </div>
+            <Badge variant="error" size="sm" className="font-black font-mono">
+              Inconformidade
+            </Badge>
+          </div>
+
+          {loading && paginatedTickets.length === 0 ? (
+            renderSkeletonGrid()
+          ) : filteredTickets.length === 0 ? (
+            <div className="p-8 text-center bg-surface-subtle/30 rounded-2xl border border-dashed border-surface-border">
+              <AlertOctagon className="w-8 h-8 mx-auto text-brand-muted/50 mb-2" />
+              <p className="text-xs font-bold text-brand-muted">Nenhum chamado filho inválido pendente nesta fila.</p>
+            </div>
+          ) : (
+            <>
+              <div className={`grid grid-cols-1 md:grid-cols-2 gap-4 transition-opacity duration-200 `}>
+                {paginatedTickets.map(ticket => {
+                  const isValidated = validatedChildTickets.has(ticket.ticket_id);
+                  const evaluation = childResultFor(ticket);
+
+                  return (
+                    <Card key={ticket.ticket_id} className={`grid h-full grid-rows-[auto_1fr_auto] gap-3 p-4 hover:border-functional-error/40 transition-all ${selectedTicketIds.has(ticket.ticket_id) ? 'ring-2 ring-functional-error/40 border-functional-error/50 bg-functional-error/3' : ''}`}>
+                      <div className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2.5 gap-y-2">
+                          {canAudit ? <input
+                            type="checkbox"
+                            checked={selectedTicketIds.has(ticket.ticket_id)}
+                            onChange={() => toggleTicketSelection(ticket.ticket_id)}
+                            disabled={batchRunning}
+                            className="w-4 h-4 mt-0.5 rounded text-functional-error focus:ring-functional-error border-surface-border cursor-pointer flex-shrink-0"
+                            title="Selecionar para avaliação"
+                          /> : <span className="w-4 h-4" aria-hidden="true" />}
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <QueueTicketNumber ticketId={ticket.ticket_id} />
+                              {ticket.parent_ticket_id && (
+                                <span className="text-[9px] font-mono font-bold px-1.5 py-0.5 rounded bg-surface-subtle border border-surface-border text-brand-muted" title="Chamado Pai">
+                                  Pai: #{ticket.parent_ticket_id}
+                                </span>
+                              )}
+                              <a
+                                href={ticket.url || `https://webposto.zendesk.com/agent/tickets/${ticket.ticket_id}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1 text-[10px] font-bold text-brand-highlight hover:underline"
+                                title="Abrir no Zendesk"
+                              >
+                                <ExternalLink className="w-2.5 h-2.5" />
+                                <span>Zendesk</span>
+                              </a>
+                              {getSpecializedTeamInfo(ticket).label && (
+                                <Badge variant="warning" size="xs" className="text-[9px] font-black uppercase tracking-wider bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/30 inline-flex items-center gap-1 shadow-2xs" title={`Atendimento da equipe ${getSpecializedTeamInfo(ticket).label}`}>
+                                  <AlertTriangle className="w-2.5 h-2.5 text-amber-500 shrink-0" />
+                                  <span>{getSpecializedTeamInfo(ticket).label}</span>
+                                </Badge>
+                              )}
+                              <Badge variant="error" size="xs" className="text-[9px]">
+                                Inválido
+                              </Badge>
+                            </div>
+                            <h4 className="text-xs font-bold text-brand-primary mt-1 line-clamp-1">
+                              {ticket.subject}
+                            </h4>
+                          </div>
+
+                        <div className="col-start-2 flex min-w-0 flex-wrap items-center gap-1.5">
+                          {renderAssignedMonitorBadge(ticket)}
+                          {ticket.child_macro_type && getMacroBadge(ticket.child_macro_type)}
+                          {evaluation && getChildStatusBadge(evaluation.status)}
+                        </div>
+                      </div>
+
+                      <div className="row-start-3 flex flex-col items-stretch gap-2 border-t border-surface-border pt-2.5 text-[10px] font-bold text-brand-muted">
+                        <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+                          {renderAgentInfo(ticket)}
+                          {renderTicketResolution(ticket)}
+                        </div>
+
+                        <div className="flex min-w-0 flex-col items-end gap-1.5" role="status" aria-live="polite">
+                          <ChildTicketMonitoriaAction
+                            ticket={{ ...ticket, child_evaluation: evaluation }}
+                            onOpen={onOpenExistingMonitoria}
+                            onStart={canAudit && evaluation ? () => { void handleStartChildAudit(ticket); } : undefined}
+                            onStartManual={canAudit ? () => { void handleStartManualChildAudit(ticket); } : undefined}
+                            loading={isEvaluatingTicket(ticket.ticket_id)}
+                          />
+                          {(canAudit || evaluation) && <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => {
+                              if (evaluation || isEvaluatingTicket(ticket.ticket_id)) {
+                                setChildPreviewTicket(ticket);
+                              } else {
+                                setChildGuidelineModalTicket(ticket);
+                              }
+                            }}
+                            className="flex items-center gap-1.5 text-xs font-bold"
+                          >
+                            {isEvaluatingTicket(ticket.ticket_id) ? (
+                              <QueueAIProgress step={ticketProgressStep(ticket.ticket_id)} waiting={aiJobs[ticket.ticket_id]?.phase === 'retry_pending'} fallback={aiJobs[ticket.ticket_id]?.phase === 'running_gemma' || aiJobs[ticket.ticket_id]?.phase === 'fallback_gemini'} />
+                            ) : (
+                              <><Bot className="w-3.5 h-3.5" /><span>{evaluation ? 'Ver Parecer IA' : 'Conferir com IA'}</span></>
+                            )}
+                          </Button>}
+                          <ChildTicketReevaluateAction
+                            ticket={{ ...ticket, child_evaluation: evaluation }}
+                            loading={isEvaluatingTicket(ticket.ticket_id)}
+                            onReevaluate={canAudit ? () => setChildGuidelineModalTicket(ticket) : undefined}
+                          />
+                          {renderCancelAIAction(ticket.ticket_id)}
+                          {aiFeedback[ticket.ticket_id] && <span className="max-w-56 text-right text-[10px] text-brand-muted">{aiFeedback[ticket.ticket_id]}</span>}
+                        </div>
+                      </div>
+                    </Card>
+                  );
+                })}
+              </div>
+              {renderPagination()}
+            </>
+          )}
+          {!loading && paginatedTickets.length === 0 && renderPagination()}
+        </div>
+      )}
+      </>
+      )}
+
+      {batchRunning && batchProgress && batchMinimized && (
+        <div className="fixed bottom-4 right-4 z-50 rounded-xl border border-surface-border bg-surface-card p-3 shadow-lg" role="status" aria-live="polite">
+          <Button variant="ghost" size="sm" onClick={() => setBatchMinimized(false)}>
+            <Bot className="h-4 w-4" /> Lote em andamento · {batchProgress.done + batchProgress.queued + batchProgress.errors}/{batchProgress.total} · Ver progresso
+          </Button>
+        </div>
+      )}
+      {/* Modal Central de Processamento em Lote com IA */}
+      {batchRunning && batchProgress && !batchMinimized && createPortal(
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-[9999] p-4 animate-fade-in">
+          <Card className="w-full max-w-lg p-6 space-y-5 shadow-2xl border border-surface-border bg-surface-card overflow-hidden relative">
+            {/* Linha superior com gradiente de destaque */}
+            <div className="absolute top-0 left-0 right-0 h-1.5 bg-gradient-to-r from-brand-primary via-[#B3141B] to-brand-highlight" />
+
+            {/* Cabeçalho do Modal */}
+            <div className="flex items-center justify-between gap-3 pt-1">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="relative flex items-center justify-center">
+                  <div className="w-11 h-11 rounded-2xl bg-brand-highlight/15 text-brand-highlight flex items-center justify-center flex-shrink-0">
+                    <Bot className="w-6 h-6 animate-pulse" />
+                  </div>
+                  <span className="absolute -top-1 -right-1 flex h-3 w-3">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-brand-highlight opacity-75" />
+                    <span className="relative inline-flex rounded-full h-3 w-3 bg-brand-highlight" />
+                  </span>
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-base font-black text-brand-primary tracking-tight">Avaliação em Lote com IA</h3>
+                    <span className="text-[10px] font-bold font-mono px-2 py-0.5 rounded-full bg-brand-highlight/10 text-brand-highlight border border-brand-highlight/20">
+                      {Math.min(batchProgress.total, batchProgress.done + batchProgress.queued + batchProgress.errors + 1)} de {batchProgress.total}
+                    </span>
+                  </div>
+                  <p className="text-xs text-brand-muted truncate">Auditoria automatizada de conformidade e critérios operacionais</p>
+                </div>
+              </div>
+            </div>
+
+            <Button variant="ghost" size="sm" onClick={() => setBatchMinimized(true)}>Continuar em segundo plano</Button>
+
+            {/* Card Central Integrado (Substitui o toast flutuante no topo direito) */}
+            <div className="p-4 rounded-2xl bg-gradient-to-br from-surface-subtle to-surface-subtle/40 border border-brand-highlight/25 space-y-2.5 relative overflow-hidden shadow-sm">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-brand-highlight text-white shadow-xs">
+                    <RefreshCw className="w-3 h-3 animate-spin" />
+                    Auditando Agora
+                  </span>
+                  <span className="font-mono font-bold text-sm text-brand-primary truncate">
+                    #{batchProgress.currentTicketId}
+                  </span>
+                </div>
+                {batchProgress.currentAgent && (
+                  <span className="text-[11px] text-brand-muted truncate font-semibold bg-surface-card px-2 py-0.5 rounded-md border border-surface-border">
+                    {batchProgress.currentAgent}
+                  </span>
+                )}
+              </div>
+
+              {batchProgress.currentSubject && (
+                <p className="text-xs font-semibold text-slate-700 dark:text-slate-200 line-clamp-2 leading-relaxed">
+                  {batchProgress.currentSubject}
+                </p>
+              )}
+
+              <div className="flex items-center gap-2 text-[11px] text-brand-highlight font-medium pt-1">
+                <Sparkles className="w-3.5 h-3.5 shrink-0 animate-pulse" />
+                <span className="truncate">Sanitizando diálogo, confrontando com manuais e calculando nota...</span>
+              </div>
+            </div>
+
+            {/* Barra de Progresso e Indicadores */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between text-xs font-bold">
+                <span className="text-brand-muted font-semibold">Progresso Geral</span>
+                <span className="text-brand-highlight font-mono font-black text-sm">
+                  {batchProgress.total > 0 ? Math.round(((batchProgress.done + batchProgress.queued + batchProgress.errors) / batchProgress.total) * 100) : 0}%
+                </span>
+              </div>
+
+              <div className="w-full h-3 bg-surface-border/60 rounded-full overflow-hidden p-0.5 border border-surface-border">
+                <div
+                  className="h-full bg-gradient-to-r from-[#0A1F44] via-[#B3141B] to-brand-highlight rounded-full transition-all duration-500 shadow-sm"
+                  style={{ width: `${batchProgress.total > 0 ? Math.max(4, Math.round(((batchProgress.done + batchProgress.queued + batchProgress.errors) / batchProgress.total) * 100)) : 0}%` }}
+                />
+              </div>
+
+              <div className="grid grid-cols-5 gap-2 pt-1">
+                <div className="p-2 rounded-xl bg-surface-subtle/80 border border-surface-border text-center min-w-0 overflow-hidden">
+                  <div className="text-[9px] text-brand-muted font-bold uppercase tracking-tight truncate" title="Avaliados">Avaliados</div>
+                  <div className="text-sm font-black text-functional-success font-mono flex items-center justify-center gap-1 mt-0.5">
+                    <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                    {batchProgress.done}
+                  </div>
+                </div>
+                <div className="p-2 rounded-xl bg-surface-subtle/80 border border-surface-border text-center min-w-0 overflow-hidden">
+                  <div className="text-[9px] text-brand-muted font-bold uppercase tracking-tight truncate" title="Reprocessamento">Reprocesso</div>
+                  <div className="text-sm font-black text-brand-highlight font-mono mt-0.5">{batchProgress.queued}</div>
+                </div>
+                <div className="p-2 rounded-xl bg-surface-subtle/80 border border-surface-border text-center min-w-0 overflow-hidden">
+                  <div className="text-[9px] text-brand-muted font-bold uppercase tracking-tight truncate" title="Falhas">Falhas</div>
+                  <div className="text-sm font-black text-functional-error font-mono flex items-center justify-center gap-1 mt-0.5">
+                    <XCircle className="w-3.5 h-3.5 shrink-0" />
+                    {batchProgress.errors}
+                  </div>
+                </div>
+                <div className="p-2 rounded-xl bg-surface-subtle/80 border border-surface-border text-center min-w-0 overflow-hidden">
+                  <div className="text-[9px] text-brand-muted font-bold uppercase tracking-tight truncate" title="Restantes">Restantes</div>
+                  <div className="text-sm font-black text-brand-primary font-mono flex items-center justify-center gap-1 mt-0.5">
+                    <Clock className="w-3.5 h-3.5 text-brand-muted shrink-0" />
+                    {Math.max(0, batchProgress.total - batchProgress.done - batchProgress.queued - batchProgress.errors)}
+                  </div>
+                </div>
+                <div className="p-2 rounded-xl bg-surface-subtle/80 border border-surface-border text-center min-w-0 overflow-hidden">
+                  <div className="text-[9px] text-brand-muted font-bold uppercase tracking-tight truncate" title="Total do Lote">Total Lote</div>
+                  <div className="text-sm font-black text-brand-primary font-mono mt-0.5">
+                    {batchProgress.total}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Mini Fila de Chamados Selecionados */}
+            {batchProgress.items && batchProgress.items.length > 0 && (
+              <div className="space-y-1.5 pt-1">
+                <div className="text-[10px] font-black uppercase tracking-wider text-brand-muted flex items-center justify-between">
+                  <span>Fila de Chamados ({batchProgress.items.length})</span>
+                  <span>Status em Tempo Real</span>
+                </div>
+                <div className="max-h-28 overflow-y-auto thin-scrollbar space-y-1 pr-1 border border-surface-border/60 rounded-xl p-1.5 bg-surface-subtle/30">
+                  {batchProgress.items.map((it) => (
+                    <div
+                      key={it.ticket_id}
+                      className={`flex items-center justify-between p-1.5 rounded-lg text-xs transition-all ${
+                        it.status === 'processing'
+                          ? 'bg-brand-highlight/10 border border-brand-highlight/30 text-brand-primary font-bold'
+                          : it.status === 'done'
+                          ? 'bg-functional-success/5 text-slate-700 dark:text-slate-300'
+                          : it.status === 'queued'
+                          ? 'bg-brand-highlight/5 text-brand-primary'
+                          : it.status === 'error'
+                          ? 'bg-functional-error/5 text-functional-error'
+                          : 'text-brand-muted'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        {it.status === 'processing' && <RefreshCw className="w-3.5 h-3.5 animate-spin text-brand-highlight shrink-0" />}
+                        {it.status === 'done' && <CheckCircle2 className="w-3.5 h-3.5 text-functional-success shrink-0" />}
+                        {it.status === 'queued' && <Clock className="w-3.5 h-3.5 text-brand-highlight shrink-0" />}
+                        {it.status === 'error' && <XCircle className="w-3.5 h-3.5 text-functional-error shrink-0" />}
+                        {it.status === 'pending' && <Clock className="w-3.5 h-3.5 text-brand-muted shrink-0" />}
+                        <span className="font-mono text-[11px] shrink-0 font-bold">#{it.ticket_id}</span>
+                        <span className="truncate text-[11px]">{it.subject || 'Sem assunto'}</span>
+                      </div>
+                      <span className="text-[10px] font-semibold shrink-0 ml-2">
+                        {it.status === 'processing' && <span className="text-brand-highlight font-bold">Auditando</span>}
+                        {it.status === 'done' && <span className="text-functional-success font-bold">Concluído</span>}
+                        {it.status === 'queued' && <span className="text-brand-highlight font-bold">Reprocessar</span>}
+                        {it.status === 'error' && <span className="text-functional-error font-bold">Falhou</span>}
+                        {it.status === 'pending' && <span className="text-brand-muted">Aguardando</span>}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Rodapé Seguro com Botão de Interrupção */}
+            <div className="flex items-center justify-between pt-3 border-t border-surface-border">
+              <div className="flex items-center gap-2 text-[11px] text-brand-muted min-w-0 pr-2">
+                <Lock className="w-3.5 h-3.5 text-brand-muted shrink-0" />
+                <span className="truncate">Você pode sair desta janela enquanto a IA avalia</span>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => { batchCancelRef.current = true; }}
+                className="text-functional-error hover:bg-functional-error/10 font-bold flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-all whitespace-nowrap shrink-0"
+              >
+                <X className="w-4 h-4 shrink-0" />
+                <span>Interromper Lote</span>
+              </Button>
+            </div>
+          </Card>
+        </div>,
+        document.body
+      )}
+
+      {/* Modal: Parecer e Base Oficial de Auditoria do Chamado Filho */}
+      {childPreviewTicket && createPortal(
+        <div
+          className="fixed inset-0 bg-black/75 backdrop-blur-xs flex items-center justify-center z-[9999] p-4 animate-fade-in"
+          onClick={handleCloseChildPreview}
+        >
+          <div onClick={(e: React.MouseEvent) => e.stopPropagation()} className="w-full max-w-2xl">
+            <Card className="p-6 space-y-5 max-h-[90vh] overflow-y-auto no-scrollbar shadow-2xl border-surface-border">
+              {/* Modal Header */}
+              <div className="flex items-center justify-between pb-3 border-b border-surface-border">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-9 h-9 rounded-xl bg-brand-highlight/10 text-brand-highlight flex items-center justify-center flex-shrink-0">
+                    <Bot className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h3 className="text-sm font-black text-brand-primary">
+                        Auditoria de Conformidade — Chamado Filho #{childPreviewTicket.ticket_id}
+                      </h3>
+                      {childPreviewTicket.child_macro_type && getMacroBadge(childPreviewTicket.child_macro_type)}
+                    </div>
+                    <p className="text-[10px] font-semibold text-brand-muted">
+                      {childPreviewTicket.parent_ticket_id ? `Vinculado ao chamado pai #${childPreviewTicket.parent_ticket_id}` : 'Chamado Filho Interno'} • Base Oficial de Avaliação
+                    </p>
+                  </div>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  aria-label="Fechar avaliação e continuar em segundo plano"
+                  onClick={handleCloseChildPreview}
+                >
+                  <X className="w-4 h-4" />
+                </Button>
+              </div>
+
+              {/* Informações Básicas do Chamado Filho com tags limpas (sem poluição visual) */}
+              <div className="p-3.5 rounded-2xl bg-surface-subtle/80 border border-surface-border space-y-2 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="font-mono font-bold text-brand-primary">
+                    Assunto: {childPreviewTicket.subject}
+                  </span>
+                  <span className="text-[10px] text-brand-muted">
+                    Atendente: {childPreviewTicket.agent_name || 'Não atribuído (Apenas Grupo)'}
+                  </span>
+                </div>
+
+                {/* Exibição limpa das tags relevantes de governança */}
+                {(() => {
+                  const allTags = childPreviewTicket.tags || [];
+                  const structuralTags = allTags.filter(tag =>
+                    tag.startsWith('existe_') ||
+                    tag.startsWith('transferencia_') ||
+                    tag.startsWith('maispag_') ||
+                    tag.includes('filho') ||
+                    tag.includes('demanda') ||
+                    tag.includes('analise')
+                  );
+                  const displayTags = structuralTags.length > 0 ? structuralTags : allTags.slice(0, 3);
+                  const hiddenCount = allTags.length - displayTags.length;
+
+                  if (displayTags.length === 0) return null;
+
+                  return (
+                    <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-surface-border/50">
+                      <span className="text-[9px] font-bold text-brand-muted uppercase tracking-wider">Tags do Chamado:</span>
+                      {displayTags.map((tag, idx) => (
+                        <span key={idx} className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-surface-card border border-surface-border text-brand-muted">
+                          #{tag}
+                        </span>
+                      ))}
+                      {hiddenCount > 0 && (
+                        <span className="text-[9px] text-brand-muted font-semibold">
+                          +{hiddenCount} outras tags
+                        </span>
+                      )}
+                    </div>
+                  );
+                })()}
+
+                {/* Ações e Acesso ao Diálogo Completo do Chamado */}
+                <div className="flex flex-wrap items-center justify-between pt-2.5 border-t border-surface-border/60 gap-2">
+                  <div className="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => handleOpenChildDialogue('child')}
+                      className="flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 cursor-pointer shadow-xs border-surface-border hover:border-brand-accent transition-all"
+                    >
+                      <MessageSquare className="w-3.5 h-3.5 text-brand-highlight" />
+                      <span>Ver Conversa</span>
+                      {childDialogue.length > 0 && (
+                        <span className="text-[10px] font-mono font-bold px-1.5 py-0.2 rounded-full bg-brand-highlight/15 text-brand-highlight">
+                          {childDialogue.length}
+                        </span>
+                      )}
+                    </Button>
+
+                    {childPreviewTicket.parent_ticket_id && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleOpenChildDialogue('parent')}
+                        className="flex items-center gap-1.5 text-xs text-brand-muted hover:text-brand-primary cursor-pointer"
+                        title="Ver diálogo do chamado pai de origem"
+                      >
+                        <ExternalLink className="w-3.5 h-3.5" />
+                        <span>Conversa do Pai (#{childPreviewTicket.parent_ticket_id})</span>
+                        {parentDialogue.length > 0 && (
+                          <span className="text-[10px] font-mono font-bold px-1.5 py-0.2 rounded-full bg-surface-card border border-surface-border text-brand-muted">
+                            {parentDialogue.length}
+                          </span>
+                        )}
+                      </Button>
+                    )}
+                  </div>
+
+                  <span className="text-[10px] text-brand-muted italic hidden sm:inline">
+                    Confronte o relato com as evidências do chamado
+                  </span>
+                </div>
+              </div>
+
+              {/* Loading State: Skeleton Shimmer com etapas de verificação */}
+              {loadingChildAi && (
+                <div className="py-6 space-y-4 animate-fade-in">
+                  <div className="p-4 rounded-2xl bg-surface-subtle/70 border border-surface-border relative overflow-hidden space-y-3">
+                    <div className="absolute inset-0 -translate-x-full animate-shimmer bg-gradient-to-r from-transparent via-brand-highlight/15 to-transparent pointer-events-none" />
+                    <div className="flex items-center justify-between">
+                      <div className="h-5 w-48 rounded bg-surface-border/60 animate-pulse" />
+                      <div className="h-5 w-24 rounded-full bg-surface-border/60 animate-pulse" />
+                    </div>
+                    <div className="h-3 w-3/4 rounded bg-surface-border/40 animate-pulse" />
+                  </div>
+
+                  <div className="p-4 rounded-xl bg-surface-card border border-surface-border space-y-2">
+                    <div className="h-4 w-48 rounded bg-surface-border/50 animate-pulse" />
+                    <div className="space-y-1.5 pt-1">
+                      {[
+                        'Verificando assunto de abertura e alterações da macro de resolvido...',
+                        'Conferindo preservação do texto estrutural e enriquecimento técnico...',
+                        'Validando direcionamento ("Para") ao grupo especialista correto...'
+                      ].map((stepLabel, idx) => (
+                        <div key={idx} className="flex items-center gap-2 p-2 rounded-lg bg-surface-subtle/50 text-[11px] text-brand-muted">
+                          <RefreshCw className="w-3 h-3 animate-spin text-brand-highlight flex-shrink-0" />
+                          <span>{stepLabel}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Result State */}
+              {!loadingChildAi && childAiEvaluation && (
+                <div className="space-y-4">
+                  {/* Status do Chamado Filho: VÁLIDO ou INVÁLIDO (sem score numérico de 1 a 100) */}
+                  {(() => {
+                    const isValido = childAiEvaluation.status === 'conforme';
+
+                    return (
+                      <div className={`p-4 rounded-2xl border flex flex-col sm:flex-row sm:items-center justify-between gap-4 ${
+                        isValido
+                          ? 'bg-functional-success/10 border-functional-success/30 text-functional-success'
+                          : 'bg-functional-error/10 border-functional-error/30 text-functional-error'
+                      }`}>
+                        <div className="flex items-center gap-3">
+                          <div className={`w-10 h-10 rounded-xl flex items-center justify-center text-white flex-shrink-0 ${
+                            isValido ? 'bg-functional-success' : 'bg-functional-error'
+                          }`}>
+                            {isValido ? <CheckCircle2 className="w-6 h-6" /> : <XCircle className="w-6 h-6" />}
+                          </div>
+                          <div>
+                            <div className="text-xs font-black uppercase tracking-wider">
+                              {isValido ? 'Sugestão da IA: válido' : 'Sugestão da IA: inválido'}
+                            </div>
+                            <div className="text-[11px] font-semibold text-brand-primary/90 mt-0.5">
+                              Padrão: {childAiEvaluation.detected_type === 'nova_demanda' ? 'Nova Demanda' : childAiEvaluation.detected_type === 'analise_tecnica' ? 'Análise Técnica N2' : childAiEvaluation.detected_type === 'apoio_tecnico' ? 'Apoio Técnico N2' : childAiEvaluation.detected_type === 'produtividade' ? 'Produtividade' : 'Escalonamento Interno'}
+                            </div>
+                          </div>
+                        </div>
+
+                      </div>
+                    );
+                  })()}
+
+                  {/* Resumo do Parecer */}
+                  <div className="p-3.5 rounded-xl bg-surface-subtle/80 border border-surface-border text-xs text-brand-primary/90 leading-relaxed">
+                    <span className="font-bold text-brand-primary block mb-1">Resumo do Parecer da Qualidade:</span>
+                    {childAiEvaluation.summary}
+                  </div>
+
+                  {/* Checklist de Regras Operacionais */}
+                  <div className="space-y-2">
+                    <span className="text-[10px] font-black uppercase tracking-wider text-brand-muted">
+                      Checklist Operacional de Regras
+                    </span>
+                    <div className="space-y-2">
+                      {childAiEvaluation.checks?.map((chk, idx) => (
+                        <div
+                          key={idx}
+                          className={`p-3 rounded-xl border flex items-start gap-2.5 ${
+                            chk.answer === 'NA' ? 'bg-surface-subtle border-surface-border' : chk.passed
+                              ? 'bg-functional-success/5 border-functional-success/20'
+                              : 'bg-functional-error/5 border-functional-error/20'
+                          }`}
+                        >
+                          {chk.answer === 'NA' ? (
+                            <Clock className="w-4 h-4 text-brand-muted flex-shrink-0 mt-0.5" />
+                          ) : chk.passed ? (
+                            <CheckCircle2 className="w-4 h-4 text-functional-success flex-shrink-0 mt-0.5" />
+                          ) : (
+                            <XCircle className="w-4 h-4 text-functional-error flex-shrink-0 mt-0.5" />
+                          )}
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-xs font-bold text-brand-primary">{chk.rule}</span>
+                              <Badge variant={chk.answer === 'NA' ? 'neutral' : chk.passed ? 'success' : 'error'} size="xs" className="text-[9px] font-bold">
+                                {chk.answer === 'NA' ? 'Não verificado' : chk.passed ? 'Atendido' : 'Não Conforme'}
+                              </Badge>
+                            </div>
+                            {chk.details && (
+                              <p className="text-[11px] text-brand-muted mt-1 bg-surface-card p-1.5 rounded border border-surface-border">
+                                {chk.details}
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Recomendações */}
+                  {childAiEvaluation.recommendations?.length > 0 && (
+                    <div className="space-y-2">
+                      <span className="text-[10px] font-black uppercase tracking-wider text-brand-muted">
+                        Recomendações e Correções
+                      </span>
+                      <ul className="space-y-1 bg-surface-subtle/50 p-3 rounded-xl border border-surface-border">
+                        {childAiEvaluation.recommendations.map((rec, idx) => (
+                          <li key={idx} className="text-[11px] text-brand-primary/90 flex items-start gap-2">
+                            <span className="text-brand-highlight font-bold">•</span>
+                            <span>{rec}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                </div>
+              )}
+
+              {/* Modal Footer */}
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-surface-border">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="cursor-pointer"
+                  onClick={handleCloseChildPreview}
+                >
+                  {loadingChildAi ? 'Continuar em segundo plano' : 'Fechar'}
+                </Button>
+
+                {canAudit && <div className="flex flex-wrap items-center justify-end gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={loadingChildAi}
+                    onClick={() => !loadingChildAi && handleEvaluateChildTicket(childPreviewTicket)}
+                    className="flex items-center gap-1 text-xs disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${loadingChildAi ? 'animate-spin' : ''}`} />
+                    <span>Reanalisar</span>
+                  </Button>
+
+                  <ChildTicketMonitoriaAction
+                    ticket={{ ...childPreviewTicket, child_evaluation: childAiEvaluation }}
+                    loading={loadingChildAi}
+                    onStart={() => { void handleStartChildAudit(childPreviewTicket); }}
+                    onStartManual={() => { void handleStartManualChildAudit(childPreviewTicket); }}
+                    onOpen={onOpenExistingMonitoria ? id => {
+                      handleCloseChildPreview();
+                      onOpenExistingMonitoria(id);
+                    } : undefined}
+                  />
+                </div>}
+              </div>
+            </Card>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* Drawer: Visualizador da Conversa / Diálogo do Chamado Filho e Pai */}
+      {showChildDialogueModal && childPreviewTicket && createPortal(
+        <div className="fixed inset-0 z-[10000] flex justify-end">
+          {/* Backdrop escuro */}
+          <div
+            className="fixed inset-0 bg-black/60 backdrop-blur-xs transition-opacity animate-fade-in"
+            onClick={() => setShowChildDialogueModal(false)}
+          />
+
+          {/* Drawer Lateral Direito */}
+          <div
+            data-testid="ticket-dialogue-drawer"
+            className="relative w-full sm:w-[500px] md:w-[580px] bg-surface-card border-l border-surface-border shadow-2xl z-10 flex flex-col h-full overflow-hidden animate-slide-in-right"
+            onClick={(e: React.MouseEvent) => e.stopPropagation()}
+          >
+            {/* Header do Drawer */}
+            <div className="p-4 border-b border-surface-border flex items-center justify-between bg-surface-subtle/70">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-brand-highlight/10 text-brand-highlight flex items-center justify-center flex-shrink-0">
+                  <MessageSquare className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-black uppercase text-brand-primary tracking-tight">
+                    {activeChildDialogueTab === 'child' ? 'Conversa do Chamado Filho' : 'Conversa do Chamado Pai'}
+                  </h3>
+                  <p className="text-[11px] text-brand-muted font-mono">
+                    Ticket #{activeChildDialogueTab === 'child' ? childPreviewTicket.ticket_id : childPreviewTicket.parent_ticket_id} • {currentChildDialogueList.length} {currentChildDialogueList.length === 1 ? 'mensagem' : 'mensagens'}
+                  </p>
+                </div>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setShowChildDialogueModal(false)}
+                className="p-1.5 hover:bg-surface-card rounded-lg transition-colors text-brand-muted cursor-pointer"
+                title="Fechar conversa"
+              >
+                <X className="w-5 h-5" />
+              </Button>
+            </div>
+
+            {/* Abas para alternar entre Filho e Pai se houver chamado pai */}
+            {childPreviewTicket.parent_ticket_id && (
+              <div className="flex items-center border-b border-surface-border bg-surface-subtle/40 px-3 pt-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleOpenChildDialogue('child')}
+                  className={`pb-2 px-3 text-xs font-bold border-b-2 transition-all cursor-pointer flex items-center gap-1.5 ${
+                    activeChildDialogueTab === 'child'
+                      ? 'border-brand-accent text-brand-accent'
+                      : 'border-transparent text-brand-muted hover:text-brand-primary'
+                  }`}
+                >
+                  <Bot className="w-3.5 h-3.5" />
+                  <span>Filho #{childPreviewTicket.ticket_id}</span>
+                  {childDialogue.length > 0 && (
+                    <span className="text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-brand-highlight/15 text-brand-highlight">
+                      {childDialogue.length}
+                    </span>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleOpenChildDialogue('parent')}
+                  className={`pb-2 px-3 text-xs font-bold border-b-2 transition-all cursor-pointer flex items-center gap-1.5 ${
+                    activeChildDialogueTab === 'parent'
+                      ? 'border-brand-accent text-brand-accent'
+                      : 'border-transparent text-brand-muted hover:text-brand-primary'
+                  }`}
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>Pai #{childPreviewTicket.parent_ticket_id}</span>
+                  {parentDialogue.length > 0 && (
+                    <span className="text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-surface-card border border-surface-border text-brand-muted">
+                      {parentDialogue.length}
+                    </span>
+                  )}
+                </button>
+              </div>
+            )}
+
+            {/* Busca e Filtros */}
+            <div className="p-3 border-b border-surface-border bg-surface-card space-y-2.5">
+              <div className="relative">
+                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-brand-muted" />
+                <input
+                  type="text"
+                  value={childDialogueSearch}
+                  onChange={e => setChildDialogueSearch(e.target.value)}
+                  placeholder="Buscar termos na conversa (ex.: erro, PDV, comprovante)..."
+                  className="w-full pl-9 pr-8 py-2 text-xs bg-surface-subtle border border-surface-border rounded-lg text-brand-primary placeholder:text-brand-muted focus:outline-none focus:border-brand-accent"
+                />
+                {childDialogueSearch && (
+                  <button
+                    type="button"
+                    onClick={() => setChildDialogueSearch('')}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-brand-muted hover:text-brand-primary cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5 no-scrollbar text-[10px]">
+                {(() => {
+                  const filterList = [
+                    { id: 'all', label: `Todas (${currentChildDialogueList.length})` },
+                    { id: 'end_user', label: `Cliente (${currentChildDialogueList.filter(d => getDialogueCategory(d) === 'end_user').length})` },
+                    { id: 'agent', label: `Atendente (${currentChildDialogueList.filter(d => getDialogueCategory(d) === 'agent').length})` },
+                    { id: 'internal', label: `Internas (${currentChildDialogueList.filter(d => getDialogueCategory(d) === 'internal').length})` },
+                  ];
+                  return filterList.map(f => (
+                    <button
+                      key={f.id}
+                      type="button"
+                      onClick={() => setChildDialogueFilter(f.id as any)}
+                      className={`px-2.5 py-1 rounded-md font-bold uppercase tracking-wider transition-all whitespace-nowrap cursor-pointer ${
+                        childDialogueFilter === f.id
+                          ? 'bg-brand-accent text-white shadow-xs'
+                          : 'bg-surface-subtle text-brand-muted hover:text-brand-primary hover:bg-surface-border'
+                      }`}
+                    >
+                      {f.label}
+                    </button>
+                  ));
+                })()}
+              </div>
+            </div>
+
+            {/* Lista de Mensagens */}
+            <div className="flex-1 overflow-y-auto p-4 space-y-3.5 no-scrollbar">
+              {loadingChildDialogue ? (
+                <div className="py-16 text-center space-y-3">
+                  <div className="w-8 h-8 border-2 border-brand-accent border-t-transparent rounded-full animate-spin mx-auto" />
+                  <p className="text-xs text-brand-muted">Carregando histórico de mensagens no Zendesk...</p>
+                </div>
+              ) : filteredChildDialogue.length === 0 ? (
+                <div className="py-16 text-center space-y-2">
+                  <p className="text-xs font-bold text-brand-primary">Nenhuma mensagem encontrada</p>
+                  <p className="text-[11px] text-brand-muted">
+                    {childDialogueSearch ? 'Nenhum trecho corresponde à busca.' : 'Nenhuma mensagem disponível neste chamado.'}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (activeChildDialogueTab === 'child') {
+                        setChildDialogue([]);
+                        handleOpenChildDialogue('child');
+                      } else {
+                        setParentDialogue([]);
+                        handleOpenChildDialogue('parent');
+                      }
+                    }}
+                    className="mt-2 text-xs font-bold text-brand-highlight hover:underline cursor-pointer"
+                  >
+                    Recarregar mensagens do Zendesk
+                  </button>
+                </div>
+              ) : (
+                filteredChildDialogue.map((msg, idx) => {
+                  const msgId = `child_drawer_${activeChildDialogueTab}_${msg.id || idx}`;
+                  return (
+                    <TicketMessageBubble
+                      key={msg.id || idx}
+                      msg={msg}
+                      msgId={msgId}
+                      isExpanded={!!childExpandedMsgIds[msgId]}
+                      onToggleExpand={() => toggleChildMsgExpand(msgId)}
+                    />
+                  );
+                })
+              )}
+            </div>
+
+            {/* Rodapé do Drawer */}
+            <div className="p-3 border-t border-surface-border bg-surface-subtle/70 flex items-center justify-between">
+              <span className="text-[10px] text-brand-muted font-mono">
+                {filteredChildDialogue.length} de {currentChildDialogueList.length} exibidas
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setShowChildDialogueModal(false)}
+                className="text-xs font-bold cursor-pointer"
+              >
+                Voltar à Auditoria
+              </Button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* Popup: Confirmação da seleção automática da IA com base nas tags do Zendesk */}
+      {guidelinePickerTicket && (() => {
+        const detectedCustomerType = resolveCustomerType(
+          guidelinePickerTicket.tags,
+          guidelinePickerTicket.organization_tags
+        );
+        const { form: autoForm, guideline: autoGuideline } = resolveFormAndGuidelineForCustomerType(
+          detectedCustomerType,
+          forms,
+          guidelineOptions
+        );
+        const effectiveForm = selectionOverrideEnabled
+          ? forms.find(form => form.id === selectedOverrideFormId)
+          : autoForm;
+        const effectiveGuideline = selectionOverrideEnabled
+          ? guidelineOptions.find(guideline => guideline.id === selectedOverrideGuidelineIds[0])
+          : autoGuideline;
+
+        return createPortal(
+          <div
+            className="fixed inset-0 bg-black/75 backdrop-blur-xs flex items-center justify-center z-[9999] p-4 animate-fade-in"
+            onClick={() => setGuidelinePickerTicket(null)}
+          >
+            <div onClick={(e: React.MouseEvent) => e.stopPropagation()} className="w-full max-w-lg">
+              <Card className="p-6 space-y-5 max-h-[90vh] overflow-y-auto no-scrollbar shadow-2xl border-surface-border">
+                <div className="flex items-center justify-between pb-3 border-b border-surface-border">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-8 h-8 rounded-xl bg-brand-highlight/10 text-brand-highlight flex items-center justify-center flex-shrink-0">
+                      <Sparkles className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-black text-brand-primary">
+                        Avaliação com IA — Seleção Automática
+                      </h3>
+                      <p className="text-[10px] font-semibold text-brand-muted">
+                        Ticket #{guidelinePickerTicket.ticket_id} • Zendesk
+                      </p>
+                    </div>
+                  </div>
+                  <Button variant="ghost" size="sm" onClick={() => setGuidelinePickerTicket(null)}>
+                    <X className="w-4 h-4" />
+                  </Button>
+                </div>
+
+                {/* Informações do Ticket & Cliente Detectado */}
+                <div className="p-3.5 rounded-2xl bg-surface-subtle/80 border border-surface-border space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-black uppercase tracking-wider text-brand-muted">
+                      Classificação do Cliente
+                    </span>
+                    <Badge
+                      variant={detectedCustomerType === 'cliente_final' ? 'success' : 'info'}
+                      size="xs"
+                      className="font-black text-[10px] uppercase tracking-wider"
+                    >
+                      {detectedCustomerType === 'cliente_final' ? 'Cliente Final' : detectedCustomerType === 'revenda' ? 'Revenda' : 'Padrão'}
+                    </Badge>
+                  </div>
+                  <div className="text-xs font-bold text-brand-primary line-clamp-1">
+                    {guidelinePickerTicket.subject}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    {guidelinePickerTicket.organization_name && (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-bold text-brand-muted bg-surface-card px-2 py-0.5 rounded-lg border border-surface-border">
+                        <Tag className="w-2.5 h-2.5" />
+                        {guidelinePickerTicket.organization_name}
+                      </span>
+                    )}
+                    {((guidelinePickerTicket.tags?.length || 0) > 0 || (guidelinePickerTicket.organization_tags?.length || 0) > 0) ? (
+                      [...(guidelinePickerTicket.organization_tags || []), ...(guidelinePickerTicket.tags || [])]
+                        .slice(0, 4)
+                        .map((tag, idx) => (
+                          <span key={idx} className="text-[9px] font-mono font-semibold text-brand-muted bg-surface-card px-1.5 py-0.5 rounded border border-surface-border">
+                            #{tag}
+                          </span>
+                        ))
+                    ) : (
+                      <span className="text-[10px] font-semibold text-brand-muted italic">
+                        Tag padrão: #cliente_final
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Sinalização de Equipe Especializada (TEF / Contábil / Fiscal) */}
+                {(() => {
+                  const spec = getSpecializedTeamInfo(guidelinePickerTicket);
+                  if (!spec.label) return null;
+                  return (
+                    <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-between gap-2 text-xs font-bold text-amber-700 dark:text-amber-300">
+                      <div className="flex items-center gap-2">
+                        <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0" />
+                        <span>
+                          Atendimento da equipe <strong>{spec.label}</strong> — avaliação liberada com a ficha ativa padrão.
+                        </span>
+                      </div>
+                      <Badge variant="warning" size="xs" className="font-black text-[9px] uppercase tracking-wider bg-amber-500/20 text-amber-800 dark:text-amber-200 border-amber-500/40 shrink-0">
+                        {spec.label}
+                      </Badge>
+                    </div>
+                  );
+                })()}
+
+                {/* Sugestão automática preservada para comparação com eventual correção. */}
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between ml-0.5">
+                    <span className="text-[10px] font-black uppercase tracking-widest text-brand-muted">
+                      Critérios e Manual Vinculados
+                    </span>
+                    <span className="flex items-center gap-1 text-[9px] font-bold text-brand-highlight">
+                      {selectionOverrideEnabled ? <AlertTriangle className="w-2.5 h-2.5" /> : <Lock className="w-2.5 h-2.5" />}
+                      <span>{selectionOverrideEnabled ? 'Correção manual' : 'Seleção automática'}</span>
+                    </span>
+                  </div>
+
+                  {/* Ficha Selecionada */}
+                  <div className="p-3.5 rounded-xl border border-surface-border bg-surface-subtle/50 flex items-start gap-3">
+                    <div className="w-7 h-7 rounded-lg bg-info/10 text-info flex items-center justify-center flex-shrink-0 mt-0.5">
+                      <FileText className="w-4 h-4" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[9px] font-black uppercase tracking-wider text-brand-muted">
+                          Ficha de Monitoria
+                        </span>
+                        <Badge variant="neutral" size="xs" className="text-[9px] font-bold">{selectionOverrideEnabled ? 'Selecionada' : 'Sugestão'}</Badge>
+                      </div>
+                      <div className="text-xs font-black text-brand-primary mt-0.5">
+                        {effectiveForm?.title || 'Selecione uma ficha'}
+                      </div>
+                      <p className="text-[10px] font-medium text-brand-muted mt-0.5">
+                        {selectionOverrideEnabled ? `Sugestão automática: ${autoForm?.title || 'nenhuma'}` : `Definida com base no tipo de cliente (${detectedCustomerType === 'cliente_final' ? 'Cliente Final' : 'Revenda'})`}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Manual Selecionado */}
+                  <div className="p-3.5 rounded-xl border border-surface-border bg-surface-subtle/50 flex items-start gap-3">
+                    <div className="w-7 h-7 rounded-lg bg-brand-highlight/10 text-brand-highlight flex items-center justify-center flex-shrink-0 mt-0.5">
+                      <BookOpen className="w-4 h-4" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[9px] font-black uppercase tracking-wider text-brand-muted">
+                          Manual de Atendimento
+                        </span>
+                        <Badge variant="neutral" size="xs" className="text-[9px] font-bold">{selectionOverrideEnabled ? 'Selecionado' : 'Sugestão'}</Badge>
+                      </div>
+                      <div className="text-xs font-black text-brand-primary mt-0.5">
+                        {effectiveGuideline?.title || 'Critérios padrão da ficha'}
+                      </div>
+                      <p className="text-[10px] font-medium text-brand-muted mt-0.5 line-clamp-1">
+                        {effectiveGuideline?.content ? effectiveGuideline.content.slice(0, 100) + '...' : 'Avaliação sem manual adicional.'}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Mensagem de trava */}
+                <div className="space-y-3 rounded-xl border border-surface-border bg-surface-subtle/60 p-3">
+                  <label className="flex cursor-pointer items-start gap-2.5 text-xs font-semibold text-brand-primary">
+                    <input
+                      type="checkbox"
+                      checked={selectionOverrideEnabled}
+                      onChange={event => {
+                        const enabled = event.target.checked;
+                        setSelectionOverrideEnabled(enabled);
+                        setSelectedOverrideFormId(autoForm?.id || '');
+                        setSelectedOverrideGuidelineIds(autoGuideline ? [autoGuideline.id] : []);
+                        if (!enabled) setSelectionOverrideReason('');
+                      }}
+                      className="mt-0.5 h-4 w-4 rounded border-surface-border text-brand-highlight focus:ring-brand-highlight"
+                    />
+                    <span>
+                      A ficha ou o manual sugerido está incorreto
+                      <span className="mt-0.5 block text-[10px] font-normal text-brand-muted">Marque para liberar a troca e registrar esta falha de seleção.</span>
+                    </span>
+                  </label>
+                  {selectionOverrideEnabled && (
+                    <div className="grid gap-3 border-t border-surface-border pt-3">
+                      <label className="grid gap-1 text-[10px] font-bold uppercase tracking-wider text-brand-muted">
+                        Ficha correta
+                        <select value={selectedOverrideFormId} onChange={event => setSelectedOverrideFormId(event.target.value)} className="rounded-lg border border-surface-border bg-surface-card px-3 py-2 text-xs font-semibold normal-case tracking-normal text-brand-primary">
+                          {forms.filter(form => form.active !== false).map(form => <option key={form.id} value={form.id}>{form.title}</option>)}
+                        </select>
+                      </label>
+                      <label className="grid gap-1 text-[10px] font-bold uppercase tracking-wider text-brand-muted">
+                        Manual correto
+                        <select value={selectedOverrideGuidelineIds[0] || ''} onChange={event => setSelectedOverrideGuidelineIds(event.target.value ? [event.target.value] : [])} className="rounded-lg border border-surface-border bg-surface-card px-3 py-2 text-xs font-semibold normal-case tracking-normal text-brand-primary">
+                          <option value="">Sem manual</option>
+                          {guidelineOptions.map(guideline => <option key={guideline.id} value={guideline.id}>{guideline.title}</option>)}
+                        </select>
+                      </label>
+                      <label className="grid gap-1 text-[10px] font-bold uppercase tracking-wider text-brand-muted">
+                        O que veio errado?
+                        <textarea value={selectionOverrideReason} onChange={event => setSelectionOverrideReason(event.target.value)} maxLength={500} rows={2} placeholder="Ex.: cliente revenda recebeu ficha de cliente final" className="resize-none rounded-lg border border-surface-border bg-surface-card px-3 py-2 text-xs font-medium normal-case tracking-normal text-brand-primary placeholder:text-brand-muted" />
+                      </label>
+                    </div>
+                  )}
+                </div>
+
+                <div className="p-3 rounded-xl bg-brand-highlight/5 border border-brand-highlight/15 text-[11px] font-medium text-brand-primary/80 flex items-center gap-2">
+                  {selectionOverrideEnabled ? <AlertTriangle className="w-4 h-4 text-functional-warning flex-shrink-0" /> : <Lock className="w-4 h-4 text-brand-highlight flex-shrink-0" />}
+                  <span>
+                    {selectionOverrideEnabled
+                      ? 'A correção será registrada junto ao resultado para análise dos erros de seleção.'
+                      : `A ficha e o manual foram sugeridos pelo tipo de cliente (${detectedCustomerType === 'cliente_final' ? 'Cliente Final' : 'Revenda'}). Se estiverem errados, marque a opção acima.`}
+                  </span>
+                </div>
+
+                <div className="flex items-center justify-end gap-2 pt-2 border-t border-surface-border">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setGuidelinePickerTicket(null)}
+                  >
+                    Cancelar
+                  </Button>
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    className="flex items-center gap-1.5"
+                    disabled={!effectiveForm || evaluatingTicketId === guidelinePickerTicket.ticket_id || (selectionOverrideEnabled && !selectionOverrideReason.trim())}
+                    onClick={() => {
+                      const ticket = guidelinePickerTicket;
+                      if (!effectiveForm) return;
+                      const formToUse = effectiveForm;
+                      const guidelineIds = selectionOverrideEnabled
+                        ? selectedOverrideGuidelineIds
+                        : (autoGuideline ? [autoGuideline.id] : []);
+                      const selectionContext = {
+                        detected_customer_type: detectedCustomerType,
+                        suggested_form_id: autoForm?.id || null,
+                        suggested_form_title: autoForm?.title || null,
+                        suggested_guideline_ids: autoGuideline ? [autoGuideline.id] : [],
+                        suggested_guideline_titles: autoGuideline ? [autoGuideline.title] : [],
+                        selected_form_id: formToUse.id,
+                        selected_form_title: formToUse.title,
+                        selected_guideline_ids: guidelineIds,
+                        selected_guideline_titles: guidelineOptions.filter(guideline => guidelineIds.includes(guideline.id)).map(guideline => guideline.title),
+                        overridden: selectionOverrideEnabled,
+                        override_reason: selectionOverrideEnabled ? selectionOverrideReason.trim() : null,
+                        source: selectionOverrideEnabled ? 'manual_override' : (autoForm ? 'automatic' : 'manual_no_suggestion'),
+                      };
+                      setGuidelinePickerTicket(null);
+                      void handleEvaluateWithAI(ticket, formToUse, guidelineIds, false, selectionContext).catch(() => undefined);
+                    }}
+                  >
+                    <Bot className="w-3.5 h-3.5" />
+                    <span>Confirmar e Avaliar com IA</span>
+                  </Button>
+                </div>
+              </Card>
+            </div>
+          </div>,
+          document.body
+        );
+      })()}
+
+      {/* Modal Prévio de Apresentação do Manual de Chamados Filhos */}
+      {childGuidelineModalTicket && createPortal(
+        <div
+          className="fixed inset-0 bg-black/75 backdrop-blur-xs flex items-center justify-center z-[9999] p-4 animate-fade-in"
+          onClick={() => {
+            setChildGuidelineModalTicket(null);
+            setShowFullChildManual(false);
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-xl animate-scale-up"
+          >
+            <Card className="p-6 space-y-4 shadow-2xl border border-surface-border">
+              {/* Header */}
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className="w-8 h-8 rounded-lg bg-brand-highlight/10 text-brand-highlight flex items-center justify-center">
+                    <Bot className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-sm font-black text-brand-primary">
+                      Auditoria de Chamado Filho com IA
+                    </h3>
+                    <p className="text-[11px] font-medium text-brand-muted">
+                      Conferência de conformidade do Ticket #{childGuidelineModalTicket.ticket_id}
+                    </p>
+                  </div>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setChildGuidelineModalTicket(null);
+                    setShowFullChildManual(false);
+                  }}
+                >
+                  <X className="w-4 h-4" />
+                </Button>
+              </div>
+
+              {/* Informações do Chamado */}
+              <div className="p-3 rounded-xl bg-surface-subtle border border-surface-border space-y-1.5">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="font-bold text-brand-primary truncate max-w-[320px]">
+                    {childGuidelineModalTicket.subject}
+                  </span>
+                  {childGuidelineModalTicket.child_macro_type && getMacroBadge(childGuidelineModalTicket.child_macro_type)}
+                </div>
+                <div className="flex items-center gap-3 text-[10px] text-brand-muted">
+                  <span>Atendente: <strong className="text-brand-primary">{childGuidelineModalTicket.agent_name || 'Não atribuído (Apenas Grupo)'}</strong></span>
+                  <span>•</span>
+                  <span>Data: {formatTicketDateTime(childGuidelineModalTicket.ticket_date)}</span>
+                </div>
+              </div>
+
+              {/* Manual Vinculado com Destaque */}
+              <div className="p-4 rounded-xl border border-brand-highlight/30 bg-brand-highlight/5 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <BookOpen className="w-4 h-4 text-brand-highlight flex-shrink-0" />
+                    <div>
+                      <div className="text-[9px] font-black uppercase tracking-wider text-brand-muted">Manual Vinculado Homologado</div>
+                      <div className="text-xs font-black text-brand-primary">
+                        Manual vigente de Chamados Filhos
+                      </div>
+                    </div>
+                  </div>
+                  <Badge variant="primary" size="xs" className="font-bold">
+                    Padrão Ativo
+                  </Badge>
+                </div>
+
+                <div className="text-[11px] font-semibold text-brand-primary/80">
+                  A IA auditará a abertura deste chamado conforme o manual vigente:
+                </div>
+
+                {/* As 3 Regras de Ouro */}
+                <div className="space-y-1.5 text-[10px]">
+                  <div className="p-2 rounded-lg bg-surface-card border border-surface-border flex items-start gap-2">
+                    <span className="w-4 h-4 rounded-full bg-brand-highlight/10 text-brand-highlight font-bold flex items-center justify-center shrink-0 text-[9px]">1</span>
+                    <div>
+                      <strong className="text-brand-primary">Assunto da Abertura:</strong> Aceita identificador do chamado pai, prefixos (ex: <code>"Ticket Nova Demanda do #169238"</code>) e alterações automáticas pela macro de resolvido.
+                    </div>
+                  </div>
+                  <div className="p-2 rounded-lg bg-surface-card border border-surface-border flex items-start gap-2">
+                    <span className="w-4 h-4 rounded-full bg-brand-highlight/10 text-brand-highlight font-bold flex items-center justify-center shrink-0 text-[9px]">2</span>
+                    <div>
+                      <strong className="text-brand-primary">Corpo da Mensagem e Enriquecimento:</strong> Manutenção da estrutura da macro com preenchimento dos dados técnicos (versão, logs, AnyDesk, testes realizados).
+                    </div>
+                  </div>
+                  <div className="p-2 rounded-lg bg-surface-card border border-surface-border flex items-start gap-2">
+                    <span className="w-4 h-4 rounded-full bg-brand-highlight/10 text-brand-highlight font-bold flex items-center justify-center shrink-0 text-[9px]">3</span>
+                    <div>
+                      <strong className="text-brand-primary">Direcionamento ("Para"):</strong> O filho inicia no nome de quem o abriu. Em Análise Técnica, o pai segue para o grupo especialista; o filho pode ser transferido depois.
+                    </div>
+                  </div>
+                  <div className="p-2 rounded-lg bg-surface-card border border-surface-border flex items-start gap-2">
+                    <span className="w-4 h-4 rounded-full bg-brand-highlight/10 text-brand-highlight font-bold flex items-center justify-center shrink-0 text-[9px]">4</span>
+                    <div>
+                      <strong className="text-brand-primary">Equipe criadora:</strong> Análise Técnica e Análise de Correções não podem criar tickets filhos. A infração comprovada é crítica e pode invalidar a monitoria.
+                    </div>
+                  </div>
+                </div>
+
+                {/* Opção para ler o manual completo */}
+                <div>
+                  <button
+                    type="button"
+                    onClick={() => setShowFullChildManual(!showFullChildManual)}
+                    className="text-[10px] font-bold text-brand-highlight hover:underline flex items-center gap-1 cursor-pointer"
+                  >
+                    <Eye className="w-3 h-3" />
+                    <span>{showFullChildManual ? 'Ocultar texto do manual' : 'Ver manual vigente na íntegra'}</span>
+                  </button>
+                  {showFullChildManual && (
+                    <div className="mt-2 p-3 max-h-48 overflow-y-auto rounded-lg bg-surface-card border border-surface-border text-[10px] text-brand-muted whitespace-pre-line font-mono leading-relaxed">
+                      {activeChildGuideline.content}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Ações do Modal */}
+              <div className="flex items-center justify-end gap-2 pt-2 border-t border-surface-border">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setChildGuidelineModalTicket(null);
+                    setShowFullChildManual(false);
+                  }}
+                >
+                  Cancelar
+                </Button>
+                <Button
+                  variant="primary"
+                  size="sm"
+                  className="flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold"
+                  onClick={() => {
+                    const ticketToEvaluate = childGuidelineModalTicket;
+                    setChildGuidelineModalTicket(null);
+                    setShowFullChildManual(false);
+                    handleEvaluateChildTicket(ticketToEvaluate);
+                  }}
+                >
+                  <Bot className="w-3.5 h-3.5" />
+                  <span>Iniciar Auditoria com IA</span>
+                </Button>
+              </div>
+            </Card>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {assignmentModalTicket && isDistributedQueue(activeQueue) && queueAssignments[activeQueue][assignmentModalTicket.ticket_id] && (
+        <QueueMonitorAssignmentModal
+          ticketId={assignmentModalTicket.ticket_id}
+          assignment={queueAssignments[activeQueue][assignmentModalTicket.ticket_id]}
+          monitors={eligibleOnlineMonitors}
+          onClose={() => setAssignmentModalTicket(null)}
+          onTransfer={async (monitorId, confirmInProgress) => {
+            const queueType = activeQueue;
+            const updated = await reassignQueueTicket(
+              assignmentModalTicket.ticket_id,
+              queueType,
+              monitorId,
+              confirmInProgress
+            );
+            setQueueAssignments(prev => ({
+              ...prev,
+              [queueType]: { ...prev[queueType], [assignmentModalTicket.ticket_id]: updated },
+            }));
+            setAssignmentModalTicket(null);
+            toast.success('Monitor responsável alterado com sucesso.');
+          }}
+        />
+      )}
+      {helpdeskTicket?.monitoria_id && typeof helpdeskTicket.monitoria_score === 'number' && Number.isFinite(helpdeskTicket.monitoria_score) && (
+        <HelpdeskSendModal
+          monitoriaId={helpdeskTicket.monitoria_id}
+          ticketId={helpdeskTicket.ticket_id}
+          suggestedOutcome={getEvaluationOutcome(helpdeskTicket.monitoria_score)}
+          underReview={helpdeskTicket.monitoria_status === 'pendente_revisao'}
+          onClose={() => setHelpdeskTicket(null)}
+          onSent={() => setTickets(previous => previous.filter(ticket => ticket.ticket_id !== helpdeskTicket.ticket_id))}
+        />
+      )}
+    </div>
+  );
+}
+
+function QueueTicketNumber({ ticketId }: { ticketId: string }) {
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-lg border border-surface-border bg-surface-card px-2.5 py-1 font-mono text-sm font-black tabular-nums text-brand-primary shadow-2xs">
+      <Hash className="h-3.5 w-3.5 text-brand-highlight" aria-hidden="true" />
+      <span>{ticketId}</span>
+    </span>
+  );
+}

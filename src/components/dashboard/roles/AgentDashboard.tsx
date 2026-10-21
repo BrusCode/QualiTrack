@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useDashboard } from '../DashboardContext';
 import { Monitoria } from '../../../types';
 import StatCard from '../widgets/StatCard';
@@ -7,18 +7,24 @@ import DistributionChart from '../widgets/DistributionChart';
 import RecentAuditsTable from '../widgets/RecentAuditsTable';
 import ActionDeadlineWidget from '../widgets/ActionDeadlineWidget';
 import OfensoresChart from '../widgets/OfensoresChart';
+import SupportDrillDownModal from '../widgets/SupportDrillDownModal';
 import { Target, ClipboardCheck, AlertTriangle, TrendingUp, CheckCircle2, XCircle, Users, History } from 'lucide-react';
 import { useQualityConfig } from '../../../lib/useQualityConfig';
 import { chartPalette, chartColorArray } from '../chartColors';
+import { buildComparisonTrend, selectTrendEvaluations } from '../../../lib/performanceTrend';
+import { useFeedbacks } from '../../../hooks/useFeedbacks';
+import FeedbacksWidget from '../../feedback/FeedbacksWidget';
+import QualityAchievementsWidget from '../widgets/QualityAchievementsWidget';
+import { DashboardTile } from '../DashboardTileLayout';
 
 // High-fidelity mock datasets for customization mode
 const mockTrendData = [
-  { name: '01/05', MeuScore: 84.5, MediaEquipe: 81.5 },
-  { name: '05/05', MeuScore: 83.2, MediaEquipe: 82.1 },
-  { name: '10/05', MeuScore: 86.1, MediaEquipe: 82.8 },
-  { name: '15/05', MeuScore: 87.4, MediaEquipe: 83.5 },
-  { name: '20/05', MeuScore: 85.9, MediaEquipe: 84.2 },
-  { name: '25/05', MeuScore: 88.2, MediaEquipe: 85.0 }
+  { name: 'abr/26', MeuScore: 84.5, MediaEquipe: 81.5 },
+  { name: 'mai/26', MeuScore: 83.2, MediaEquipe: 82.1 },
+  { name: 'jun/26', MeuScore: 86.1, MediaEquipe: 82.8 },
+  { name: 'jul/26', MeuScore: 87.4, MediaEquipe: 83.5 },
+  { name: 'ago/26', MeuScore: 85.9, MediaEquipe: 84.2 },
+  { name: 'set/26', MeuScore: 88.2, MediaEquipe: 85.0 }
 ];
 
 const mockDistributionData = [
@@ -149,6 +155,7 @@ export default function AgentDashboard({
     monitorias: [],
     allMonitorias: [],
     users: [],
+    teams: [],
     forms: [],
     dissatisfactionFields: [],
     globalAvg: 0
@@ -163,8 +170,15 @@ export default function AgentDashboard({
     // safe fallback when outside DashboardProvider (e.g. customization preview)
   }
 
-  const { user, monitorias, allMonitorias, users, forms, dissatisfactionFields, globalAvg } = dashboardData;
+  const { user, monitorias, allMonitorias, filters = { startDate: '', endDate: '' }, users, teams, forms, dissatisfactionFields, globalAvg } = dashboardData;
   const { config, getLevelForScore, isAboveTarget } = useQualityConfig();
+  const { feedbacks, createFeedback, acknowledgeFeedback, completeFeedback } = useFeedbacks(user);
+
+  const [drillDown, setDrillDown] = useState<{
+    title: string;
+    subtitle?: string;
+    monitorias: any[];
+  } | null>(null);
 
   // --- Only MY monitorias (for personal metrics) - FILTERED BY UI
   const myMonitorias = useMemo(() => {
@@ -244,8 +258,8 @@ export default function AgentDashboard({
     );
   }, [isCustomizing, myMonitorias]);
 
-  const contestationsApproved = useMemo(() => {
-    if (isCustomizing) return 2;
+  const contestationsApprovedList = useMemo(() => {
+    if (isCustomizing) return [];
     return myContestations.filter((m: any) => 
       m.status === 'contestacao_aceita' || 
       m.status === 'finalizada_alterada' ||
@@ -256,13 +270,15 @@ export default function AgentDashboard({
         h.action.toLowerCase().includes('alterado') ||
         h.action.toLowerCase().includes('reavaliada')
       )
-    ).length;
+    );
   }, [isCustomizing, myContestations]);
 
-  const contestationsRejected = useMemo(() => {
-    if (isCustomizing) return 2;
+  const contestationsApproved = isCustomizing ? 2 : contestationsApprovedList.length;
+
+  const contestationsRejectedList = useMemo(() => {
+    if (isCustomizing) return [];
     return myContestations.filter((m: any) => 
-      m.status === 'contestacao_negada' ||
+      m.status === 'contestacao_negada' || 
       m.history?.some((h: any) =>
         h.action.includes('Improcedente') ||
         h.action.includes('Mantida') ||
@@ -270,8 +286,10 @@ export default function AgentDashboard({
         h.action.toLowerCase().includes('recusada') ||
         h.action.toLowerCase().includes('mantida')
       )
-    ).length;
+    );
   }, [isCustomizing, myContestations]);
+
+  const contestationsRejected = isCustomizing ? 2 : contestationsRejectedList.length;
 
   const reversionRate = useMemo(() => {
     const totalContested = contestationsApproved + contestationsRejected;
@@ -292,34 +310,20 @@ export default function AgentDashboard({
   // --- Trend Data (Agent vs Team)
   const trendData = useMemo(() => {
     if (isCustomizing) return mockTrendData;
-    const days: Record<string, { myTotal: number, myCount: number, teamTotal: number, teamCount: number }> = {};
-    
-    // Process My Scores
-    myMonitorias.forEach((m: any) => {
-      const date = new Date(m.created_at).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
-      if (!days[date]) days[date] = { myTotal: 0, myCount: 0, teamTotal: 0, teamCount: 0 };
-      days[date].myTotal += m.score || 0;
-      days[date].myCount += 1;
-    });
-
-    // Process Team Scores
-    teamMonitorias.forEach((m: any) => {
-      const date = new Date(m.created_at).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
-      if (!days[date]) days[date] = { myTotal: 0, myCount: 0, teamTotal: 0, teamCount: 0 };
-      days[date].teamTotal += m.score || 0;
-      days[date].teamCount += 1;
-    });
-
-    return Object.entries(days).map(([name, data]) => ({
-      name,
-      MeuScore: data.myCount > 0 ? Math.round((data.myTotal / data.myCount) * 100) / 100 : undefined,
-      MediaEquipe: data.teamCount > 0 ? Math.round((data.teamTotal / data.teamCount) * 100) / 100 : undefined
-    })).sort((a, b) => {
-      const [da, ma] = a.name.split('/').map(Number);
-      const [db, mb] = b.name.split('/').map(Number);
-      return ma !== mb ? ma - mb : da - db;
-    });
-  }, [isCustomizing, myMonitorias, teamMonitorias]);
+    const selected = selectTrendEvaluations(allMonitorias, filters, 'suporte');
+    const myInfo = users.find((candidate: { id: string }) => candidate.id === user?.id);
+    let teamIds: string[] = myInfo?.team_ids || user?.team_ids || [];
+    if (teamIds.length === 0) {
+      teamIds = Array.from(new Set(allMonitorias
+        .filter((m: Monitoria) => m.evaluated_id === user?.id && m.team_id)
+        .map((m: Monitoria) => m.team_id as string)));
+    }
+    return buildComparisonTrend(
+      selected.evaluations.filter(m => m.evaluated_id === user?.id),
+      selected.evaluations.filter(m => m.team_id && teamIds.includes(m.team_id)),
+      selected.granularity,
+    );
+  }, [isCustomizing, allMonitorias, filters, users, user]);
 
   // --- Total Pendentes: Monitorias aguardando ação do agente (Ciente ou Re-contestação)
   const pendingCount = isCustomizing ? 2 : myAllMonitorias.filter((m: any) => ['pendente_revisao', 'contestacao_negada'].includes(m.status)).length;
@@ -460,6 +464,11 @@ export default function AgentDashboard({
           icon={pendingCount === 0 ? <CheckCircle2 className="w-5 h-5" /> : <AlertTriangle className="w-5 h-5" />}
           accent={pendingCount === 0 ? 'text-functional-success' : 'text-functional-error'}
           valueColorClass="text-slate-900 dark:text-slate-50"
+          onClick={() => setDrillDown({
+            title: 'Minhas Pendências',
+            subtitle: 'Monitorias aguardando sua revisão ou manifestação',
+            monitorias: prazosParaContestar,
+          })}
           isCustomizing={isCustomizing}
           profile="suporte"
           activeEditingId={activeEditingId}
@@ -472,6 +481,11 @@ export default function AgentDashboard({
           good={volDiff >= 0}
           icon={<ClipboardCheck className="w-5 h-5" />}
           accent={volDiff >= 0 ? 'text-functional-success' : 'text-functional-error'}
+          onClick={() => setDrillDown({
+            title: 'Meu Volume de Avaliações',
+            subtitle: 'Todas as suas monitorias avaliadas no período selecionado',
+            monitorias: maskedMonitorias,
+          })}
           badge={
             myMonitorias.length > 0 ? (
               <span className={`inline-flex items-center justify-center gap-0.5 px-1.5 py-0.5 text-[10px] font-bold rounded-md self-center ${volColorClass}`}>
@@ -496,6 +510,11 @@ export default function AgentDashboard({
           good={isAboveTarget(avgScore)}
           icon={<Target className="w-5 h-5" />}
           accent="text-slate-500"
+          onClick={() => setDrillDown({
+            title: 'Minhas Avaliações com Nota',
+            subtitle: 'Monitorias que compõem a sua pontuação média no período',
+            monitorias: maskedMonitorias.filter((m: any) => m.score !== undefined && m.score !== null),
+          })}
           badge={
             isCustomizing ? (
               <span className={`inline-flex items-center justify-center gap-0.5 px-1.5 py-0.5 text-[10px] font-bold rounded-md self-center ${isCustomizing ? 'bg-green-50 text-green-700 dark:bg-green-950/30 dark:text-green-400' : diffColorClass}`}>
@@ -521,6 +540,11 @@ export default function AgentDashboard({
           icon={<Users className="w-5 h-5" />}
           accent="text-slate-500"
           valueColorClass="text-slate-900 dark:text-slate-50"
+          onClick={() => setDrillDown({
+            title: 'Monitorias da Equipe',
+            subtitle: 'Monitorias avaliadas da sua equipe no período selecionado',
+            monitorias: maskedMonitorias,
+          })}
           isCustomizing={isCustomizing}
           profile="suporte"
           activeEditingId={activeEditingId}
@@ -538,6 +562,11 @@ export default function AgentDashboard({
           icon={<History className="w-5 h-5" />}
           accent="text-slate-500"
           valueColorClass="text-slate-900 dark:text-slate-50"
+          onClick={() => setDrillDown({
+            title: 'Contestações Solicitadas',
+            subtitle: 'Todas as monitorias com solicitação de contestação/reavaliação',
+            monitorias: myContestations,
+          })}
           isCustomizing={isCustomizing}
           profile="suporte"
           activeEditingId={activeEditingId}
@@ -551,6 +580,11 @@ export default function AgentDashboard({
           icon={<CheckCircle2 className="w-5 h-5" />}
           accent="text-functional-success"
           valueColorClass="text-slate-900 dark:text-slate-50"
+          onClick={() => setDrillDown({
+            title: 'Contestações Procedentes',
+            subtitle: 'Contestações deferidas com alteração de nota',
+            monitorias: contestationsApprovedList,
+          })}
           isCustomizing={isCustomizing}
           profile="suporte"
           activeEditingId={activeEditingId}
@@ -564,6 +598,11 @@ export default function AgentDashboard({
           icon={<XCircle className="w-5 h-5" />}
           accent="text-functional-error"
           valueColorClass="text-slate-900 dark:text-slate-50"
+          onClick={() => setDrillDown({
+            title: 'Contestações Improcedentes',
+            subtitle: 'Contestações indeferidas com nota mantida',
+            monitorias: contestationsRejectedList,
+          })}
           isCustomizing={isCustomizing}
           profile="suporte"
           activeEditingId={activeEditingId}
@@ -576,6 +615,11 @@ export default function AgentDashboard({
           good={reversionRate >= config.targetReversalRate}
           icon={<Target className="w-5 h-5" />}
           accent={reversionRate >= config.targetReversalRate ? 'text-functional-success' : 'text-functional-error'}
+          onClick={() => setDrillDown({
+            title: 'Base da Taxa de Sucesso',
+            subtitle: 'Contestações avaliadas consideradas no cálculo da taxa',
+            monitorias: [...contestationsApprovedList, ...contestationsRejectedList],
+          })}
           badge={
             isCustomizing ? (
               <span className={`inline-flex items-center justify-center gap-0.5 px-1.5 py-0.5 text-[10px] font-bold rounded-md self-center ${isCustomizing ? 'bg-green-50 text-green-700 dark:bg-green-950/30 dark:text-green-400' : revColorClass}`}>
@@ -620,7 +664,8 @@ export default function AgentDashboard({
           <TrendChart 
             data={trendData} 
             title="Evolução Semanal"
-            subtitle="Tendência de desempenho ao longo das semanas"
+            displayTitle="Evolução de Desempenho"
+            subtitle="Tendência na escala selecionada: dia, mês ou ano"
             dataKeys={[
               { key: 'MeuScore', name: 'Meu Score', color: chartPalette().excelente },
               { key: 'MediaEquipe', name: 'Média Equipe', color: chartPalette().aceitavel }
@@ -710,6 +755,33 @@ export default function AgentDashboard({
         </div>
       </div>
 
+      {/* LINHA 7 (grid-cols-1): Minhas Conquistas & Gamificação */}
+      <div>
+        <DashboardTile type="QualityAchievementsWidget" title="Minhas Conquistas & Gamificação">
+        <QualityAchievementsWidget
+          monitorias={maskedMonitorias}
+          currentUser={user}
+        />
+        </DashboardTile>
+      </div>
+
+      {/* LINHA 8 (grid-cols-1): Meus Feedbacks e Planos 1:1 */}
+      <div>
+        <DashboardTile type="FeedbacksWidget" title="Meus Feedbacks & Planos 1:1">
+        <FeedbacksWidget
+          feedbacks={feedbacks}
+          currentUser={user}
+          viewRole="suporte"
+          users={maskedUsers}
+          teams={teams || []}
+          monitorias={maskedMonitorias}
+          onCreateFeedback={createFeedback}
+          onAcknowledgeFeedback={acknowledgeFeedback}
+          onCompleteFeedback={completeFeedback}
+        />
+        </DashboardTile>
+      </div>
+
       {/* LINHA 8 (grid-cols-1): Histórico Recente */}
       <div className="overflow-hidden">
         <RecentAuditsTable 
@@ -719,6 +791,15 @@ export default function AgentDashboard({
           isCustomizing={isCustomizing}
         />
       </div>
+
+      {drillDown && (
+        <SupportDrillDownModal
+          title={drillDown.title}
+          subtitle={drillDown.subtitle}
+          monitorias={drillDown.monitorias}
+          onClose={() => setDrillDown(null)}
+        />
+      )}
     </div>
   );
 }

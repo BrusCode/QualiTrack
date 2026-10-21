@@ -1,19 +1,23 @@
 import React, { useState } from 'react';
-import { User, Award } from 'lucide-react';
+import { User, Award, ChevronRight } from 'lucide-react';
 import Card from '../../ui/Card';
+import { withDashboardTile } from '../DashboardTileLayout';
 import { useQualityConfig } from '../../../lib/useQualityConfig';
 import { useDashboard, useEditing } from '../DashboardContext';
 import { toast } from 'sonner';
 import { m, AnimatePresence } from 'motion/react';
 
-interface RankingItem {
+export interface RankingItem {
   id: string;
   name: string;
   score?: number;
+  rawScore?: number;
+  badness?: number;
   count: number;
+  monitorias?: any[];
 }
 
-interface RankingWidgetProps {
+export interface RankingWidgetProps {
   title: string;
   subtitle?: string;
   data: RankingItem[];
@@ -24,6 +28,7 @@ interface RankingWidgetProps {
   profile?: string;
   activeEditingId?: string | null;
   setActiveEditingId?: (id: string | null) => void;
+  onItemClick?: (item: RankingItem) => void;
 }
 
 const RANKING_BG_MAP: Record<string, string> = {
@@ -47,7 +52,7 @@ function getIconBg(accent: string): string {
   return 'bg-surface-subtle';
 }
 
-export default function RankingWidget({ 
+function RankingWidget({
   title, 
   subtitle, 
   data, 
@@ -57,13 +62,16 @@ export default function RankingWidget({
   isCustomizing = false,
   profile,
   activeEditingId,
-  setActiveEditingId
+  setActiveEditingId,
+  onItemClick
 }: RankingWidgetProps) {
   const { getLevelForScore, config, saveConfig } = useQualityConfig();
   const [isHovered, setIsHovered] = useState(false);
   const [tempSub, setTempSub] = useState('');
 
   const isMelhoresSuporte = title === 'Melhores Suporte';
+  const isSupportOffender = title === 'Maiores Ofensores';
+  const isSupportRanking = isMelhoresSuporte || isSupportOffender;
   const isTopReavRecusadas = title === 'Top Reav. Recusadas' || title === 'Top Reav. Aceitas';
 
   const tooltipPositionClass = isMelhoresSuporte
@@ -217,21 +225,28 @@ export default function RankingWidget({
           </AnimatePresence>
         </div>
           <div className="flex-1">
-            <h3 className="text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 leading-tight whitespace-normal">{title}</h3>
+            <h3 className="text-[11px] font-black uppercase tracking-wider text-brand-primary leading-tight whitespace-normal">{title}</h3>
           </div>
         </div>
       )}
 
-      <div className="flex-1 space-y-1.5 overflow-visible pr-1 no-scrollbar">
+      <div className="flex-1 space-y-1 overflow-visible pr-0.5 no-scrollbar">
         {data.map((item, index) => {
-          const level = item.score !== undefined ? getLevelForScore(item.score) : { color: 'text-brand-primary', label: '' };
+          const level = item.score !== undefined ? getLevelForScore(isSupportRanking ? (item.rawScore ?? item.score) : item.score) : { color: 'text-brand-primary', label: '' };
           const isCount = type === 'count';
+          const displayScore = isSupportOffender ? (item.badness ?? item.score ?? 0) : (item.score ?? 0);
 
           return (
         <div
           key={item.id}
-          className="group relative flex items-center gap-2 py-1 px-2 rounded-2xl border border-surface-border hover:border-brand-primary/20 hover:bg-surface-subtle/50 hover:z-[10000] transition-all duration-200"
+          onClick={onItemClick ? () => onItemClick(item) : undefined}
+          onKeyDown={onItemClick ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onItemClick(item); } } : undefined}
+          className={`group relative flex items-center gap-2 py-1.5 px-2 rounded-xl border border-surface-border hover:border-brand-primary/20 hover:bg-surface-subtle/50 hover:z-[10000] transition-all duration-200 ${
+            onItemClick ? 'cursor-pointer hover:border-brand-accent/50 hover:bg-surface-subtle/80 hover:shadow-sm active:scale-[0.99]' : ''
+          }`}
           tabIndex={0}
+          role={onItemClick ? 'button' : undefined}
+          aria-label={onItemClick ? `Ver monitorias de ${item.name}` : undefined}
           aria-describedby={`tooltip-${myUniqueId}-row-${index}`}
         >
           <div
@@ -247,7 +262,9 @@ export default function RankingWidget({
                     const isReav = title.toLowerCase().includes('reav');
                     const isCrit = title.toLowerCase().includes('crit') || title.toLowerCase().includes('ofensor');
                     if (type === 'score') {
-                      return `Score Médio: ${(item.score ?? 0).toFixed(1)}% | Total: ${item.count} mon.`;
+                      return item.rawScore !== undefined
+                        ? `${isSupportOffender ? 'Índice de perdas' : 'Índice ponderado'}: ${displayScore.toFixed(1)}% | Média: ${item.rawScore.toFixed(1)}%`
+                        : `Score Médio: ${(item.score ?? 0).toFixed(1)}% | Total: ${item.count} mon.`;
                     } else if (isReav) {
                       return `Reavaliações: ${item.count} Vol.`;
                     } else if (isCrit) {
@@ -265,31 +282,39 @@ export default function RankingWidget({
 
               {/* Rank Badge */}
               <div className="relative flex-shrink-0">
-                <div className="w-7 h-7 rounded-xl bg-brand-accent text-white flex items-center justify-center font-black text-[10px] shadow-premium group-hover:scale-105 transition-transform">
+                <div className="w-6 h-6 rounded-lg bg-brand-accent text-white flex items-center justify-center font-black text-[10px] shadow-sm group-hover:scale-105 transition-transform">
                   {index + 1}
                 </div>
                 {index === 0 && (
-                  <div className="absolute -top-1 -right-1 w-3.5 h-3.5 bg-yellow-400 rounded-full border border-surface-card flex items-center justify-center">
-                    <Award className="w-2 h-2 text-white" />
+                  <div className="absolute -top-1 -right-1 w-3 h-3 bg-yellow-400 rounded-full border border-surface-card flex items-center justify-center">
+                    <Award className="w-1.5 h-1.5 text-white" />
                   </div>
                 )}
               </div>
 
               {/* Name + Count */}
-              <div className="flex-1 min-w-0">
-                <p className="text-[10px] font-semibold text-brand-primary uppercase tracking-tight leading-tight">{item.name}</p>
+              <div className="flex-1 min-w-0 pr-1">
+                <p className="text-[10px] font-semibold text-brand-primary uppercase tracking-tight leading-tight truncate" title={item.name}>
+                  {item.name}
+                </p>
                 {!isCount && (
-                  <p className="text-[9px] font-medium text-slate-400 dark:text-slate-500 mt-0.5">
-                    {item.count} mon.
+                  <p className="text-[9px] font-semibold text-slate-800 dark:text-slate-400 mt-0.5 truncate">
+                    {item.count} mon.{item.rawScore !== undefined && ` · Média ${item.rawScore.toFixed(1)}%`}
                   </p>
                 )}
               </div>
 
               {/* Score / Volume */}
-              <div className="text-right flex-shrink-0">
-                <div className={`text-xs font-bold ${isCount ? 'text-brand-primary' : level.color}`}>
-                  {isCount ? `${item.count} Vol.` : `${(item.score ?? 0).toFixed(1)}%`}
+              <div className="flex items-center gap-1.5 flex-shrink-0">
+                <div className="text-right">
+                  <div className={`text-xs font-bold ${isCount ? 'text-brand-primary' : level.color}`}>
+                    {isCount ? `${item.count} Vol.` : `${displayScore.toFixed(1)}%`}
+                    {item.rawScore !== undefined && <span className="block text-[9px] font-medium text-brand-muted">{isSupportOffender ? 'perdas' : 'índice'}</span>}
+                  </div>
                 </div>
+                {onItemClick && (
+                  <ChevronRight className="w-3.5 h-3.5 text-brand-muted opacity-40 group-hover:opacity-100 group-hover:translate-x-0.5 group-hover:text-brand-accent transition-all flex-shrink-0" />
+                )}
               </div>
             </div>
           );
@@ -303,3 +328,5 @@ export default function RankingWidget({
     </Card>
   );
 }
+
+export default withDashboardTile(RankingWidget, 'RankingWidget');

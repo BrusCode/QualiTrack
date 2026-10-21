@@ -8,7 +8,11 @@ export default defineConfig({
     globals: true,
     environment: 'jsdom',
     setupFiles: ['./src/test/setup.tsx'],
-    include: ['src/**/*.test.{ts,tsx}'],
+    // `supabase/functions/**` entra aqui para que a lógica pura das Edge
+    // Functions (ex.: montagem do HTML do comentário do helpdesk) seja
+    // coberta pelo `npm test`. Só arquivos sem import de runtime Deno são
+    // testáveis assim — é por isso que essa lógica fica separada do index.ts.
+    include: ['src/**/*.test.{ts,tsx}', 'supabase/functions/**/*.test.ts'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
@@ -16,6 +20,8 @@ export default defineConfig({
       exclude: ['src/**/*.d.ts', 'src/test/**', 'src/main.tsx', 'src/vite-env.d.ts'],
     },
     alias: {
+      './mockDb': path.resolve(__dirname, './src/lib/mockDb.dev.ts'),
+      './mockQueue': path.resolve(__dirname, './src/lib/mockQueue.dev.ts'),
       '@': path.resolve(__dirname, './src'),
     },
   },

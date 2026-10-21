@@ -1,15 +1,24 @@
-import React, { useEffect, useMemo, useRef } from 'react';
-import { User, Monitoria } from '../types';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { User, Monitoria, AIEvaluationResult, ChildTicketAiEvaluation, TicketCommentMessage, ZendeskTicketField } from '../types';
 import { useStaticData } from '../lib/StaticDataContext';
 import { useTheme } from '../providers/ThemeProvider';
 import {
   ChevronRight,
   ChevronLeft,
+  ChevronDown,
+  ChevronUp,
   Save,
   X,
   AlertOctagon,
   Info,
   CheckCircle2,
+  CheckCircle,
+  XCircle,
+  AlertCircle,
+  Bot,
+  RotateCcw,
+  RotateCw,
   MessageSquare,
   Hash,
   Clock,
@@ -18,21 +27,52 @@ import {
   Calendar,
   AlertTriangle,
   History,
-  Target
+  Target,
+  Lock,
+  Send,
+  ExternalLink,
+  UserPlus,
+  FileText,
+  Quote,
+  Search,
+  Copy,
+  Check,
+  Pencil
 } from 'lucide-react';
 import { m, AnimatePresence, useReducedMotion } from 'motion/react';
 import { useQualityConfig } from '../lib/useQualityConfig';
 import { toast } from 'sonner';
+import { supabase, mockDb, isMockMode } from '../lib/supabase';
+import {
+  resolveManualAgent,
+  lookupTicketAgent,
+  TicketAgentLookup,
+  fetchTicketDialogue,
+  generateAuditorRecordWithAI,
+} from '../lib/helpdeskQueue';
+import { getDialogueCategory, normalizeTicketDialogue } from '../lib/zendeskChatParser';
 import { useMonitoriaFormState } from '../hooks/useMonitoriaFormState';
 import { useMonitoriaSave } from '../hooks/useMonitoriaSave';
+import { useMonitoriaDraft } from '../hooks/useMonitoriaDraft';
+import { getEvaluationOutcome } from '../lib/domainRules';
+import { awaitsFinalPositiveDecision, canPublishSavedMonitoria } from '../lib/helpdeskPublicationGate';
+import { childVerdict, isChildFormId, isChildTicketMonitoria, legacyChildNoteVerdict } from '../lib/childTicketForm';
+import { isVerifiedTicketGroupPair } from '../lib/ticketTeam';
+import { getSavedZendeskTicketFields, normalizeZendeskTicketFields } from '../lib/monitoriaTicketFields';
 import Card from './ui/Card';
 import Button from './ui/Button';
 import Badge from './ui/Badge';
+import MonitoriaIdBadge from './ui/MonitoriaIdBadge';
 import Select from './ui/Select';
 import CustomSelect from './ui/CustomSelect';
 import CustomDatepicker from './ui/CustomDatepicker';
+import HelpdeskSendModal from './HelpdeskSendModal';
+import ChildTicketPublishModal from './ChildTicketPublishModal';
+import TicketMessageBubble from './TicketMessageBubble';
+import { EvaluationOutcome, MonitoriaStatus } from '../types';
 
 const CHANNELS = ['Chat', 'Email', 'Telefone', 'WhatsApp'] as const;
+
 
 export default function MonitoriaForm({
   user,
@@ -42,19 +82,84 @@ export default function MonitoriaForm({
 }: {
   user: User | null;
   onCancel: () => void;
-  onSaved: () => void;
+  onSaved: (monitoriaId: string) => void;
   initialData?: Monitoria;
 }) {
   const { resolvedTheme } = useTheme();
   const { config: qualityConfig, getLevelForScore, isAboveTarget } = useQualityConfig();
   const staticData = useStaticData();
   const isAdmin = user?.role === 'admin';
-  const isViewOnly = !!initialData && !(initialData as any)?._reevaluate && !(initialData as any)?._adminEdit;
+  // Só é "somente leitura" quando initialData é uma monitoria JÁ SALVA (tem
+  // id) — dados de pré-preenchimento vindos da Central de Filas (ticket_id,
+  // sugestões da IA etc.) não têm id ainda e precisam continuar editáveis.
+  const [isEditModeOverride, setIsEditModeOverride] = useState(false);
+  const isViewOnly = !!(initialData as any)?.id && !(initialData as any)?._reevaluate && !(initialData as any)?._adminEdit && !isEditModeOverride;
   const isReevaluating = !!(initialData as any)?._reevaluate;
-  const isAdminEdit = !!(initialData as any)?._adminEdit;
+  const isAdminEdit = !!(initialData as any)?._adminEdit || isEditModeOverride;
+
+  const initialAiEval: AIEvaluationResult | undefined =
+    (initialData as any)?.aiEvaluation ||
+    (initialData as any)?.form_snapshot?.ai_evaluation;
+
+  const childAiEval: ChildTicketAiEvaluation | undefined = (initialData ? isChildTicketMonitoria(initialData) : false)
+    ? ((initialData as any)?.childAiEvaluation || (initialData as any)?.form_snapshot?.child_ai_evaluation)
+    : undefined;
 
   const shouldReduceMotion = useReducedMotion();
   const contentRef = useRef<HTMLDivElement>(null);
+
+  // Popup de cadastro rápido de agente do helpdesk ainda não formalizado
+  // no QualiTrack (conta provisória por e-mail — ver lib/helpdeskQueue).
+  const [newAgentModalOpen, setNewAgentModalOpen] = useState(false);
+  const [newAgentName, setNewAgentName] = useState('');
+  const [newAgentEmail, setNewAgentEmail] = useState('');
+  const [creatingAgent, setCreatingAgent] = useState(false);
+  // Preview do agente encontrado no Zendesk pelo número do ticket, quando
+  // ele ainda não tem conta no QualiTrack (ver efeito de lookup abaixo).
+  const [unregisteredAgentPreview, setUnregisteredAgentPreview] = useState<TicketAgentLookup | null>(null);
+
+  // Card do score encolhe ao rolar para baixo na etapa de avaliação e acopla no topo
+  const [scoreCompact, setScoreCompact] = useState(false);
+  useEffect(() => {
+    const el = contentRef.current;
+    if (!el) return;
+    const onScroll = () => setScoreCompact(el.scrollTop > 45);
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, []);
+
+  // Diálogo e evidências do atendimento
+  const [dialogue, setDialogue] = useState<TicketCommentMessage[]>(() => {
+    const raw = (initialData as any)?.dialogue ||
+      (initialData as any)?.aiEvaluation?.dialogue ||
+      [];
+    const agentName = (initialData as any)?.evaluated_name || (initialData as any)?.agent_name;
+    return normalizeTicketDialogue(raw, agentName);
+  });
+  const [loadingDialogue, setLoadingDialogue] = useState(false);
+  const [loadingTicketFields, setLoadingTicketFields] = useState(false);
+  const [ticketFieldsError, setTicketFieldsError] = useState(false);
+  const [ticketContextRetry, setTicketContextRetry] = useState(0);
+  const [ticketFieldContext, setTicketFieldContext] = useState<{ ticketId: string; fields: ZendeskTicketField[]; source: 'saved' | 'provided' | 'current' }>(() => ({
+    ticketId: initialData?.ticket_id?.trim() || '',
+    fields: getSavedZendeskTicketFields(initialData),
+    source: initialData?.form_snapshot?.ticket_fields ? 'saved' : 'provided',
+  }));
+  const [showDialogueDrawer, setShowDialogueDrawer] = useState(false);
+  const [dialogueSearch, setDialogueSearch] = useState('');
+  const [dialogueFilter, setDialogueFilter] = useState<'all' | 'end_user' | 'agent' | 'system' | 'internal'>('all');
+  const [selectedQuestionForDialogue, setSelectedQuestionForDialogue] = useState<string | null>(null);
+  const [showStep4Dialogue, setShowStep4Dialogue] = useState(false);
+  const [expandedDialogueMsgIds, setExpandedDialogueMsgIds] = useState<Record<string, boolean>>({});
+
+  const toggleDialogueMsgExpand = (id: string | number) => {
+    setExpandedDialogueMsgIds(prev => ({ ...prev, [String(id)]: !prev[String(id)] }));
+  };
+
+  const [expandedAiQuestions, setExpandedAiQuestions] = useState<Record<string, boolean>>({});
+  const toggleAiExpansion = (questionId: string) => {
+    setExpandedAiQuestions(prev => ({ ...prev, [questionId]: !prev[questionId] }));
+  };
 
   const forms = useMemo(() =>
     staticData.forms.filter(f => f.active !== false).sort((a, b) => a.title.localeCompare(b.title)),
@@ -78,21 +183,380 @@ export default function MonitoriaForm({
     observations, setObservations,
     criticalErrors, setCriticalErrors,
     criticalErrorObservations, setCriticalErrorObservations,
-    dissatisfactionAnswers,
+    dissatisfactionAnswers, setDissatisfactionAnswers,
     selectedForm,
     score,
     clientFieldsToShow,
     qualityFieldsToShow,
     handleCheckboxChange,
   } = useMonitoriaFormState(initialData, forms, dissatisfactionFields);
+  const isChildEvaluation = initialData ? isChildTicketMonitoria(initialData) : isChildFormId(header.form_id);
+  const ticketFields = ticketFieldContext.ticketId === header.ticket_id?.trim() ? ticketFieldContext.fields : [];
+  const ticketFieldSource = ticketFieldContext.ticketId === header.ticket_id?.trim() ? ticketFieldContext.source : 'current';
+  const [lookedUpTicketGroup, setLookedUpTicketGroup] = useState<{
+    ticketId: string; agentId: string; teamId: string; groupName?: string;
+  } | null>(null);
+  const activeLookedUpGroup = lookedUpTicketGroup?.ticketId === header.ticket_id?.trim() ? lookedUpTicketGroup : null;
+  const ticketGroupTeamId = (initialData as Monitoria & { ticket_group_team_id?: string } | undefined)?.ticket_group_team_id
+    || activeLookedUpGroup?.teamId;
+  const isTicketGroupPair = (agentId: string | undefined, teamId: string | undefined) =>
+    teams.some(team => team.id === ticketGroupTeamId) &&
+    isVerifiedTicketGroupPair(
+      header.ticket_id,
+      initialData?.ticket_id || activeLookedUpGroup?.ticketId,
+      agentId,
+      initialData?.evaluated_id || activeLookedUpGroup?.agentId,
+      teamId,
+      ticketGroupTeamId,
+    );
+  const aiEval = header.form_id === initialData?.form_id ? initialAiEval : undefined;
+  const aiFormChanged = !!initialAiEval && header.form_id !== initialData?.form_id;
+
+  const handleFormChange = (formId: string) => {
+    if (formId === header.form_id) return;
+    setHeader(previous => ({
+      ...previous,
+      form_id: formId,
+      evaluator_note: previous.evaluator_note === initialAiEval?.summary ? '' : previous.evaluator_note,
+    }));
+    setScores({});
+    setObservations({});
+    setCriticalErrors({});
+    setCriticalErrorObservations({});
+    setDissatisfactionAnswers({});
+    if (initialAiEval) toast.info('Ficha alterada. As respostas da IA para a ficha anterior foram limpas; avalie os critérios da nova ficha.');
+  };
+
+  const handleRestoreDraft = React.useCallback((draft: any) => {
+    const incompatibleAiForm = !!initialAiEval && !!draft.header?.form_id && draft.header.form_id !== header.form_id;
+    if (draft.header) setHeader(prev => ({
+      ...prev,
+      ...draft.header,
+      ...(initialData?.ticket_id ? { ticket_id: initialData.ticket_id } : {}),
+      ...(incompatibleAiForm ? { form_id: prev.form_id, evaluator_note: prev.evaluator_note } : {}),
+    }));
+    if (!incompatibleAiForm) {
+      if (draft.scores) setScores(draft.scores);
+      if (draft.observations) setObservations(draft.observations);
+      if (draft.criticalErrors) setCriticalErrors(draft.criticalErrors);
+      if (draft.criticalErrorObservations) setCriticalErrorObservations(draft.criticalErrorObservations);
+      if (draft.step) setStep(draft.step);
+    }
+    if (incompatibleAiForm) toast.warning('Rascunho local de outra ficha: a ficha e as respostas atuais foram preservadas.');
+    else toast.success('Rascunho da avaliação recuperado!');
+  }, [initialAiEval, initialData?.ticket_id, header.form_id, setHeader, setScores, setObservations, setCriticalErrors, setCriticalErrorObservations, setStep]);
+
+  const {
+    hasDraft,
+    draftData,
+    lastSaved,
+    restoreDraft,
+    discardDraft,
+    clearDraft,
+  } = useMonitoriaDraft({
+    isViewOnly,
+    userId: user?.id,
+    ticketId: header.ticket_id,
+    header,
+    scores,
+    observations,
+    criticalErrors,
+    criticalErrorObservations,
+    dissatisfactionAnswers,
+    step,
+    onRestore: handleRestoreDraft,
+  });
 
   useEffect(() => {
     if (contentRef.current) {
       contentRef.current.scrollTop = 0;
+      setScoreCompact(false);
     }
   }, [step]);
 
+  const evaluatedAgent = useMemo(() => agents.find(a => a.id === header.evaluated_id), [agents, header.evaluated_id]);
+  const evaluatedTeam = useMemo(() => teams.find(t => t.id === header.team_id), [teams, header.team_id]);
+  const specializedTeamLabel = useMemo(() => {
+    if ((initialData as any)?.specializedTeamLabel) return (initialData as any).specializedTeamLabel as string;
+    const teamName = (evaluatedTeam?.name || '').toLowerCase();
+    if (/cont[aá]bil/i.test(teamName)) return 'Contábil';
+    if (/fiscal/i.test(teamName)) return 'Fiscal';
+    if (/\btef\b/i.test(teamName)) return 'TEF';
+    return null;
+  }, [initialData, evaluatedTeam]);
+  const ticketSubject = (initialData as any)?.ticket_subject?.trim();
+  const headerSubtitle = ticketSubject || (evaluatedAgent?.name
+    ? `Resolvido por ${evaluatedAgent.name}${evaluatedTeam?.name ? ` da equipe ${evaluatedTeam.name}` : ''}`
+    : '');
+
+  // Busca o contexto do ticket uma vez, inclusive quando o diálogo já veio da IA.
+  const fetchedTicketContextRef = useRef<string | null>(null);
+  useEffect(() => {
+    const ticketId = header.ticket_id?.trim();
+    if (!ticketId || (dialogue.length > 0 && ticketFields.length > 0) || fetchedTicketContextRef.current === ticketId) return;
+
+    let cancelled = false;
+    fetchedTicketContextRef.current = ticketId;
+    if (dialogue.length === 0) setLoadingDialogue(true);
+    if (ticketFields.length === 0) { setLoadingTicketFields(true); setTicketFieldsError(false); }
+    fetchTicketDialogue(ticketId)
+      .then(res => {
+        if (cancelled) return;
+        if (dialogue.length === 0 && res?.comments && res.comments.length > 0) {
+          setDialogue(normalizeTicketDialogue(res.comments, evaluatedAgent?.name));
+        }
+        if (ticketFields.length === 0) {
+          setTicketFieldContext({ ticketId, fields: normalizeZendeskTicketFields(res.ticketFields), source: 'current' });
+        }
+      })
+      .catch(err => {
+        console.warn('[MonitoriaForm] Contexto Zendesk não carregado automaticamente:', err);
+        if (!cancelled && ticketFields.length === 0) setTicketFieldsError(true);
+      })
+      .finally(() => {
+        if (!cancelled) { setLoadingDialogue(false); setLoadingTicketFields(false); }
+      });
+
+    return () => { cancelled = true; };
+  }, [header.ticket_id, dialogue.length, ticketFields.length, evaluatedAgent?.name, ticketContextRetry]);
+
+  // Se o agente for selecionado ou alterado, revalida papéis no diálogo existente
+  useEffect(() => {
+    if (dialogue.length > 0 && evaluatedAgent?.name) {
+      setDialogue(prev => normalizeTicketDialogue(prev, evaluatedAgent.name));
+    }
+  }, [evaluatedAgent?.name]);
+
+  const scoreLevel = useMemo(() => getLevelForScore(score), [getLevelForScore, score]);
+  const isScoreTarget = useMemo(() => isAboveTarget(score), [isAboveTarget, score]);
+
+  const subtleScoreClass = useMemo(() => {
+    const textColor = scoreLevel.color;
+    if (textColor.includes('excelente')) return 'bg-level-excelente/10 text-level-excelente';
+    if (textColor.includes('aceitavel')) return 'bg-level-aceitavel/10 text-level-aceitavel';
+    if (textColor.includes('atencao')) return 'bg-level-atencao/10 text-level-atencao';
+    if (textColor.includes('ruim')) return 'bg-level-ruim/10 text-level-ruim';
+    if (textColor.includes('roxo')) return 'bg-level-roxo/10 text-level-roxo';
+    return 'bg-brand-subtle/10 text-brand-primary';
+  }, [scoreLevel.color]);
+  const [scoreBgClass, scoreTextClass] = subtleScoreClass.split(' ');
+
+  const filteredDialogue = useMemo(() => {
+    return dialogue.filter(msg => {
+      if (dialogueFilter !== 'all' && getDialogueCategory(msg) !== dialogueFilter) return false;
+      if (dialogueSearch.trim()) {
+        const normalize = (s: string) =>
+          s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+        const normQuery = normalize(dialogueSearch);
+        const normBody = normalize(msg.body || '');
+        const normAuthor = normalize(msg.author_name || '');
+        const combined = `${normBody} ${normAuthor}`;
+
+        if (combined.includes(normQuery)) return true;
+
+        const words = normQuery.split(/\s+/).filter(w => w.length > 1);
+        if (words.length > 0 && words.every(w => combined.includes(w))) return true;
+
+        return false;
+      }
+      return true;
+    });
+  }, [dialogue, dialogueFilter, dialogueSearch]);
+
+  const handleCiteInObservation = (commentText: string, authorName: string, questionId?: string) => {
+    const targetQId = questionId || selectedQuestionForDialogue;
+    const citation = `"${commentText.trim()}" (${authorName})`;
+    if (targetQId) {
+      setObservations(prev => {
+        const current = prev[targetQId] || '';
+        return {
+          ...prev,
+          [targetQId]: current ? `${current}\n${citation}` : citation
+        };
+      });
+      toast.success('Trecho citado inserido na observação do critério!');
+    } else {
+      navigator.clipboard.writeText(citation);
+      toast.success('Trecho copiado para a área de transferência!');
+    }
+  };
+
+  // Aviso (não bloqueio) de ticket já avaliado. Não há UNIQUE em
+  // monitorias.ticket_id nem checagem alguma hoje — confirmado no banco:
+  // já existem 2 monitorias reais com o mesmo ticket_id avaliando pessoas
+  // diferentes. A decisão de negócio foi permitir isso (pode ser
+  // reavaliação legítima), só sinalizando quando acontecer.
+  //
+  // Limitação conhecida: a policy de SELECT em monitorias restringe o
+  // papel 'qualidade' a ver apenas as PRÓPRIAS avaliações (evaluator_id =
+  // auth.uid()). Então esta checagem, para esse papel, só enxerga
+  // duplicidade criada pelo mesmo auditor — não pega o caso de dois
+  // auditores diferentes avaliarem o mesmo ticket. Para admin e
+  // gestor_qualidade, que veem tudo, a checagem é completa. Resolver o
+  // caso geral exigiria uma função SECURITY DEFINER dedicada; não fizemos
+  // isso aqui para manter a mudança pequena e sem tocar em RLS.
+  const lastWarnedTicketRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (isViewOnly) return;
+    const ticketId = header.ticket_id?.trim();
+    if (!ticketId) { lastWarnedTicketRef.current = null; return; }
+    if (lastWarnedTicketRef.current === ticketId) return;
+
+    const timer = setTimeout(async () => {
+      try {
+        let existentes: { evaluated_name?: string; score?: number | null; status?: string; form_id?: string; child_verdict?: 'valido' | 'invalido' | null }[] = [];
+        if (isMockMode) {
+          const { data } = await mockDb.get('monitorias');
+          existentes = (data || []).filter((m: any) =>
+            m.ticket_id === ticketId && m.active !== false && m.id !== initialData?.id
+          );
+        } else if (supabase) {
+          let query = supabase
+            .from('monitorias')
+            .select('evaluated_name, score, status, form_id, child_verdict')
+            .eq('ticket_id', ticketId)
+            .eq('active', true);
+          if (initialData?.id) query = query.neq('id', initialData.id);
+          const { data, error } = await query;
+          if (error) throw error;
+          existentes = data || [];
+        }
+
+        if (existentes.length > 0) {
+          lastWarnedTicketRef.current = ticketId;
+          const resumo = existentes
+            .slice(0, 3)
+            .map(m => `${m.evaluated_name || '—'} (${isChildFormId(m.form_id) ? (m.child_verdict === 'valido' ? 'Válido' : m.child_verdict === 'invalido' ? 'Inválido' : 'Chamado filho') : `${m.score ?? '—'}%`})`)
+            .join(', ');
+          const resto = existentes.length > 3 ? ` e mais ${existentes.length - 3}` : '';
+          toast.warning(
+            `Este ticket já possui ${existentes.length === 1 ? 'uma monitoria avaliada' : `${existentes.length} monitorias avaliadas`}: ${resumo}${resto}. Você pode continuar mesmo assim.`,
+            { duration: 8000 }
+          );
+        }
+      } catch (e) {
+        // Falha na checagem não deve bloquear o preenchimento — é só um
+        // aviso a mais, não uma validação obrigatória.
+        console.error('[MonitoriaForm] Falha ao checar monitorias existentes para o ticket:', e);
+      }
+    }, 600);
+
+    return () => clearTimeout(timer);
+  }, [header.ticket_id, isViewOnly, initialData?.id]);
+
+  // Ao digitar o número do ticket manualmente (fora da Central de Filas),
+  // busca no Zendesk quem é o atendente responsável e já preenche o campo
+  // de Agente — mesmo que ele ainda não tenha conta no QualiTrack, caso em
+  // que mostramos um aviso com asterisco em vez do id (que não existe).
+  const lastLookedUpTicketRef = useRef<string | null>(null);
+  // Sempre reflete o ticket_id do render mais recente — usado para
+  // descartar uma resposta de busca que chegou tarde, depois que o auditor
+  // já trocou o número do ticket (senão o agente de um ticket antigo podia
+  // ser aplicado por cima do ticket novo, avaliando a pessoa errada).
+  const latestTicketIdRef = useRef<string | undefined>(header.ticket_id);
+  latestTicketIdRef.current = header.ticket_id;
+
+  // Nome/e-mail de um lookup anterior não podem sobreviver à troca do
+  // ticket — senão o popup "Agente não cadastrado?" reabre pré-cheio com os
+  // dados de outro ticket (mesmo que o ticket novo já tenha agente
+  // cadastrado) e o auditor pode associar a pessoa errada sem perceber.
+  // Efeito separado, disparado só por ticket_id em si — não pelo resto do
+  // header — pra não limpar o que o auditor está digitando à toa.
+  const agentModalTicketRef = useRef(header.ticket_id);
+  useEffect(() => {
+    if (agentModalTicketRef.current !== header.ticket_id) {
+      agentModalTicketRef.current = header.ticket_id;
+      setNewAgentName('');
+      setNewAgentEmail('');
+    }
+  }, [header.ticket_id]);
+
+  useEffect(() => {
+    if (isViewOnly || isReevaluating) return;
+    const ticketId = header.ticket_id?.trim();
+    if (!ticketId || !/^\d+$/.test(ticketId)) {
+      lastLookedUpTicketRef.current = null;
+      setUnregisteredAgentPreview(null);
+      return;
+    }
+    if (lastLookedUpTicketRef.current === ticketId) return;
+    // Já tem um agente selecionado manualmente — não sobrescreve.
+    if (header.evaluated_id) return;
+
+    const timer = setTimeout(async () => {
+      lastLookedUpTicketRef.current = ticketId;
+      const found = await lookupTicketAgent(ticketId);
+      // O ticket_id pode ter mudado enquanto a busca estava em voo — se
+      // mudou, essa resposta já não corresponde ao que está na tela.
+      if (ticketId !== latestTicketIdRef.current?.trim()) return;
+      if (!found || header.evaluated_id) return;
+
+      if (found.existing_id) {
+        if (found.ticket_group_team_id) {
+          setLookedUpTicketGroup({
+            ticketId, agentId: found.existing_id, teamId: found.ticket_group_team_id,
+            groupName: found.team_name,
+          });
+        }
+        // Agente já cadastrado — preenche a ficha automaticamente, igual já
+        // acontece vindo da Central de Filas.
+        setHeader(prev => (prev.evaluated_id || prev.ticket_id?.trim() !== ticketId) ? prev : ({
+          ...prev,
+          evaluated_id: found.existing_id!,
+          team_id: found.existing_team_id || prev.team_id || '',
+        }));
+        setUnregisteredAgentPreview(null);
+      } else {
+        setUnregisteredAgentPreview(found);
+        // O grupo Zendesk não define a equipe gestora de um novo agente.
+      }
+    }, 700);
+
+    return () => clearTimeout(timer);
+  }, [header.ticket_id, header.evaluated_id, header.team_id, isViewOnly, isReevaluating, teams]);
+
+  // Envio ao Zendesk: só faz sentido para monitorias com veredito final e
+  // com ticket_id preenchido (a Edge Function exige um ticket numérico).
+  //
+  // O modal pode abrir de duas formas: manualmente (botão "Enviar ao
+  // Zendesk" na visualização de uma monitoria já concluída) ou
+  // automaticamente logo após "Finalizar Monitoria". `fromConclusion`
+  // distingue as duas para o HelpdeskSendModal ajustar os textos, e também
+  // decide o que fazer quando o modal fecha: no fluxo manual só fecha o
+  // modal; no fluxo de conclusão, fechar o modal precisa também avisar o
+  // componente pai (via onSaved) para fechar o formulário — é por isso que
+  // o modal é mantido montado dentro do MonitoriaForm até esse momento, em
+  // vez de o form fechar (e desmontar o modal) assim que o save termina.
+  const [helpdeskModal, setHelpdeskModal] = useState<{ monitoriaId: string; fromConclusion: boolean } | null>(null);
+  const [childPublishModal, setChildPublishModal] = useState<{ monitoriaId: string; fromConclusion: boolean } | null>(null);
+  const [generatingAuditorRecord, setGeneratingAuditorRecord] = useState(false);
+
+  const canSendToHelpdesk = isViewOnly
+    && !isChildEvaluation
+    && !!initialData?.status
+    && canPublishSavedMonitoria(initialData)
+    && !!header.ticket_id?.trim();
+  const canPublishChild = isViewOnly && isChildEvaluation
+    && initialData?.status === 'concluida'
+    && !legacyChildNoteVerdict(initialData)
+    && ['admin', 'gestor_qualidade', 'qualidade'].includes(user?.role || '');
+  const savedLegacyChildVerdict = isViewOnly && initialData
+    ? legacyChildNoteVerdict(initialData)
+    : null;
+  // Sugestão de desfecho do preview baseada na regra de domínio estrita (WQ-22):
+  // score >= 75% -> Válido (positiva), score < 75% -> Invalidado (negativa)
+  const targetScore = isViewOnly ? (initialData?.score ?? 0) : score;
+  const suggestedOutcome: EvaluationOutcome = getEvaluationOutcome(targetScore);
+
+  const handleHelpdeskModalClose = () => {
+    const wasFromConclusion = helpdeskModal?.fromConclusion;
+    const savedMonitoriaId = helpdeskModal?.monitoriaId;
+    setHelpdeskModal(null);
+    if (wasFromConclusion && savedMonitoriaId) onSaved(savedMonitoriaId);
+  };
+
   const { isPending, validateStep, handleSave } = useMonitoriaSave({
+    ticketGroupTeamId,
     user,
     initialData,
     isReevaluating,
@@ -105,6 +569,7 @@ export default function MonitoriaForm({
     dissatisfactionAnswers,
     score,
     selectedForm,
+    ticketFields,
     qualityConfig,
     allUsers,
     forms,
@@ -112,50 +577,261 @@ export default function MonitoriaForm({
     dissatisfactionFields,
     clientFieldsToShow,
     qualityFieldsToShow,
-    onSaved,
+    onSaved: (savedMonitoriaId: string, savedStatus: MonitoriaStatus) => {
+      clearDraft();
+      if (isChildFormId(header.form_id) && savedStatus === 'concluida') {
+        setChildPublishModal({ monitoriaId: savedMonitoriaId, fromConclusion: true });
+        return;
+      }
+      // A macro de atendimento pode ser revista após salvar; filhos usam macro própria.
+      const ticketIdTrimmed = header.ticket_id?.trim() || '';
+      const publicationContext={status:savedStatus,score,satisfaction_result:header.satisfaction_result};
+      const awaitsFinal=awaitsFinalPositiveDecision(publicationContext);
+      const shouldAutoSend = /^\d+$/.test(ticketIdTrimmed)
+        && !isChildFormId(header.form_id)
+        && canPublishSavedMonitoria(publicationContext)
+        && !isAdminEdit
+        && !isReevaluating;
+
+      if (shouldAutoSend) {
+        setHelpdeskModal({ monitoriaId: savedMonitoriaId, fromConclusion: true });
+      } else {
+        if (awaitsFinal && !isChildFormId(header.form_id)) {
+          toast.info('Monitoria salva. A invalidação no Zendesk aguarda a conclusão das revisões e contestações.');
+        }
+        onSaved(savedMonitoriaId);
+      }
+    },
   });
 
-  return (
-    <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 md:p-8 overflow-y-auto">
+  const handleGenerateAuditorRecord = async () => {
+    if (!selectedForm || !header.ticket_id?.trim()) {
+      toast.error('Informe o ticket e a ficha antes de gerar o registro.');
+      return;
+    }
+
+    const hasCurrentObservation = Object.values(observations).some(value => value.trim().length > 0)
+      || Object.entries(criticalErrors).some(([id, selected]) =>
+        selected && !!criticalErrorObservations[id]?.trim(),
+      );
+
+    if (!hasCurrentObservation) {
+      toast.error('Adicione ao menos uma observação na etapa de Avaliação antes de gerar o registro.');
+      return;
+    }
+
+    setGeneratingAuditorRecord(true);
+    try {
+      const record = await generateAuditorRecordWithAI({
+        ticketId: header.ticket_id.trim(),
+        form: selectedForm,
+        score,
+        answers: scores,
+        observations,
+        criticalErrors,
+        criticalErrorObservations,
+      });
+      setHeader(prev => ({ ...prev, evaluator_note: record }));
+      toast.success('Novo Registro do Auditor gerado com as observações atuais.');
+    } catch (error: any) {
+      console.error('[MonitoriaForm] Falha ao gerar Registro do Auditor:', error);
+      toast.error(error?.message || 'Não foi possível gerar o Registro do Auditor.');
+    } finally {
+      setGeneratingAuditorRecord(false);
+    }
+  };
+
+  // Cadastro rápido de agente do helpdesk que ainda não tem conta no
+  // QualiTrack — cria uma conta provisória por e-mail (mesmo mecanismo da
+  // triagem automática) e já seleciona o agente recém-criado na ficha.
+  const handleCreateAgent = async () => {
+    if (!newAgentName.trim() || !newAgentEmail.trim()) {
+      toast.error('Preencha nome e e-mail do agente.');
+      return;
+    }
+    setCreatingAgent(true);
+    try {
+      const agent = await resolveManualAgent(newAgentEmail.trim(), newAgentName.trim(), header.team_id || undefined);
+      toast.success(`Agente "${newAgentName.trim()}" cadastrado — já pode ser selecionado.`);
+      setHeader(prev => ({
+        ...prev,
+        evaluated_id: agent.id,
+        team_id: agent.team_id || prev.team_id,
+      }));
+      setNewAgentModalOpen(false);
+      setNewAgentName('');
+      setNewAgentEmail('');
+      staticData.refreshAll();
+    } catch (e: any) {
+      console.error('Erro ao cadastrar agente:', e);
+      toast.error(e?.message || 'Falha ao cadastrar o agente.');
+    } finally {
+      setCreatingAgent(false);
+    }
+  };
+
+  return createPortal(
+    <div className="fixed inset-0 z-[9999] bg-black/25 dark:bg-black/40 backdrop-blur-md flex items-end sm:items-center justify-center p-0 sm:p-4 md:p-6 overflow-hidden animate-fade-in">
       <m.div
         initial={shouldReduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.98, y: 10 }}
         animate={shouldReduceMotion ? { opacity: 1 } : { opacity: 1, scale: 1, y: 0 }}
-        className="bg-surface-bg rounded-2xl shadow-2xl w-full max-w-4xl mx-auto flex flex-col overflow-hidden"
-        style={{ height: '90vh' }}
+        className="bg-surface-bg rounded-t-3xl sm:rounded-2xl shadow-2xl w-full max-w-5xl mx-auto flex flex-col h-[100dvh] sm:h-[94vh] max-h-[100dvh] sm:max-h-[94vh] overflow-hidden border-t sm:border border-surface-border relative"
       >
         {/* Top Header */}
-        <div className="p-6 border-b border-surface-border flex items-center justify-between bg-surface-card">
-          <div className="flex items-center gap-4">
-            <div className="w-10 h-10 rounded-xl bg-brand-subtle flex items-center justify-center text-brand-primary">
-              <CheckCircle2 className="w-6 h-6" />
+        <div className="px-3.5 py-2.5 sm:px-5 sm:py-3 border-b border-surface-border flex items-center justify-between bg-surface-card flex-shrink-0 gap-2 sm:gap-4">
+          <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
+            <div className="w-8 h-8 sm:w-9 sm:h-9 rounded-xl bg-brand-subtle flex items-center justify-center text-brand-primary flex-shrink-0">
+              <CheckCircle2 className="w-4 h-4 sm:w-5 sm:h-5" />
             </div>
-            <div>
-              <h2 className="text-xl font-black text-brand-primary tracking-tight uppercase">
-                {isViewOnly ? 'Visualizar' : isAdminEdit ? 'Editar (Admin)' : isReevaluating ? 'Reavaliar' : 'Nova'} Monitoria
-              </h2>
-              {initialData?.display_id && <Badge variant="info" className="mt-1">Mon: {initialData.display_id}</Badge>}
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
+                <h2 className="text-sm sm:text-lg font-black text-brand-primary tracking-tight uppercase truncate">
+                  {isViewOnly ? 'Visualizar' : isAdminEdit ? 'Editar Avaliação' : isReevaluating ? 'Reavaliar' : 'Nova'} Monitoria
+                </h2>
+                {isViewOnly && (
+                  <Badge variant="warning" size="xs" className="flex items-center gap-1 flex-shrink-0 text-[9px] px-1.5 py-0.5">
+                    <Lock className="w-2.5 h-2.5" /> Somente leitura
+                  </Badge>
+                )}
+              </div>
+              {isViewOnly && (
+                <p className="hidden sm:block text-[11px] text-brand-muted mt-0.5 max-w-md leading-relaxed truncate">
+                  {user?.role === 'admin' || user?.role === 'gestor_qualidade'
+                    ? 'Modo somente leitura. Para retificar critérios ou notas, use o botão "Habilitar Edição".'
+                    : 'Monitorias salvas são somente leitura.'}
+                </p>
+              )}
+              {initialData && <MonitoriaIdBadge displayId={initialData.display_id} id={initialData.id} className="mt-0.5" />}
+              {headerSubtitle && (
+                <p className="text-[11px] sm:text-xs font-bold text-brand-primary mt-0.5 max-w-md truncate" title={headerSubtitle}>
+                  {headerSubtitle}
+                </p>
+              )}
             </div>
           </div>
-          <button onClick={onCancel} className="p-2 hover:bg-surface-subtle rounded-xl transition-all text-brand-muted"><X className="w-6 h-6" /></button>
+
+          <div className="flex items-center gap-2 sm:gap-3 flex-shrink-0">
+            {/* Docked Score Badge in Top Header (appears on scroll in step 2) */}
+            <AnimatePresence>
+              {scoreCompact && step === 2 && selectedForm && !isChildFormId(header.form_id) && (
+                <m.div
+                  key="header-docked-score"
+                  initial={{ opacity: 0, scale: 0.72, y: -4 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.72, y: -4 }}
+                  transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
+                  className="flex items-center gap-1.5 sm:gap-2.5 px-2 sm:px-3 py-1 sm:py-1.5 rounded-xl border border-surface-border bg-surface-subtle shadow-premium-sm"
+                >
+                  <div className={`w-5 h-5 sm:w-6 sm:h-6 rounded-lg flex items-center justify-center ${scoreBgClass}`}>
+                    <Target className={`w-3 h-3 sm:w-3.5 sm:h-3.5 ${scoreTextClass}`} />
+                  </div>
+                  <div className="flex items-baseline gap-1 sm:gap-1.5">
+                    <span className="text-[10px] font-black uppercase tracking-wider text-brand-muted hidden md:inline">Score:</span>
+                    <span className={`text-xs sm:text-base font-black tabular-nums ${scoreTextClass}`}>
+                      {score.toFixed(2)}%
+                    </span>
+                    <span className="hidden sm:inline text-[9px] sm:text-[10px] font-black uppercase text-brand-muted tracking-wider">
+                      - {scoreLevel.label}
+                    </span>
+                  </div>
+                  <Badge
+                    variant={isScoreTarget ? 'success' : 'error'}
+                    size="xs"
+                    className="font-black uppercase tracking-wider text-[8px] sm:text-[9px] px-1.5 sm:px-2 py-0.5"
+                  >
+                    {isScoreTarget ? 'Meta' : 'Abaixo'}
+                  </Badge>
+                </m.div>
+              )}
+            </AnimatePresence>
+
+            {lastSaved && !isViewOnly && (
+              <span className="hidden sm:inline-flex items-center gap-1 text-[10px] text-brand-muted font-medium mr-1" title={`Salvo às ${lastSaved.toLocaleTimeString('pt-BR')}`}>
+                <Check className="w-3 h-3 text-brand-accent" /> Salvo
+              </span>
+            )}
+
+            {isViewOnly && (user?.role === 'admin' || user?.role === 'gestor_qualidade') && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setIsEditModeOverride(true)}
+                icon={<Pencil className="w-3.5 h-3.5" />}
+                className="h-8 text-[10px] font-black uppercase tracking-wider shrink-0"
+                title="Habilitar edição desta avaliação como Administrador"
+              >
+                Habilitar Edição
+              </Button>
+            )}
+
+            <button onClick={onCancel} className="p-1.5 hover:bg-surface-subtle rounded-xl transition-all text-brand-muted cursor-pointer" title="Fechar">
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
 
         {/* Form Content */}
-        <div ref={contentRef} className="flex-1 overflow-y-auto p-8 space-y-10 no-scrollbar">
+        <div ref={contentRef} className="flex-1 overflow-y-auto px-4 py-4 md:px-8 md:py-6 space-y-6 no-scrollbar min-h-0">
+          {/* Banner de Rascunho Encontrado */}
+          {hasDraft && draftData && (
+            <div className="p-3.5 rounded-2xl bg-brand-primary/10 border border-brand-primary/30 flex items-center justify-between gap-3 text-xs shadow-xs animate-fade-in">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <RotateCcw className="w-4 h-4 text-brand-primary shrink-0" />
+                <span className="truncate">
+                  Existe um <strong>rascunho salvo</strong> desta avaliação ({new Date(draftData.savedAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}).
+                </span>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <Button size="sm" variant="primary" onClick={restoreDraft}>
+                  Restaurar
+                </Button>
+                <Button size="sm" variant="ghost" onClick={discardDraft} className="text-brand-muted hover:text-danger">
+                  Descartar
+                </Button>
+              </div>
+            </div>
+          )}
+
           {/* Stepper Progress */}
-          <div className="flex items-center justify-center gap-6 md:gap-10">
+          <div className="flex items-center justify-center gap-2 sm:gap-4 md:gap-8 pb-3 border-b border-surface-border/50">
             {[
               { n: 1, label: 'Identificação' },
-              { n: 2, label: 'Pesquisa' },
-              { n: 3, label: 'Avaliação' },
+              { n: 2, label: 'Avaliação' },
+              { n: 3, label: 'Pesquisa' },
               { n: 4, label: 'Registro/Log' }
-            ].map(s => (
-              <div key={s.n} className="flex flex-col items-center gap-1.5 group">
-                <div className={`w-8 h-8 rounded-xl flex items-center justify-center text-xs font-black transition-all ${step >= s.n ? 'bg-brand-primary text-brand-on-primary shadow-sm' : 'bg-surface-subtle text-brand-muted'}`}>
-                  {s.n}
-                </div>
-                <span className={`text-[9px] font-black uppercase tracking-[0.15em] ${step >= s.n ? 'text-brand-primary' : 'text-brand-muted hidden md:block'}`}>{s.label}</span>
-              </div>
-            ))}
+            ].map(s => {
+              const isCurrent = step === s.n;
+              const isPast = step > s.n;
+              const canClick = isViewOnly || s.n < step || (s.n === step + 1 && validateStep(step, true));
+              return (
+                <button
+                  key={s.n}
+                  type="button"
+                  onClick={() => {
+                    if (s.n < step || isViewOnly) {
+                      setStep(s.n);
+                    } else if (s.n === step + 1 && validateStep(step)) {
+                      setStep(s.n);
+                    }
+                  }}
+                  className={`flex flex-col items-center gap-1 group transition-all ${
+                    canClick ? 'cursor-pointer hover:opacity-90' : 'cursor-default'
+                  }`}
+                  title={canClick ? `Ir para etapa ${s.n} (${s.label})` : s.label}
+                >
+                  <div className={`w-7 h-7 sm:w-8 sm:h-8 rounded-xl flex items-center justify-center text-xs font-black font-mono transition-all ${
+                    isCurrent
+                      ? 'bg-brand-accent text-white shadow-xs ring-2 ring-brand-accent/30'
+                      : isPast
+                      ? 'bg-brand-accent/20 text-brand-accent border border-brand-accent/30'
+                      : 'bg-surface-subtle text-brand-muted'
+                  }`}>
+                    {s.n}
+                  </div>
+                  <span className={`text-[8.5px] sm:text-[9px] font-black uppercase tracking-[0.1em] sm:tracking-[0.15em] ${step >= s.n ? 'text-brand-primary' : 'text-brand-muted hidden md:block'}`}>{s.label}</span>
+                </button>
+              );
+            })}
           </div>
 
           {step === 1 && (
@@ -165,12 +841,34 @@ export default function MonitoriaForm({
                 <p className="text-xs font-bold text-brand-muted uppercase tracking-widest mt-1">Preencha as informações básicas do ticket</p>
               </div>
 
+              {specializedTeamLabel && (
+                <div className="p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-between gap-3 text-amber-700 dark:text-amber-300 shadow-xs">
+                  <div className="flex items-center gap-2.5">
+                    <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0" />
+                    <span className="text-xs font-bold">
+                      Observação: Atendimento da equipe <strong>{specializedTeamLabel}</strong> — avaliado utilizando a ficha ativa disponível ({selectedForm?.title || 'Ficha Padrão'}).
+                    </span>
+                  </div>
+                  <Badge variant="warning" size="xs" className="font-black text-[10px] uppercase tracking-wider bg-amber-500/20 text-amber-800 dark:text-amber-200 border-amber-500/40 shrink-0">
+                    {specializedTeamLabel}
+                  </Badge>
+                </div>
+              )}
+
               <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-6">
                 <div className="space-y-2">
-                  <label className="text-[10px] font-black text-brand-muted uppercase tracking-widest ml-1">Ficha de Avaliação *</label>
+                  <div className="flex items-center justify-between ml-1">
+                    <label className="text-[10px] font-black text-brand-muted uppercase tracking-widest">Ficha de Avaliação *</label>
+                    {initialAiEval && (
+                      <span className="flex items-center gap-1 text-[10px] font-black text-brand-highlight">
+                        {aiFormChanged ? <Pencil className="w-3 h-3" /> : <Bot className="w-3 h-3" />}
+                        <span>{aiFormChanged ? 'Ficha corrigida pelo monitor' : 'Ficha usada no rascunho da IA'}</span>
+                      </span>
+                    )}
+                  </div>
                   <CustomSelect
                     value={header.form_id}
-                    onChange={val => setHeader({...header, form_id: val})}
+                    onChange={handleFormChange}
                     options={[{ value: '', label: 'Selecione a ficha...' }, ...forms.map(f => ({ value: f.id, label: f.title }))]}
                     className="w-full"
                     disabled={isViewOnly || isReevaluating}
@@ -178,31 +876,76 @@ export default function MonitoriaForm({
                 </div>
 
                 <div className="space-y-2">
-                  <label className="text-[10px] font-black text-brand-muted uppercase tracking-widest ml-1">Agente de Atendimento *</label>
+                  <div className="flex items-center justify-between ml-1">
+                    <label className="text-[10px] font-black text-brand-muted uppercase tracking-widest">Agente de Atendimento *</label>
+                    {!isViewOnly && !isReevaluating && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (unregisteredAgentPreview) {
+                            setNewAgentName(unregisteredAgentPreview.name || '');
+                            setNewAgentEmail(unregisteredAgentPreview.email || '');
+                          }
+                          setNewAgentModalOpen(true);
+                        }}
+                        className="flex items-center gap-1 text-[10px] font-black text-brand-highlight hover:underline"
+                      >
+                        <UserPlus className="w-3 h-3" />
+                        <span>Agente não cadastrado?</span>
+                      </button>
+                    )}
+                  </div>
                   <CustomSelect
                     value={header.evaluated_id}
                     onChange={val => {
-                      if (header.team_id && val && val !== header.evaluated_id) {
-                        const newAgent = agents.find(a => a.id === val);
-                        if (newAgent && !newAgent.team_ids?.includes(header.team_id)) {
-                          toast.info('Remova a equipe antes de trocar o agente.');
-                          return;
+                      if (!val) {
+                        setHeader(prev => ({...prev, evaluated_id: '', team_id: ''}));
+                        return;
+                      }
+                      const selectedAgent = agents.find(a => a.id === val);
+                      let autoTeamId = header.team_id;
+                      if (selectedAgent) {
+                        const agentTeams = selectedAgent.team_ids?.length
+                          ? selectedAgent.team_ids
+                          : (selectedAgent.primary_team_id ? [selectedAgent.primary_team_id] : []);
+
+                        if (isTicketGroupPair(val, header.team_id)) {
+                          autoTeamId = header.team_id;
+                        } else if (agentTeams.length === 1) {
+                          autoTeamId = agentTeams[0];
+                        } else if (selectedAgent.primary_team_id && agentTeams.includes(selectedAgent.primary_team_id)) {
+                          autoTeamId = selectedAgent.primary_team_id;
+                        } else if (!header.team_id && agentTeams.length > 0) {
+                          autoTeamId = agentTeams[0];
+                        } else if (header.team_id && agentTeams.length > 0 && !agentTeams.includes(header.team_id)) {
+                          autoTeamId = agentTeams[0];
                         }
                       }
-                      setHeader(prev => ({...prev, evaluated_id: val, ...(val === '' ? { team_id: '' } : {})}));
+                      setHeader(prev => ({...prev, evaluated_id: val, team_id: autoTeamId}));
                     }}
                     options={[
                       { value: '', label: 'Selecione o agente...' },
                       ...agents
                         .filter(a => {
-                          if (!header.team_id) return true;
-                          return a.team_ids && a.team_ids.includes(header.team_id);
+                          if (!header.team_id || isTicketGroupPair(a.id, header.team_id)) return true;
+                          const agentTeams = a.team_ids?.length
+                            ? a.team_ids
+                            : (a.primary_team_id ? [a.primary_team_id] : []);
+                          if (!agentTeams || agentTeams.length === 0) return true;
+                          return agentTeams.includes(header.team_id);
                         })
                         .map(a => ({ value: a.id, label: a.name }))
                     ]}
                     className="w-full"
                     disabled={isViewOnly || isReevaluating}
                   />
+                  {unregisteredAgentPreview && !header.evaluated_id && (
+                    <p className="text-[10px] font-bold text-functional-warning ml-1">
+                      * {unregisteredAgentPreview.name} ({unregisteredAgentPreview.email}) — atendente do
+                      Zendesk deste ticket, ainda não cadastrado no QualidadeWP. Clique em
+                      "Agente não cadastrado?" acima para cadastrar.
+                    </p>
+                  )}
                 </div>
 
                 <div className="space-y-2">
@@ -210,39 +953,72 @@ export default function MonitoriaForm({
                   <CustomSelect
                     value={header.team_id}
                     onChange={val => {
-                      if (header.evaluated_id && val && val !== header.team_id) {
+                      if (!val) {
+                        setHeader(prev => ({...prev, team_id: ''}));
+                        return;
+                      }
+                      if (header.evaluated_id) {
                         const currentAgent = agents.find(a => a.id === header.evaluated_id);
-                        if (currentAgent && !currentAgent.team_ids?.includes(val)) {
-                          toast.info('Remova o agente antes de trocar a equipe.');
+                        const agentTeams = currentAgent?.team_ids?.length
+                          ? currentAgent.team_ids
+                          : (currentAgent?.primary_team_id ? [currentAgent.primary_team_id] : []);
+                        if (agentTeams.length > 0 && !agentTeams.includes(val)
+                          && !isTicketGroupPair(header.evaluated_id, val)) {
+                          toast.info('Remova o agente antes de trocar para uma equipe diferente.');
                           return;
                         }
                       }
-                      setHeader(prev => ({...prev, team_id: val, ...(val === '' ? { evaluated_id: '' } : {})}));
+                      setHeader(prev => ({...prev, team_id: val}));
                     }}
                     options={[
                       { value: '', label: 'Selecione a equipe...' },
                       ...teams
                         .filter(t => {
-                          if (!header.evaluated_id) return true;
+                          if (!header.evaluated_id || isTicketGroupPair(header.evaluated_id, t.id)) return true;
                           const agent = agents.find(a => a.id === header.evaluated_id);
-                          return agent?.team_ids?.includes(t.id);
+                          const agentTeams = agent?.team_ids?.length
+                            ? agent.team_ids
+                            : (agent?.primary_team_id ? [agent.primary_team_id] : []);
+                          // Se o agente ainda não tiver equipes vinculadas no cadastro, exibe todas as equipes disponíveis
+                          if (!agentTeams || agentTeams.length === 0) return true;
+                          return agentTeams.includes(t.id);
                         })
                         .map(t => ({ value: t.id, label: t.name }))
                     ]}
                     className="w-full"
                     disabled={isViewOnly || isReevaluating}
                   />
+                  {ticketGroupTeamId && (
+                    <p className="ml-1 text-[10px] font-medium text-brand-muted">
+                      Grupo do ticket no Zendesk: {(initialData as Monitoria & { group_name?: string } | undefined)?.group_name || activeLookedUpGroup?.groupName || teams.find(team => team.id === ticketGroupTeamId)?.name || 'Grupo não identificado'}.
+                      {' '}A monitoria pertence à equipe principal do agente.
+                    </p>
+                  )}
                 </div>
 
                 <div className="space-y-2">
-                  <label className="text-[10px] font-black text-brand-muted uppercase tracking-widest ml-1">Número do Ticket *</label>
+                  <div className="flex items-center justify-between">
+                    <label className="text-[10px] font-black text-brand-muted uppercase tracking-widest ml-1">Número do Ticket *</label>
+                    {header.ticket_id?.trim() && (
+                      <a
+                        href={`https://webposto.zendesk.com/agent/tickets/${header.ticket_id.trim()}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-[10px] font-black text-brand-highlight hover:underline uppercase tracking-wider"
+                        title={`Abrir ticket #${header.ticket_id} no Zendesk`}
+                      >
+                        <span>Abrir no Zendesk</span>
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                    )}
+                  </div>
                   <div className="relative">
                     <Hash className="w-4 h-4 absolute left-4 top-1/2 -translate-y-1/2 text-brand-muted/50" />
                     <input
                       type="text"
                       value={header.ticket_id}
                       onChange={e => setHeader({...header, ticket_id: e.target.value})}
-                      disabled={isViewOnly || isReevaluating}
+                      disabled={isViewOnly || isReevaluating || !!initialData?.ticket_id}
                       className="w-full bg-surface-subtle border border-surface-border rounded-xl pl-11 pr-4 h-10 text-xs font-bold text-brand-primary placeholder:text-brand-muted/40 focus:border-brand-accent focus:ring-4 focus:ring-brand-accent/5 transition-all outline-none"
                       placeholder="Digite o número do ticket"
                     />
@@ -281,10 +1057,410 @@ export default function MonitoriaForm({
                   </div>
                 </div>
               </div>
+
+              {/* Campos do Formulário no Zendesk (exclusivamente campos do formulário ativo, sem campos ocultos) */}
+              {ticketFields.length > 0 && (
+                <div className="mt-8 pt-6 border-t border-surface-border/60 animate-fade-in">
+                  <div className="flex items-center gap-2 mb-4">
+                    <FileText className="w-4 h-4 text-brand-highlight" />
+                    <h4 className="text-xs font-black uppercase text-brand-primary tracking-wider">
+                      Campos do Formulário no Zendesk ({ticketFields.length})
+                    </h4>
+                    <span className="text-[10px] text-brand-muted font-bold hidden sm:inline">
+                      · {ticketFieldSource === 'saved' ? 'Dados registrados na avaliação' : ticketFieldSource === 'current' ? 'Dados atuais do chamado; podem ter mudado desde a avaliação' : 'Dados do chamado para validação'}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+                    {ticketFields.map((field, idx) => (
+                      <div key={idx} className="p-3 bg-surface-card border border-surface-border rounded-xl shadow-xs space-y-1">
+                        <p className="text-[9px] font-black uppercase tracking-wider text-brand-muted line-clamp-1" title={field.title}>
+                          {field.title}
+                        </p>
+                        <p className="text-xs font-bold text-brand-primary line-clamp-2" title={field.value}>
+                          {field.value}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </section>
           )}
 
-          {step === 2 && (
+          {step === 2 && selectedForm && (
+            <section className="space-y-8 animate-fade-in max-w-4xl mx-auto">
+              {isChildFormId(header.form_id) && (
+                <div className="rounded-2xl border border-surface-border bg-surface-card p-5" role="status">
+                  <p className="text-sm font-bold text-brand-primary">
+                    {savedLegacyChildVerdict
+                      ? `Parecer histórico importado: ${savedLegacyChildVerdict === 'valido' ? 'Válido' : 'Inválido'}`
+                      : `Veredito do chamado filho: ${childVerdict(scores, selectedForm) === 'valido' ? 'Válido' : childVerdict(scores, selectedForm) === 'invalido' ? 'Inválido' : 'Preencha todos os critérios'}`}
+                  </p>
+                  <p className="mt-1 text-xs text-brand-muted">
+                    {savedLegacyChildVerdict
+                      ? 'Este registro conserva o parecer original importado do Zendesk. Os critérios antigos não são recalculados com a ficha atual.'
+                      : 'Todos os critérios devem estar atendidos para validar a abertura.'}
+                  </p>
+                </div>
+              )}
+              {/* Score Banner Principal - Animação de encolher ao rolar para baixo e transferir para o topo fixo */}
+              <AnimatePresence>
+                {!scoreCompact && !isChildFormId(header.form_id) && (
+                  <m.div
+                    key="step2-main-score-banner"
+                    initial={{ opacity: 0, height: 0, scale: 0.95 }}
+                    animate={{ opacity: 1, height: 'auto', scale: 1 }}
+                    exit={{ opacity: 0, height: 0, scale: 0.92 }}
+                    transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
+                    className="overflow-hidden mb-6"
+                  >
+                    <div className="rounded-2xl border border-surface-border flex flex-col sm:flex-row items-center justify-between bg-surface-card shadow-premium gap-4 p-6">
+                      <div className="flex items-center gap-4">
+                        <div className={`rounded-xl flex items-center justify-center w-12 h-12 ${scoreBgClass}`}>
+                          <Target className={`w-6 h-6 ${scoreTextClass}`} />
+                        </div>
+                        <div>
+                          <p className="text-[10px] font-black uppercase text-brand-muted tracking-[0.2em]">Score de Avaliação</p>
+                          <div className="flex items-baseline gap-2 mt-1">
+                            <span className={`text-3xl font-black tabular-nums ${scoreTextClass}`}>
+                              {score.toFixed(2)}%
+                            </span>
+                            <span className="text-[10px] font-black text-brand-muted uppercase tracking-wider">
+                              - {scoreLevel.label}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                      <div className="text-center sm:text-right">
+                        <Badge variant={isScoreTarget ? 'success' : 'error'} className="font-black uppercase tracking-wider px-3.5 py-1 text-[10px]">
+                          {isScoreTarget ? 'Meta Atingida' : 'Abaixo da Meta'}
+                        </Badge>
+                        <p className="text-[9px] font-bold text-brand-muted uppercase tracking-widest mt-1.5">Calculado em tempo real</p>
+                      </div>
+                    </div>
+                  </m.div>
+                )}
+              </AnimatePresence>
+
+              {/* Barra de Evidências por Escrito do Atendimento */}
+              <div className="rounded-2xl border border-brand-highlight/25 bg-surface-card p-4 sm:p-5 shadow-premium-sm flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                <div className="flex items-center gap-3.5">
+                  <div className="w-10 h-10 rounded-xl bg-brand-highlight/10 text-brand-highlight flex items-center justify-center flex-shrink-0">
+                    <MessageSquare className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <h4 className="text-xs sm:text-sm font-black uppercase text-brand-primary tracking-wider">
+                        Evidências por Escrito do Atendimento
+                      </h4>
+                      {dialogue.length > 0 ? (
+                        <Badge variant="info" size="sm" className="font-mono font-bold text-[10px]">
+                          {dialogue.length} {dialogue.length === 1 ? 'mensagem' : 'mensagens'}
+                        </Badge>
+                      ) : loadingDialogue ? (
+                        <span className="text-[10px] text-brand-muted animate-pulse font-bold">Carregando mensagens...</span>
+                      ) : null}
+                    </div>
+                    <p className="text-[11px] text-brand-muted mt-0.5">
+                      Consulte as transcrições e falas registradas no ticket #{header.ticket_id || '—'} para confrontar com fatos concretos.
+                    </p>
+                  </div>
+                </div>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => {
+                    setSelectedQuestionForDialogue(null);
+                    setDialogueSearch('');
+                    setShowDialogueDrawer(true);
+                  }}
+                  className="flex items-center gap-2 text-xs font-bold w-full sm:w-auto justify-center cursor-pointer flex-shrink-0"
+                >
+                  <FileText className="w-4 h-4 text-brand-highlight" />
+                  <span>{showDialogueDrawer ? 'Painel Aberto' : 'Ver Diálogo Completo'}</span>
+                </Button>
+              </div>
+
+              {selectedForm.sections.map((section, sIdx) => (
+                <div key={section.id} className="space-y-6">
+                  <div className="flex items-center gap-3">
+                    <div className="w-8 h-8 rounded-xl bg-brand-accent text-white flex items-center justify-center text-xs font-black font-mono shadow-xs">{sIdx + 1}</div>
+                    <div>
+                      <h3 className="text-lg font-black text-brand-primary tracking-tight uppercase">{section.title}</h3>
+                      {!isChildFormId(header.form_id) && <p className="text-[10px] font-bold text-brand-muted uppercase tracking-widest">Peso desta seção: {section.weight}%</p>}
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 gap-4">
+                    {section.questions.map(q => (
+                      <Card key={q.id} className={`bg-surface-card rounded-xl p-5 hover:border-brand-accent transition-all group ${!isChildFormId(header.form_id) && q.is_critical && scores[q.id] === 'NAO' ? 'border-error ring-4 ring-error/5' : ''}`}>
+                        <div className="flex flex-col md:flex-row justify-between gap-6">
+                          <div className="flex-1">
+                            <div className="flex items-start gap-3">
+                              {!isChildFormId(header.form_id) && q.is_critical && (
+                                <Badge variant="error" size="sm" className="mt-1 flex-shrink-0 animate-pulse">ERRO CRÍTICO</Badge>
+                              )}
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <p className="text-sm font-bold text-brand-primary leading-relaxed">{q.text}</p>
+                                {q.description && (
+                                  <div className="relative z-20 hover:z-50 group/info">
+                                    <Info className="w-4 h-4 text-brand-muted hover:text-brand-accent cursor-help transition-colors" />
+                                    <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-64 p-3 bg-surface-card border border-surface-border rounded-xl shadow-premium opacity-0 invisible group-hover/info:opacity-100 group-hover/info:visible transition-all z-50 pointer-events-none group-hover/info:pointer-events-auto text-center">
+                                      <p className="text-[11px] font-bold text-brand-muted leading-relaxed">{q.description}</p>
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                            {!isChildFormId(header.form_id) && <div className="flex items-center gap-4 mt-2">
+                              <span className="text-[9px] font-black text-brand-muted uppercase tracking-widest">
+                                Impacto: {((section.weight || 0) / (section.questions.filter(qu => scores[qu.id] !== 'NA').length || section.questions.length)).toFixed(1)}%
+                              </span>
+                            </div>}
+                          </div>
+                          {isChildFormId(header.form_id) ? (
+                            <div className="flex items-center gap-2 rounded-lg border border-surface-border bg-surface-subtle p-1 text-xs font-bold text-brand-primary" role="group" aria-label="O critério atende ao procedimento do manual?">
+                              <span className="px-2 text-[10px] uppercase tracking-wider text-brand-muted">Atende?</span>
+                              {(['SIM', 'NAO'] as const).map(answer => (
+                                <button key={answer} type="button" onClick={() => !isViewOnly && setScores(prev => ({ ...prev, [q.id]: answer }))}
+                                  disabled={isViewOnly} aria-pressed={scores[q.id] === answer}
+                                  className={`rounded-md px-3 py-1.5 text-[10px] font-black transition-colors ${scores[q.id] === answer ? answer === 'SIM' ? 'bg-emerald-500/20 text-emerald-700 dark:text-emerald-300' : 'bg-rose-500/20 text-rose-700 dark:text-rose-300' : 'text-brand-muted hover:bg-surface-card hover:text-brand-primary'}`}>
+                                  {answer}
+                                </button>
+                              ))}
+                            </div>
+                          ) : <div className="flex gap-0.5 bg-surface-subtle p-0.5 rounded-lg border border-surface-border h-fit flex-shrink-0">
+                            {(['SIM', 'NAO', 'NA'] as const).map(opt => {
+                              const isSelected = scores[q.id] === opt;
+                              let selectedStyle = 'bg-brand-primary text-brand-on-primary shadow-xs';
+                              if (isSelected) {
+                                if (opt === 'SIM') {
+                                  selectedStyle = 'bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/40 shadow-xs font-black';
+                                } else if (opt === 'NAO') {
+                                  selectedStyle = q.is_critical
+                                    ? 'bg-rose-600 text-white shadow-xs font-black'
+                                    : 'bg-rose-500/20 text-rose-700 dark:text-rose-300 border border-rose-500/40 shadow-xs font-black';
+                                } else {
+                                  selectedStyle = 'bg-slate-500/20 text-slate-700 dark:text-slate-300 border border-slate-500/40 shadow-xs font-black';
+                                }
+                              }
+                              return (
+                                <button
+                                  key={opt}
+                                  type="button"
+                                  onClick={() => !isViewOnly && setScores({...scores, [q.id]: opt})}
+                                  className={`px-3.5 py-1 rounded-md text-[10px] uppercase tracking-wider transition-all cursor-pointer ${
+                                    isSelected
+                                      ? selectedStyle
+                                      : 'text-brand-muted hover:bg-surface-card hover:text-brand-primary'
+                                  }`}
+                                  disabled={isViewOnly}
+                                >
+                                  {opt}
+                                </button>
+                              );
+                            })}
+                          </div>}
+                        </div>
+
+                        {/* Campo de Observação do Auditor */}
+                        <div className="space-y-1.5 mt-4">
+                          <div className="flex items-center justify-between">
+                            <label className="text-[10px] font-black uppercase tracking-wider text-brand-muted">
+                              Observação do Auditor para este critério
+                            </label>
+                            {dialogue.length > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSelectedQuestionForDialogue(q.id);
+                                  setShowDialogueDrawer(true);
+                                }}
+                                className="text-[10px] font-bold text-brand-highlight hover:underline flex items-center gap-1 cursor-pointer"
+                              >
+                                <MessageSquare className="w-3 h-3" />
+                                <span>Ver evidências no diálogo</span>
+                              </button>
+                            )}
+                          </div>
+                          <textarea
+                            value={observations[q.id] || ''}
+                            onChange={e => !isViewOnly && setObservations({...observations, [q.id]: e.target.value})}
+                            placeholder="Adicionar observação técnica ou justificativa do auditor para este item..."
+                            rows={3}
+                            className="w-full bg-surface-subtle border border-surface-border rounded-lg p-3 text-xs font-medium focus:border-brand-accent focus:outline-none transition-all resize-y break-words whitespace-pre-wrap min-h-[60px]"
+                            disabled={isViewOnly}
+                          />
+                        </div>
+
+                        {/* Base de Confronto da IA & Evidências por Escrito do Atendimento */}
+                        {(() => {
+                          const aiAnswer = aiEval?.suggested_answers?.[q.id];
+                          const aiObs = aiEval?.suggested_observations?.[q.id];
+                          const aiCrit = aiEval?.suggested_critical_errors?.[q.id];
+                          if (!aiAnswer && !aiObs && aiCrit === undefined) return null;
+
+                          const isAiExpanded = Boolean(expandedAiQuestions[q.id]);
+                          const quoteMatch = aiObs ? aiObs.match(/["“]([^"”]{4,})["”]/) : null;
+                          const quotedSnippet = quoteMatch ? quoteMatch[1] : null;
+
+                          return (
+                            <div className="mt-3 p-3 rounded-xl bg-surface-subtle/70 border border-brand-highlight/20 space-y-2">
+                              <div className="flex items-center justify-between gap-2 flex-wrap">
+                                <div className="flex items-center gap-1.5 text-xs font-black text-brand-highlight">
+                                  <Bot className="w-3.5 h-3.5" />
+                                  <span>Base de Confronto & Parecer da IA</span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                  {aiAnswer && (
+                                    <button
+                                      type="button"
+                                      onClick={() => toggleAiExpansion(q.id)}
+                                      className={`text-[10px] font-black uppercase px-2.5 py-0.5 rounded-md border flex items-center gap-1 transition-all cursor-pointer ${
+                                        aiAnswer === 'SIM'
+                                          ? 'bg-functional-success/10 text-functional-success border-functional-success/25 hover:bg-functional-success/20'
+                                          : aiAnswer === 'NAO'
+                                          ? 'bg-functional-error/10 text-functional-error border-functional-error/25 hover:bg-functional-error/20'
+                                          : 'bg-surface-subtle text-brand-muted border-surface-border hover:bg-surface-subtle/80'
+                                      }`}
+                                      title={isAiExpanded ? "Recolher análise detalhada da IA" : "Expandir análise e justificativa da IA"}
+                                    >
+                                      <span>Sugestão IA: {aiAnswer}</span>
+                                      {isAiExpanded ? (
+                                        <ChevronUp className="w-3 h-3 opacity-70" />
+                                      ) : (
+                                        <ChevronDown className="w-3 h-3 opacity-70" />
+                                      )}
+                                    </button>
+                                  )}
+                                  {aiCrit && (
+                                    <Badge variant="error" size="sm" className="text-[9px] font-black">
+                                      Erro Crítico Apontado
+                                    </Badge>
+                                  )}
+                                </div>
+                              </div>
+
+                              {/* Conteúdo analítico e evidências recolhíveis */}
+                              {isAiExpanded && (
+                                <div className="space-y-2.5 pt-1 animate-fade-in">
+                                  {/* Evidência Textual Extraída do Atendimento */}
+                                  {quotedSnippet && (
+                                    <div className="p-2.5 rounded-lg bg-surface-card border border-brand-highlight/30 space-y-1">
+                                      <div className="flex items-center justify-between gap-2">
+                                        <span className="text-[10px] font-black uppercase tracking-wider text-brand-highlight flex items-center gap-1.5">
+                                          <Quote className="w-3 h-3" />
+                                          <span>Citação Extraída do Atendimento:</span>
+                                        </span>
+                                        {dialogue.length > 0 && (
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              setSelectedQuestionForDialogue(q.id);
+                                              setDialogueFilter('all');
+                                              const cleanSnippet = quotedSnippet.replace(/^["'“”\s]+|["'“”\s]+$/g, '').trim();
+                                              const words = cleanSnippet.split(/\s+/).filter(Boolean);
+                                              const searchTerms = words.length <= 6 ? cleanSnippet : words.slice(0, 5).join(' ');
+                                              setDialogueSearch(searchTerms);
+                                              setShowDialogueDrawer(true);
+                                            }}
+                                            className="text-[10px] font-bold text-brand-muted hover:text-brand-highlight underline cursor-pointer"
+                                          >
+                                            Localizar no diálogo
+                                          </button>
+                                        )}
+                                      </div>
+                                      <p className="font-mono text-[11px] text-brand-primary italic select-text bg-surface-subtle/60 p-2 rounded border border-surface-border/50">
+                                        "{quotedSnippet}"
+                                      </p>
+                                    </div>
+                                  )}
+
+                                  {/* Parecer Analítico da IA */}
+                                  {aiObs ? (
+                                    <div className="text-[11px] text-brand-muted bg-surface-card p-3 rounded-lg border border-surface-border leading-relaxed select-text space-y-1.5">
+                                      <div className="flex items-center justify-between gap-2">
+                                        <span className="font-bold text-brand-primary text-[10px] uppercase tracking-wider">
+                                          Análise e Motivo da IA:
+                                        </span>
+                                        {!isViewOnly && observations[q.id] !== aiObs && (
+                                          <button
+                                            type="button"
+                                            onClick={() => setObservations(prev => ({ ...prev, [q.id]: aiObs }))}
+                                            className="text-[10px] font-bold text-brand-highlight hover:underline flex items-center gap-1 cursor-pointer transition-colors"
+                                            title="Copiar texto da IA para a observação deste critério"
+                                          >
+                                            <RotateCcw className="w-2.5 h-2.5" />
+                                            Copiar para observação do auditor
+                                          </button>
+                                        )}
+                                      </div>
+                                      <p className="text-[11px] text-brand-primary/90 leading-relaxed font-sans">
+                                        {aiObs}
+                                      </p>
+                                    </div>
+                                  ) : (
+                                    <p className="text-[10px] text-brand-muted italic">Critério validado automaticamente sem observação adicional.</p>
+                                  )}
+
+                                  {/* Atalho para confrontar com o diálogo real */}
+                                  {dialogue.length > 0 && (
+                                    <div className="pt-1 flex items-center justify-between text-[10px]">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setSelectedQuestionForDialogue(q.id);
+                                          setDialogueFilter('all');
+                                          if (quotedSnippet) {
+                                            const cleanSnippet = quotedSnippet.replace(/^["'“”\s]+|["'“”\s]+$/g, '').trim();
+                                            const words = cleanSnippet.split(/\s+/).filter(Boolean);
+                                            const searchTerms = words.length <= 6 ? cleanSnippet : words.slice(0, 5).join(' ');
+                                            setDialogueSearch(searchTerms);
+                                          } else {
+                                            setDialogueSearch('');
+                                          }
+                                          setShowDialogueDrawer(true);
+                                        }}
+                                        className="text-brand-muted hover:text-brand-primary font-bold flex items-center gap-1.5 cursor-pointer transition-colors"
+                                      >
+                                        <MessageSquare className="w-3.5 h-3.5 text-brand-highlight" />
+                                        <span>Confrontar no Diálogo do Atendimento ({dialogue.length} mensagens gravadas)</span>
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })()}
+                      </Card>
+                    ))}
+                  </div>
+                </div>
+              ))}
+
+              {!isChildFormId(header.form_id) && selectedForm.critical_errors && selectedForm.critical_errors.length > 0 && (
+                <div className="pt-10 border-t border-error/10">
+                  <h3 className="text-sm font-black text-error flex items-center gap-1.5 mb-4 uppercase tracking-wider"><AlertOctagon className="w-4 h-4" /> Pontos de Atenção para Revisão</h3>
+                  <div className="grid grid-cols-1 gap-3">
+                    {(selectedForm.critical_errors || []).map(ce => (
+                      <div key={ce.id} className="space-y-2">
+                        <label className={`flex items-center gap-2.5 p-2.5 rounded-lg border transition-all cursor-pointer ${criticalErrors[ce.id] ? 'bg-error/5 border-error' : 'bg-surface-card border-surface-border hover:border-error/30'}`}>
+                          <input type="checkbox" checked={!!criticalErrors[ce.id]} onChange={e => !isViewOnly && setCriticalErrors({...criticalErrors, [ce.id]: e.target.checked})} disabled={isViewOnly} className="w-4.5 h-4.5 rounded text-error focus:ring-error" />
+                          <span className="text-[11px] font-black text-brand-primary uppercase tracking-wider">{ce.text}</span>
+                        </label>
+                        {criticalErrors[ce.id] && (
+                          <textarea rows={2} value={criticalErrorObservations[ce.id] || ''} onChange={e => !isViewOnly && setCriticalErrorObservations({...criticalErrorObservations, [ce.id]: e.target.value})} placeholder="Registre as evidências para revisão humana..." className="w-full border border-error/20 rounded-lg p-3 text-xs font-medium focus:border-error focus:outline-none bg-error/5 resize-y break-words whitespace-pre-wrap min-h-[60px]" disabled={isViewOnly} />
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </section>
+          )}
+
+          {step === 3 && (
             <section className="animate-fade-in space-y-10 max-w-4xl mx-auto">
               <div className="space-y-4">
                 <p className="text-[10px] font-black uppercase text-brand-muted tracking-[0.2em] ml-1 text-center">Pesquisa de Satisfação</p>
@@ -337,42 +1513,60 @@ export default function MonitoriaForm({
 
                   {header.satisfaction_result === 'Negativa' && (
                     <Card className="bg-error/5 border-error/20 p-5 space-y-4 rounded-xl">
-                      <div className="flex items-center justify-between gap-4">
-                        <p className="text-xs font-black text-error uppercase tracking-wider">Conseguimos contato com o cliente?</p>
-                        <div className="flex gap-0.5 bg-surface-subtle p-0.5 rounded-lg border border-surface-border h-fit flex-shrink-0">
-                          {[true, false].map(v => (
-                            <button
-                              key={v ? 'y' : 'n'}
-                              onClick={() => !isViewOnly && setHeader({...header, client_contact_success: v})}
-                              className={`px-3.5 py-1 rounded-md text-[10px] font-black uppercase tracking-wider transition-all cursor-pointer ${header.client_contact_success === v ? 'bg-error text-white shadow-sm' : 'text-brand-muted hover:bg-surface-card'}`}
-                              disabled={isViewOnly}
-                            >
-                              {v ? 'SIM' : 'NÃO'}
-                            </button>
-                          ))}
+                      <div className="space-y-2.5">
+                        <p className="text-xs font-black text-error uppercase tracking-wider">Contato com o Cliente</p>
+                        <p className="text-[10px] font-medium text-brand-muted">Selecione o(s) canal(is) utilizado(s) para o contato. Caso não consiga falar por telefone, envie uma mensagem via WhatsApp pelo Zendesk.</p>
+                        <div className="grid grid-cols-2 gap-2.5">
+                          {(['Zendesk', 'Telefone'] as const).map(opt => {
+                            const isChecked = (header.client_contact_channel || []).includes(opt);
+                            return (
+                              <label
+                                key={opt}
+                                className={`flex items-center gap-2.5 py-2.5 px-3.5 rounded-lg border transition-all cursor-pointer ${
+                                  isChecked
+                                    ? 'bg-surface-card border-error/40 text-error'
+                                    : 'bg-surface-card border-surface-border text-brand-muted hover:border-error/30 hover:text-error'
+                                }`}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={isChecked}
+                                  onChange={e => {
+                                    if (isViewOnly) return;
+                                    const current = header.client_contact_channel || [];
+                                    const next = e.target.checked
+                                      ? [...current, opt]
+                                      : current.filter((c: string) => c !== opt);
+                                    setHeader({...header, client_contact_channel: next});
+                                  }}
+                                  disabled={isViewOnly}
+                                  className="w-4.5 h-4.5 rounded text-error border-surface-border focus:ring-error"
+                                />
+                                <span className="text-[11px] font-black uppercase tracking-wider">{opt}</span>
+                              </label>
+                            );
+                          })}
                         </div>
                       </div>
-                      {header.client_contact_success && (
-                        <div className="space-y-2 animate-fade-in">
-                          <label className="text-[10px] font-bold text-brand-muted uppercase tracking-widest ml-1">Registro de Contato/Tentativa</label>
-                          <textarea
-                            value={header.client_contact_log}
-                            onChange={e => setHeader({...header, client_contact_log: e.target.value})}
-                            disabled={isViewOnly}
-                            className="w-full bg-surface-bg border border-surface-border rounded-xl p-4 text-xs font-medium min-h-[100px] focus:border-brand-accent focus:outline-none placeholder:text-brand-muted/40 text-brand-primary"
-                            placeholder="Descreva como foi o contato ou o motivo do insucesso..."
-                          />
-                        </div>
-                      )}
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-bold text-brand-muted uppercase tracking-widest ml-1">Registro de Contato/Tentativa</label>
+                        <textarea
+                          value={header.client_contact_log}
+                          onChange={e => setHeader({...header, client_contact_log: e.target.value})}
+                          disabled={isViewOnly}
+                          className="w-full bg-surface-bg border border-surface-border rounded-xl p-4 text-xs font-medium min-h-[100px] focus:border-brand-accent focus:outline-none placeholder:text-brand-muted/40 text-brand-primary"
+                          placeholder="Descreva como foi o contato ou o motivo do insucesso..."
+                        />
+                      </div>
                     </Card>
                   )}
 
-                  {header.satisfaction_result === 'Negativa' && (header.satisfaction_has_record || header.client_contact_success) && clientFieldsToShow.length > 0 && (
+                  {header.satisfaction_result === 'Negativa' && clientFieldsToShow.length > 0 && (
                     <div className="space-y-6 pt-4 animate-fade-in">
                       <p className="text-[10px] font-black uppercase text-brand-muted tracking-[0.2em] ml-1 text-center">Campos Extras do Cliente</p>
                       {clientFieldsToShow.map(field => (
                         <Card key={field.id} className="bg-surface-card p-5 border border-surface-border space-y-4 shadow-premium-sm rounded-xl">
-                          <p className="text-xs font-black text-brand-primary uppercase tracking-wider">{field.title} *</p>
+                          <p className="text-xs font-black text-brand-primary uppercase tracking-wider">{field.title}{!isViewOnly && ' *'}</p>
                           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                             {field.options.map(opt => {
                               const isChecked = (dissatisfactionAnswers[field.id] || []).includes(opt);
@@ -406,175 +1600,265 @@ export default function MonitoriaForm({
             </section>
           )}
 
-          {step === 3 && selectedForm && (
-            <section className="space-y-10 animate-fade-in max-w-4xl mx-auto">
-              {(() => {
-                const level = getLevelForScore(score);
-                const isTarget = isAboveTarget(score);
-
-                const getSubtleBgClass = (textColor: string) => {
-                  if (textColor.includes('excelente')) return 'bg-level-excelente/10 text-level-excelente';
-                  if (textColor.includes('aceitavel')) return 'bg-level-aceitavel/10 text-level-aceitavel';
-                  if (textColor.includes('atencao')) return 'bg-level-atencao/10 text-level-atencao';
-                  if (textColor.includes('ruim')) return 'bg-level-ruim/10 text-level-ruim';
-                  if (textColor.includes('roxo')) return 'bg-level-roxo/10 text-level-roxo';
-                  return 'bg-brand-subtle/10 text-brand-primary';
-                };
-
-                const subtleClass = getSubtleBgClass(level.color);
-                const [bgClass, textClass] = subtleClass.split(' ');
-
-                return (
-                  <div className="p-6 rounded-2xl border border-surface-border flex flex-col sm:flex-row items-center justify-between bg-surface-card shadow-premium-sm gap-4">
-                    <div className="flex items-center gap-4">
-                      <div className={`w-12 h-12 rounded-xl flex items-center justify-center ${bgClass}`}>
-                        <Target className={`w-6 h-6 ${textClass}`} />
-                      </div>
-                      <div>
-                        <p className="text-[10px] font-black uppercase text-brand-muted tracking-[0.2em]">Score de Avaliação</p>
-                        <div className="flex items-baseline gap-2 mt-1">
-                          <span className={`text-3xl font-black tabular-nums ${textClass}`}>
-                            {score.toFixed(2)}%
-                          </span>
-                          <span className="text-[10px] font-black text-brand-muted uppercase tracking-wider">
-                            - {level.label}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-                    <div className="text-center sm:text-right">
-                      <Badge variant={isTarget ? 'success' : 'error'} className="px-3.5 py-1 text-[10px] font-black uppercase tracking-wider">
-                        {isTarget ? 'Meta Atingida' : 'Abaixo da Meta'}
-                      </Badge>
-                      <p className="text-[9px] font-bold text-brand-muted uppercase tracking-widest mt-1.5">Calculado em tempo real</p>
-                    </div>
-                  </div>
-                );
-              })()}
-
-              {selectedForm.sections.map((section, sIdx) => (
-                <div key={section.id} className="space-y-6">
-                  <div className="flex items-center gap-3">
-                    <div className="w-8 h-8 rounded-xl bg-brand-primary text-white flex items-center justify-center text-xs font-black">{sIdx + 1}</div>
-                    <div>
-                      <h3 className="text-lg font-black text-brand-primary tracking-tight uppercase">{section.title}</h3>
-                      <p className="text-[10px] font-bold text-brand-muted uppercase tracking-widest">Peso desta seção: {section.weight}%</p>
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-1 gap-4">
-                    {section.questions.map(q => (
-                      <Card key={q.id} className={`bg-surface-card rounded-xl p-5 hover:border-brand-accent transition-all group ${q.is_critical && scores[q.id] === 'NAO' ? 'border-error ring-4 ring-error/5' : ''}`}>
-                        <div className="flex flex-col md:flex-row justify-between gap-6">
-                          <div className="flex-1">
-                            <div className="flex items-start gap-3">
-                              {q.is_critical && (
-                                <Badge variant="error" size="sm" className="mt-1 flex-shrink-0 animate-pulse">ERRO CRÍTICO</Badge>
-                              )}
-                              <div className="flex items-center gap-2 flex-wrap">
-                                <p className="text-sm font-bold text-brand-primary leading-relaxed">{q.text}</p>
-                                {q.description && (
-                                  <div className="relative z-20 hover:z-50 group/info">
-                                    <Info className="w-4 h-4 text-brand-muted hover:text-brand-accent cursor-help transition-colors" />
-                                    <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-64 p-3 bg-surface-card border border-surface-border rounded-xl shadow-premium opacity-0 invisible group-hover/info:opacity-100 group-hover/info:visible transition-all z-50 pointer-events-none group-hover/info:pointer-events-auto text-center">
-                                      <p className="text-[11px] font-bold text-brand-muted leading-relaxed">{q.description}</p>
-                                    </div>
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-                            <div className="flex items-center gap-4 mt-2">
-                              <span className="text-[9px] font-black text-brand-muted uppercase tracking-widest">
-                                Impacto: {((section.weight || 0) / (section.questions.filter(qu => scores[qu.id] !== 'NA').length || section.questions.length)).toFixed(1)}%
-                              </span>
-                            </div>
-                          </div>
-                          <div className="flex gap-0.5 bg-surface-subtle p-0.5 rounded-lg border border-surface-border h-fit flex-shrink-0">
-                            {(['SIM', 'NAO', 'NA'] as const).map(opt => (
-                              <button
-                                key={opt}
-                                onClick={() => !isViewOnly && setScores({...scores, [q.id]: opt})}
-                                className={`px-3.5 py-1 rounded-md text-[10px] font-black uppercase tracking-wider transition-all cursor-pointer ${scores[q.id] === opt ? (opt === 'NAO' && q.is_critical ? 'bg-error text-white shadow-sm' : 'bg-brand-primary text-brand-on-primary shadow-sm') : 'text-brand-muted hover:bg-surface-card'}`}
-                                disabled={isViewOnly}
-                              >
-                                {opt}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                        <textarea value={observations[q.id] || ''} onChange={e => !isViewOnly && setObservations({...observations, [q.id]: e.target.value})} placeholder="Adicionar observação específica para este item..." className="w-full mt-4 bg-surface-subtle border border-surface-border rounded-lg p-3 text-xs font-medium focus:border-brand-accent focus:outline-none transition-all" disabled={isViewOnly} />
-                      </Card>
-                    ))}
-                  </div>
-                </div>
-              ))}
-
-              {selectedForm.critical_errors && selectedForm.critical_errors.length > 0 && (
-                <div className="pt-10 border-t border-error/10">
-                  <h3 className="text-sm font-black text-error flex items-center gap-1.5 mb-4 uppercase tracking-wider"><AlertOctagon className="w-4 h-4" /> Itens Fatais (Erros Críticos)</h3>
-                  <div className="grid grid-cols-1 gap-3">
-                    {(selectedForm.critical_errors || []).map(ce => (
-                      <div key={ce.id} className="space-y-2">
-                        <label className={`flex items-center gap-2.5 p-2.5 rounded-lg border transition-all cursor-pointer ${criticalErrors[ce.id] ? 'bg-error/5 border-error' : 'bg-surface-card border-surface-border hover:border-error/30'}`}>
-                          <input type="checkbox" checked={!!criticalErrors[ce.id]} onChange={e => !isViewOnly && setCriticalErrors({...criticalErrors, [ce.id]: e.target.checked})} disabled={isViewOnly} className="w-4.5 h-4.5 rounded text-error focus:ring-error" />
-                          <span className="text-[11px] font-black text-brand-primary uppercase tracking-wider">{ce.text}</span>
-                        </label>
-                        {criticalErrors[ce.id] && (
-                          <textarea value={criticalErrorObservations[ce.id] || ''} onChange={e => !isViewOnly && setCriticalErrorObservations({...criticalErrorObservations, [ce.id]: e.target.value})} placeholder="Justificativa técnica obrigatória para a aplicação deste erro crítico..." className="w-full border border-error/20 rounded-lg p-3 text-xs font-medium focus:border-error focus:outline-none bg-error/5" disabled={isViewOnly} />
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </section>
-          )}
-
           {step === 4 && (
             <section className="space-y-10 animate-fade-in max-w-4xl mx-auto w-full">
-              {qualityFieldsToShow.length > 0 && (
-                <div className="space-y-6 animate-fade-in">
-                  <p className="text-[10px] font-black uppercase text-brand-muted tracking-[0.2em] ml-1">Campos Extras da Qualidade</p>
-                  {qualityFieldsToShow.map(field => (
-                    <Card key={field.id} className="bg-surface-card p-5 border border-surface-border space-y-4 shadow-premium-sm rounded-xl">
-                      <p className="text-xs font-black text-brand-primary uppercase tracking-wider">{field.title} *</p>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                        {field.options.map(opt => {
-                          const isChecked = (dissatisfactionAnswers[field.id] || []).includes(opt);
-                          return (
-                            <label
-                              key={opt}
-                              className={`flex items-center gap-2.5 py-2.5 px-3.5 rounded-lg border transition-all cursor-pointer ${
-                                isChecked
-                                  ? 'bg-surface-subtle border-brand-primary/40 text-brand-primary'
-                                  : 'bg-surface-card border-surface-border text-brand-muted hover:border-brand-accent hover:text-brand-primary'
-                              }`}
-                            >
-                              <input
-                                type="checkbox"
-                                checked={isChecked}
-                                onChange={e => handleCheckboxChange(field.id, opt, e.target.checked, isViewOnly)}
-                                disabled={isViewOnly}
-                                className="w-4.5 h-4.5 rounded text-brand-primary border-surface-border focus:ring-brand-primary"
-                              />
-                              <span className="text-[11px] font-black uppercase tracking-wider">{opt}</span>
-                            </label>
-                          );
-                        })}
-                      </div>
-                    </Card>
-                  ))}
+              {specializedTeamLabel && (
+                <div className="p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-between gap-3 text-amber-700 dark:text-amber-300 shadow-xs">
+                  <div className="flex items-center gap-2.5">
+                    <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0" />
+                    <span className="text-xs font-bold">
+                      Observação: Atendimento da equipe <strong>{specializedTeamLabel}</strong> — avaliado utilizando a ficha ativa disponível.
+                    </span>
+                  </div>
+                  <Badge variant="warning" size="xs" className="font-black text-[10px] uppercase tracking-wider bg-amber-500/20 text-amber-800 dark:text-amber-200 border-amber-500/40 shrink-0">
+                    {specializedTeamLabel}
+                  </Badge>
                 </div>
               )}
-
               <div className="space-y-4">
-                <p className="text-[10px] font-black uppercase text-brand-muted tracking-widest ml-1">Registro do Auditor</p>
+                <div className="flex flex-wrap items-center justify-between gap-3 px-1">
+                  <p className="text-[10px] font-black uppercase text-brand-muted tracking-widest">Registro do Auditor</p>
+                  {!isViewOnly && !isReevaluating && !isChildFormId(header.form_id) && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      loading={generatingAuditorRecord}
+                      onClick={handleGenerateAuditorRecord}
+                      icon={<RotateCw className={`w-3.5 h-3.5 ${generatingAuditorRecord ? 'animate-spin' : ''}`} />}
+                      title="Substitui o registro atual por um novo texto baseado nas observações da etapa de Avaliação"
+                      className="shrink-0"
+                    >
+                      {generatingAuditorRecord ? 'Gerando registro...' : 'Gerar novo com IA'}
+                    </Button>
+                  )}
+                </div>
                 <textarea
                   value={header.evaluator_note}
                   onChange={e => setHeader({...header, evaluator_note: e.target.value})}
                   disabled={isViewOnly || isReevaluating}
-                  className="w-full bg-surface-card border border-surface-border rounded-xl p-5 text-xs font-medium min-h-[150px] focus:border-brand-accent focus:outline-none shadow-premium-sm"
+                  className="w-full bg-surface-card border border-surface-border rounded-xl p-5 text-xs font-medium min-h-[150px] focus:border-brand-accent focus:outline-none shadow-premium-sm resize-y break-words whitespace-pre-wrap"
                   placeholder="Escreva aqui as observações gerais da auditoria..."
                 />
+
+                {/* Retorno da Base de Avaliação e Confronto da IA */}
+                {(aiEval || childAiEval) && (
+                  <div className="mt-4 rounded-2xl border border-brand-highlight/25 bg-surface-card p-6 shadow-premium space-y-5 animate-fade-in">
+                    <div className="flex items-center justify-between pb-3 border-b border-surface-border">
+                      <div className="flex items-center gap-2.5">
+                        <div className="w-8 h-8 rounded-xl bg-brand-highlight/10 text-brand-highlight flex items-center justify-center flex-shrink-0">
+                          <Bot className="w-4 h-4" />
+                        </div>
+                        <div>
+                          <h4 className="text-xs font-black uppercase text-brand-primary tracking-wider">
+                            Base de Confronto e Avaliação da IA
+                          </h4>
+                          <p className="text-[10px] text-brand-muted">
+                            Retorno detalhado dos motivos, regras e evidências levantadas pela IA para confronto do auditor
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {!isChildFormId(header.form_id) && aiEval?.score !== undefined && (
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[10px] font-bold text-brand-muted uppercase">Score IA:</span>
+                            <Badge variant={aiEval.score >= 85 ? 'success' : aiEval.score >= 70 ? 'warning' : 'error'} className="font-mono font-bold">
+                              {Math.round(aiEval.score)}%
+                            </Badge>
+                          </div>
+                        )}
+                        {!isViewOnly && !isReevaluating && aiEval?.summary && header.evaluator_note !== aiEval.summary && (
+                          <button
+                            type="button"
+                            onClick={() => setHeader(prev => ({ ...prev, evaluator_note: aiEval.summary }))}
+                            className="text-[10px] font-bold text-brand-muted hover:text-brand-highlight underline flex items-center gap-1 cursor-pointer transition-colors"
+                            title="Restaurar o parecer geral original sugerido pela IA"
+                          >
+                            <RotateCcw className="w-2.5 h-2.5" />
+                            Restaurar parecer da IA
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Motivos Avaliados nos Confrontos (Melhorias / Falhas Apontadas) */}
+                    {aiEval?.improvements && aiEval.improvements.length > 0 && (
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-1.5 text-xs font-black text-functional-error uppercase tracking-wider">
+                          <AlertCircle className="w-3.5 h-3.5" />
+                          <span>Motivos Avaliados nos Confrontos / Oportunidades de Melhoria ({aiEval.improvements.length})</span>
+                        </div>
+                        <div className="grid grid-cols-1 gap-2">
+                          {aiEval.improvements.map((imp, idx) => (
+                            <div key={idx} className="flex items-start gap-2.5 p-3 rounded-xl bg-functional-error/5 border border-functional-error/15 text-xs">
+                              <span className="w-4 h-4 rounded-full bg-functional-error/10 text-functional-error flex items-center justify-center text-[10px] font-black flex-shrink-0 mt-0.5">
+                                {idx + 1}
+                              </span>
+                              <p className="text-brand-primary leading-relaxed font-medium">{imp}</p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Pontos Fortes Constatados pela IA */}
+                    {aiEval?.strengths && aiEval.strengths.length > 0 && (
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-1.5 text-xs font-black text-functional-success uppercase tracking-wider">
+                          <CheckCircle className="w-3.5 h-3.5" />
+                          <span>Pontos Fortes Identificados ({aiEval.strengths.length})</span>
+                        </div>
+                        <div className="grid grid-cols-1 gap-2">
+                          {aiEval.strengths.map((st, idx) => (
+                            <div key={idx} className="flex items-start gap-2.5 p-3 rounded-xl bg-functional-success/5 border border-functional-success/15 text-xs">
+                              <span className="w-4 h-4 rounded-full bg-functional-success/10 text-functional-success flex items-center justify-center text-[10px] font-black flex-shrink-0 mt-0.5">
+                                ✓
+                              </span>
+                              <p className="text-brand-primary leading-relaxed font-medium">{st}</p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Se for Chamado Filho: Regras e Confrontos do manual vigente */}
+                    {childAiEval && (
+                      <div className="space-y-3 pt-3 border-t border-surface-border">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-black text-brand-primary uppercase tracking-wider">
+                              Confronto de Padrão do Chamado Filho
+                            </span>
+                            <Badge variant={childAiEval.status === 'conforme' ? 'success' : childAiEval.status === 'nao_conforme' ? 'error' : 'warning'}>
+                              {childAiEval.status === 'conforme' ? 'Conforme' : childAiEval.status === 'nao_conforme' ? 'Não Conforme' : 'Atenção'}
+                            </Badge>
+                          </div>
+                        </div>
+
+                        {childAiEval.checks && childAiEval.checks.length > 0 && (
+                          <div className="grid grid-cols-1 gap-2">
+                            {childAiEval.checks.map((chk, idx) => (
+                              <div
+                                key={idx}
+                                className={`p-3 rounded-xl border text-xs flex items-start gap-2.5 ${
+                                  chk.passed
+                                    ? 'bg-functional-success/5 border-functional-success/20'
+                                    : 'bg-functional-error/5 border-functional-error/20'
+                                }`}
+                              >
+                                {chk.passed ? (
+                                  <CheckCircle className="w-4 h-4 text-functional-success flex-shrink-0 mt-0.5" />
+                                ) : (
+                                  <XCircle className="w-4 h-4 text-functional-error flex-shrink-0 mt-0.5" />
+                                )}
+                                <div className="space-y-0.5 flex-1">
+                                  <p className="font-bold text-brand-primary">{chk.rule}</p>
+                                  <p className="text-[11px] text-brand-muted leading-relaxed">{chk.details}</p>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        {childAiEval.recommendations && childAiEval.recommendations.length > 0 && (
+                          <div className="p-3 bg-surface-subtle rounded-xl border border-surface-border space-y-1.5">
+                            <p className="text-[10px] font-black uppercase text-brand-muted tracking-wider">Orientações Práticas da IA:</p>
+                            <ul className="list-disc list-inside space-y-1 text-xs text-brand-muted">
+                              {childAiEval.recommendations.map((rec, idx) => (
+                                <li key={idx} className="leading-relaxed">{rec}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                  </div>
+                )}
+
+                {ticketFields.length > 0 && (
+                  <div className="rounded-2xl border border-surface-border bg-surface-card p-5 shadow-premium">
+                    <details className="group/ticketFields">
+                      <summary className="flex cursor-pointer items-center gap-2 text-xs font-black uppercase tracking-wider text-brand-primary hover:text-brand-highlight">
+                        <FileText className="size-4" />
+                        Campos do formulário Zendesk ({ticketFields.length})
+                      </summary>
+                      <p className="mt-2 text-[11px] text-brand-muted">{ticketFieldSource === 'saved' ? 'Dados registrados na avaliação.' : ticketFieldSource === 'current' ? 'Dados atuais do chamado; podem ter mudado desde a avaliação.' : 'Dados do chamado para validação.'}</p>
+                      <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                        {ticketFields.map((field, index) => <div key={`${field.title}-${index}`} className="rounded-lg border border-surface-border bg-surface-subtle p-3 text-xs"><span className="block text-[10px] font-bold uppercase text-brand-muted">{field.title}</span><span className="mt-1 block break-words font-medium text-brand-primary">{field.value || '—'}</span></div>)}
+                      </div>
+                    </details>
+                  </div>
+                )}
+                {ticketFields.length === 0 && isViewOnly && header.ticket_id && (
+                  <div className="rounded-xl border border-surface-border bg-surface-subtle px-4 py-3 text-xs text-brand-muted">
+                    {loadingTicketFields ? 'Carregando campos do formulário Zendesk…' : ticketFieldsError ? 'Não foi possível carregar os campos atuais do Zendesk.' : 'Nenhum campo visível do formulário Zendesk foi encontrado para este ticket.'}
+                    {ticketFieldsError && <button type="button" onClick={() => { fetchedTicketContextRef.current = null; setTicketContextRetry(value => value + 1); }} className="ml-2 font-bold text-brand-highlight hover:underline focus-visible:ring-2 focus-visible:ring-brand-accent">Tentar novamente</button>}
+                  </div>
+                )}
+
+                {/* Evidências Documentais do Atendimento (Transcrição Completa do Chamado) */}
+                <div className="mt-4 rounded-2xl border border-surface-border bg-surface-card p-6 shadow-premium space-y-4 animate-fade-in">
+                  <div className="flex items-center justify-between pb-3 border-b border-surface-border">
+                    <div className="flex items-center gap-2.5">
+                      <div className="w-8 h-8 rounded-xl bg-brand-highlight/10 text-brand-highlight flex items-center justify-center flex-shrink-0">
+                        <MessageSquare className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <h4 className="text-xs font-black uppercase text-brand-primary tracking-wider">
+                          Evidências por Escrito do Atendimento
+                        </h4>
+                        <p className="text-[10px] text-brand-muted">
+                          Transcrição documental das mensagens trocadas no ticket #{header.ticket_id || '—'}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {dialogue.length > 0 && (
+                        <Badge variant="neutral" size="sm" className="font-mono font-bold text-[10px]">
+                          {dialogue.length} {dialogue.length === 1 ? 'mensagem' : 'mensagens'}
+                        </Badge>
+                      )}
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setShowStep4Dialogue(prev => !prev)}
+                        className="text-xs font-bold cursor-pointer"
+                      >
+                        {showStep4Dialogue ? 'Ocultar Transcrição' : 'Expandir Transcrição'}
+                      </Button>
+                    </div>
+                  </div>
+
+                  {showStep4Dialogue && (
+                    <div className="space-y-3 max-h-[420px] overflow-y-auto pr-1 no-scrollbar animate-fade-in">
+                      {loadingDialogue ? (
+                        <div className="py-8 text-center text-xs text-brand-muted">
+                          Carregando histórico do Helpdesk...
+                        </div>
+                      ) : dialogue.length === 0 ? (
+                        <div className="py-6 text-center text-xs text-brand-muted">
+                          Nenhuma mensagem registrada no diálogo deste ticket.
+                        </div>
+                      ) : (
+                        dialogue.map((msg, idx) => {
+                          const msgId = `step4_${msg.id || idx}`;
+                          return (
+                            <TicketMessageBubble
+                              key={msg.id || idx}
+                              msg={msg}
+                              msgId={msgId}
+                              isExpanded={!!expandedDialogueMsgIds[msgId]}
+                              onToggleExpand={() => toggleDialogueMsgExpand(msgId)}
+                              onCite={(text, author) => handleCiteInObservation(text, author)}
+                            />
+                          );
+                        })
+                      )}
+                    </div>
+                  )}
+                </div>
               </div>
 
               {(() => {
@@ -644,24 +1928,313 @@ export default function MonitoriaForm({
         </div>
 
         {/* Footer Actions */}
-        <div className="p-8 bg-surface-card border-t border-surface-border flex items-center justify-between">
-          <Button variant="ghost" onClick={() => setStep(s => Math.max(1, s - 1))} disabled={step === 1} icon={<ChevronLeft className="w-4 h-4 transition-transform duration-200 group-hover:-translate-x-0.5" />}>
-            Voltar
+        <div className="px-4 py-3 sm:px-6 sm:py-3.5 pb-safe bg-surface-card border-t border-surface-border flex items-center justify-between flex-shrink-0 z-10">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              if (step > 1) {
+                setStep(s => s - 1);
+              } else {
+                onCancel();
+              }
+            }}
+            disabled={isPending}
+            icon={<ChevronLeft className="w-4 h-4 transition-transform duration-200 group-hover:-translate-x-0.5" />}
+          >
+            {step === 1 ? 'Voltar' : isViewOnly ? 'Anterior' : 'Voltar'}
           </Button>
 
-          <div className="flex gap-4">
+          <div className="flex gap-3">
             {step < 4 ? (
-              <Button onClick={() => { if (validateStep(step)) setStep(s => Math.min(4, s + 1)); }} icon={<ChevronRight className="w-4 h-4 transition-transform duration-200 group-hover:translate-x-0.5" />}>
-                Continuar
+              <Button
+                size="sm"
+                onClick={() => {
+                  // Em modo leitura os campos estão desabilitados, então validar
+                  // aqui prenderia o usuário: ele não tem como corrigir o que a
+                  // validação exige. Registros antigos, ou anteriores à criação
+                  // de um novo campo obrigatório, ficavam impossíveis de navegar.
+                  if (isViewOnly || validateStep(step)) setStep(s => Math.min(4, s + 1));
+                }}
+                icon={<ChevronRight className="w-4 h-4 transition-transform duration-200 group-hover:translate-x-0.5" />}
+              >
+                {isViewOnly ? 'Próximo' : 'Continuar'}
               </Button>
+            ) : isViewOnly ? (
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                {!isChildEvaluation && initialData && awaitsFinalPositiveDecision(initialData) && (
+                  <span className="max-w-sm text-right text-xs text-brand-muted">A atualização do Zendesk aguarda a conclusão das revisões e contestações.</span>
+                )}
+                {canSendToHelpdesk && (
+                  <button
+                    type="button"
+                    onClick={() => initialData && setHelpdeskModal({ monitoriaId: initialData.id, fromConclusion: false })}
+                    className="action-primary group inline-flex items-center justify-center gap-2 px-6 py-2 text-xs font-bold uppercase tracking-wider rounded-lg transition-all duration-200 active:scale-[0.98]"
+                  >
+                    <Send className="w-4 h-4 transition-transform duration-200 group-hover:scale-110" />
+                    Enviar ao Zendesk
+                  </button>
+                )}
+                {canPublishChild && initialData && (
+                  <Button size="sm" onClick={() => setChildPublishModal({ monitoriaId: initialData.id, fromConclusion: false })} icon={<Send className="w-4 h-4" />}>
+                    Enviar macro do chamado filho
+                  </Button>
+                )}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={onCancel}
+                  className="px-6"
+                >
+                  Fechar Visualização
+                </Button>
+              </div>
             ) : (
-              <Button onClick={handleSave} disabled={isPending || isViewOnly} variant="primary" className="px-12" icon={<Save className="w-4 h-4 transition-transform duration-200 group-hover:scale-110" />}>
+              <Button onClick={handleSave} disabled={isPending} variant="primary" size="sm" className="px-8" icon={<Save className="w-4 h-4 transition-transform duration-200 group-hover:scale-110" />}>
                 {isPending ? 'Processando...' : 'Finalizar Monitoria'}
               </Button>
             )}
           </div>
         </div>
+
+        {/* SLIDE-OVER DRAWER: EVIDÊNCIAS POR ESCRITO DO ATENDIMENTO */}
+        <AnimatePresence>
+          {showDialogueDrawer && (
+            <>
+              {/* Backdrop overlay for drawer */}
+              <m.div
+                key="dialogue-drawer-backdrop"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                onClick={() => setShowDialogueDrawer(false)}
+                className="absolute inset-0 bg-black/40 backdrop-blur-xs z-40"
+              />
+
+              {/* Drawer content */}
+              <m.div
+                key="dialogue-drawer"
+                initial={{ x: '100%' }}
+                animate={{ x: 0 }}
+                exit={{ x: '100%' }}
+                transition={{ type: 'spring', damping: 28, stiffness: 280 }}
+                className="absolute top-0 right-0 bottom-0 w-full sm:w-[480px] md:w-[540px] bg-surface-card border-l border-surface-border shadow-2xl z-50 flex flex-col overflow-hidden"
+              >
+                {/* Drawer Header */}
+                <div className="p-4 border-b border-surface-border flex items-center justify-between bg-surface-subtle/70">
+                  <div className="flex items-center gap-3">
+                    <div className="w-9 h-9 rounded-xl bg-brand-highlight/10 text-brand-highlight flex items-center justify-center flex-shrink-0">
+                      <MessageSquare className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-black uppercase text-brand-primary tracking-tight">
+                        Evidências do Atendimento
+                      </h3>
+                      <p className="text-[11px] text-brand-muted font-mono">
+                        Ticket #{header.ticket_id || '—'} · {dialogue.length} {dialogue.length === 1 ? 'mensagem' : 'mensagens'}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => setShowDialogueDrawer(false)}
+                    className="p-1.5 hover:bg-surface-card rounded-lg transition-colors text-brand-muted cursor-pointer"
+                    title="Fechar painel"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+
+                {/* Selected question target indicator */}
+                {selectedQuestionForDialogue && (
+                  <div className="px-4 py-2 bg-brand-highlight/10 border-b border-brand-highlight/20 flex items-center justify-between text-xs">
+                    <span className="text-brand-highlight font-bold flex items-center gap-1.5 text-[11px]">
+                      <Bot className="w-3.5 h-3.5" />
+                      <span>Vinculado à observação do critério</span>
+                    </span>
+                    <button
+                      onClick={() => setSelectedQuestionForDialogue(null)}
+                      className="text-[10px] text-brand-muted hover:text-brand-primary underline"
+                    >
+                      Desvincular
+                    </button>
+                  </div>
+                )}
+
+                {/* Search & Filters */}
+                <div className="p-3 border-b border-surface-border bg-surface-card space-y-2.5">
+                  <div className="relative">
+                    <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-brand-muted" />
+                    <input
+                      type="text"
+                      value={dialogueSearch}
+                      onChange={e => setDialogueSearch(e.target.value)}
+                      placeholder="Buscar termos no diálogo (ex.: PDV, erro, webhook)..."
+                      className="w-full pl-9 pr-8 py-2 text-xs bg-surface-subtle border border-surface-border rounded-lg text-brand-primary placeholder:text-brand-muted focus:outline-none focus:border-brand-accent"
+                    />
+                    {dialogueSearch && (
+                      <button
+                        onClick={() => setDialogueSearch('')}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-brand-muted hover:text-brand-primary"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5 no-scrollbar text-[10px]">
+                    {(() => {
+                      const systemCount = dialogue.filter(d => getDialogueCategory(d) === 'system').length;
+                      const filterList = [
+                        { id: 'all', label: `Todas (${dialogue.length})` },
+                        { id: 'end_user', label: `Cliente (${dialogue.filter(d => getDialogueCategory(d) === 'end_user').length})` },
+                        { id: 'agent', label: `Atendente (${dialogue.filter(d => getDialogueCategory(d) === 'agent').length})` },
+                        ...(systemCount > 0 ? [{ id: 'system', label: `Bot / IA (${systemCount})` }] : []),
+                        { id: 'internal', label: `Internas (${dialogue.filter(d => getDialogueCategory(d) === 'internal').length})` }
+                      ];
+                      return filterList.map(f => (
+                        <button
+                          key={f.id}
+                          onClick={() => setDialogueFilter(f.id as any)}
+                          className={`px-2.5 py-1 rounded-md font-bold uppercase tracking-wider transition-all whitespace-nowrap cursor-pointer ${
+                            dialogueFilter === f.id
+                              ? 'bg-brand-accent text-white shadow-xs'
+                              : 'bg-surface-subtle text-brand-muted hover:text-brand-primary hover:bg-surface-border'
+                          }`}
+                        >
+                          {f.label}
+                        </button>
+                      ));
+                    })()}
+                  </div>
+                </div>
+
+                {/* Message List */}
+                <div className="flex-1 overflow-y-auto p-4 space-y-3.5 no-scrollbar">
+                  {loadingDialogue ? (
+                    <div className="py-12 text-center space-y-3">
+                      <div className="w-8 h-8 border-2 border-brand-accent border-t-transparent rounded-full animate-spin mx-auto" />
+                      <p className="text-xs text-brand-muted">Carregando diálogo completo do ticket no Zendesk...</p>
+                    </div>
+                  ) : filteredDialogue.length === 0 ? (
+                    <div className="py-12 text-center space-y-2">
+                      <p className="text-xs font-bold text-brand-primary">Nenhuma mensagem encontrada</p>
+                      <p className="text-[11px] text-brand-muted">
+                        {dialogueSearch ? 'Nenhum trecho corresponde aos termos pesquisados.' : 'Nenhuma mensagem disponível para este ticket.'}
+                      </p>
+                      {header.ticket_id && (
+                        <button
+                          onClick={() => {
+                            setLoadingDialogue(true);
+                            fetchTicketDialogue(header.ticket_id.trim())
+                              .then(res => { if (res?.comments) setDialogue(normalizeTicketDialogue(res.comments, evaluatedAgent?.name)); })
+                              .finally(() => setLoadingDialogue(false));
+                          }}
+                          className="mt-2 text-xs font-bold text-brand-highlight hover:underline"
+                        >
+                          Recarregar mensagens do Helpdesk
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    filteredDialogue.map((msg, idx) => {
+                      const msgId = `drawer_${msg.id || idx}`;
+                      return (
+                        <TicketMessageBubble
+                          key={msg.id || idx}
+                          msg={msg}
+                          msgId={msgId}
+                          isExpanded={!!expandedDialogueMsgIds[msgId]}
+                          onToggleExpand={() => toggleDialogueMsgExpand(msgId)}
+                          onCite={(text, author) => handleCiteInObservation(text, author, selectedQuestionForDialogue || undefined)}
+                          hasTargetCriterion={!!selectedQuestionForDialogue}
+                        />
+                      );
+                    })
+                  )}
+                </div>
+              </m.div>
+            </>
+          )}
+        </AnimatePresence>
       </m.div>
-    </div>
+
+      {helpdeskModal && (
+        <HelpdeskSendModal
+          monitoriaId={helpdeskModal.monitoriaId}
+          ticketId={header.ticket_id}
+          suggestedOutcome={suggestedOutcome}
+          underReview={initialData?.status === 'pendente_revisao'}
+          fromConclusion={helpdeskModal.fromConclusion}
+          onClose={handleHelpdeskModalClose}
+        />
+      )}
+      {childPublishModal && (
+        <ChildTicketPublishModal
+          monitoriaId={childPublishModal.monitoriaId}
+          ticketId={header.ticket_id}
+          onClose={() => {
+            const saved = childPublishModal;
+            setChildPublishModal(null);
+            if (saved.fromConclusion) onSaved(saved.monitoriaId);
+          }}
+        />
+      )}
+
+
+      {newAgentModalOpen && (
+        <div
+          className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
+          onClick={() => !creatingAgent && setNewAgentModalOpen(false)}
+        >
+          <div onClick={(e: React.MouseEvent) => e.stopPropagation()} className="w-full max-w-md">
+            <Card className="p-6 space-y-4">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-black text-brand-primary">Cadastrar Agente do Helpdesk</h3>
+                <Button variant="ghost" size="sm" onClick={() => setNewAgentModalOpen(false)} disabled={creatingAgent}>
+                  <X className="w-4 h-4" />
+                </Button>
+              </div>
+              <p className="text-[11px] font-semibold text-brand-muted">
+                Para um atendente do Zendesk que ainda não tem conta formal no QualidadeWP. Cria um registro
+                provisório vinculado ao e-mail — quando ele fizer o onboarding com o mesmo e-mail, o histórico
+                é herdado automaticamente pela conta definitiva.
+              </p>
+              <div className="space-y-1">
+                <label className="text-[10px] font-black text-brand-muted uppercase tracking-widest ml-1">Nome *</label>
+                <input
+                  type="text"
+                  value={newAgentName}
+                  onChange={e => setNewAgentName(e.target.value)}
+                  placeholder="Nome completo do agente"
+                  disabled={creatingAgent}
+                  className="w-full px-3 py-2 rounded-xl border border-surface-border bg-surface-subtle text-sm font-semibold"
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] font-black text-brand-muted uppercase tracking-widest ml-1">E-mail *</label>
+                <input
+                  type="email"
+                  value={newAgentEmail}
+                  onChange={e => setNewAgentEmail(e.target.value)}
+                  placeholder="agente@empresa.com.br"
+                  disabled={creatingAgent}
+                  className="w-full px-3 py-2 rounded-xl border border-surface-border bg-surface-subtle text-sm font-semibold"
+                />
+              </div>
+              <div className="flex items-center justify-end gap-2 pt-2">
+                <Button variant="ghost" size="sm" onClick={() => setNewAgentModalOpen(false)} disabled={creatingAgent}>
+                  Cancelar
+                </Button>
+                <Button variant="primary" size="sm" onClick={handleCreateAgent} disabled={creatingAgent} className="flex items-center gap-1.5">
+                  <UserPlus className="w-3.5 h-3.5" />
+                  <span>{creatingAgent ? 'Cadastrando...' : 'Cadastrar e Selecionar'}</span>
+                </Button>
+              </div>
+            </Card>
+          </div>
+        </div>
+      )}
+    </div>,
+    document.body
   );
 }

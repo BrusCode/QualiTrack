@@ -1,9 +1,128 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
 @import "tailwindcss";
+
+.dashboard-skeleton-block {
+  position: relative;
+  overflow: hidden;
+}
+
+.dashboard-skeleton-block::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 25%, rgb(255 255 255 / 0.5) 50%, transparent 75%);
+  transform: translateX(-100%);
+}
+
+.dark .dashboard-skeleton-block::after {
+  background: linear-gradient(100deg, transparent 25%, rgb(255 255 255 / 0.28) 50%, transparent 75%);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .dashboard-skeleton-block::after {
+    animation: dashboard-skeleton-shimmer 1.3s ease-in-out infinite;
+  }
+  .dashboard-loading-icon {
+    animation: dashboard-loading-spin 1s linear infinite;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dashboard-skeleton-block::after {
+    display: none;
+  }
+  .dashboard-skeleton-block,
+  .dashboard-loading-icon {
+    animation: dashboard-loading-breathe 1.6s ease-in-out infinite;
+  }
+}
+
+@keyframes dashboard-skeleton-shimmer {
+  to { transform: translateX(100%); }
+}
+
+@keyframes dashboard-loading-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes dashboard-loading-breathe {
+  50% { opacity: 0.45; }
+}
+
+.dashboard-tile-container {
+  container: dashboard-tiles / inline-size;
+}
+
+.dashboard-tile-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-auto-rows: auto;
+  grid-auto-flow: row dense;
+  gap: 1.5rem;
+}
+
+.dashboard-tile-grid--editing {
+  grid-auto-rows: minmax(144px, auto);
+}
+
+.dashboard-tile-grid > [data-dashboard-kind="chart"] {
+  align-self: start;
+  height: 380px;
+}
+
+.dashboard-tile-grid > [data-dashboard-compact="true"] {
+  height: 280px;
+}
+
+.dashboard-tile-grid > [data-dashboard-kind="auto"] {
+  grid-column: 1 / -1;
+}
+
+.dashboard-tile-grid > [data-dashboard-kind="chart"] [data-dashboard-tile-content] > *,
+.dashboard-tile-grid > [data-dashboard-kind="card"] [data-dashboard-tile-content] > * {
+  height: 100%;
+}
+
+@container dashboard-tiles (min-width: 640px) {
+  .dashboard-tile-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-auto-rows: minmax(128px, auto);
+  }
+
+  .dashboard-tile-grid > [data-dashboard-kind="chart"] {
+    grid-column: span 2;
+    grid-row: span 3;
+  }
+
+  .dashboard-tile-grid > [data-dashboard-compact="true"] {
+    grid-row: span 2;
+  }
+}
+
+@container dashboard-tiles (min-width: 1000px) {
+  .dashboard-tile-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .dashboard-tile-grid > [data-dashboard-wide] {
+    grid-column: 1 / -1;
+  }
+}
+
+.dashboard-tile-grid > [data-dashboard-slot]:not(:has([data-dashboard-tile-content])),
+.dashboard-tile-source .grid:empty,
+.dashboard-tile-source .grid > div:empty,
+.dashboard-tile-source > div:empty,
+.dashboard-tile-source > div > div:empty {
+  display: none;
+}
 
 @variant dark (&:where(.dark, .dark *));
 
 @theme {
+  /* ── Typography Tokens ── */
+  --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
   /* ── Brand Colors ── */
   --color-brand-primary: var(--brand-primary);
   --color-brand-muted: var(--brand-muted);
@@ -25,8 +144,8 @@
   --color-info: #6366F1;
 
   /* ── Layout Tokens ── */
-  --radius-card: 1.5rem;
-  --radius-panel: 2rem;
+  --radius-card: 1.125rem;
+  --radius-panel: 1.25rem;
   --radius-badge: 9999px;
   
   --shadow-premium: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
@@ -38,27 +157,32 @@
 :root {
 color-scheme: light;
 /* Light Theme (Default) */
-  --brand-primary: #2D3A3A;
-  --brand-highlight: #A7C0A5;
-  --brand-accent: #8E9B7B;
-  --brand-muted: #7A7D71;
-  --brand-subtle: #F0F1E8;
+  /* WebPosto brand palette — WebPosto Red Refinado */
+  --brand-primary: #000000;
+  --brand-highlight: #D9232A;
+  --brand-accent: #D9232A;
+  /* Primary actions: modern energetic red with rich contrast */
+  --action-primary-bg: #D9232A;
+  --action-primary-fg: #FFFFFF;
+  --brand-muted: #1E293B; /* Slate-800 escuro e nítido (substitui cinza apagado) */
+  --brand-subtle: #DEE2E8;
   --brand-on-primary: #FFFFFF; /* White text on dark primary (Light Mode) */
 
-  --surface-bg: #F9F9F6;
-  --surface-card: #FFFFFF;
-  --surface-subtle: #F0F1E8;
+  /* Offwhite confortável tendendo ao cinza suave (descanso visual sem ofuscamento) */
+  --surface-bg: #EAECEF;
+  --surface-card: #FDFDFE;
+  --surface-subtle: #DEE2E8;
 
-  /* Role Sidebar Colors (Light Mode — neutral gray) */
-  --sidebar-bg-admin: #F9F9F6;
-  --sidebar-bg-qualidade: #F9F9F6;
-  --sidebar-bg-gestor-qualidade: #F9F9F6;
-  --sidebar-bg-gestor-suporte: #F9F9F6;
-  --sidebar-bg-suporte: #F9F9F6;
-  --surface-border: #E2E4D8;
+  /* Role Sidebar Colors (Light Mode — cinza demarcado e elegante) */
+  --sidebar-bg-admin: #D6DCE4;
+  --sidebar-bg-qualidade: #D6DCE4;
+  --sidebar-bg-gestor-qualidade: #D6DCE4;
+  --sidebar-bg-gestor-suporte: #D6DCE4;
+  --sidebar-bg-suporte: #D6DCE4;
+  --surface-border: #CBD5E1;
   
-  --shadow-premium: 0 10px 40px -10px rgba(45, 58, 58, 0.1);
-  --shadow-premium-sm: 0 4px 20px -5px rgba(45, 58, 58, 0.05);
+  --shadow-premium: 0 10px 40px -10px rgba(10, 31, 68, 0.1);
+  --shadow-premium-sm: 0 4px 20px -5px rgba(10, 31, 68, 0.05);
 
   /* Functional color tokens (light mode) */
   --error-color: #EF4444;
@@ -72,41 +196,45 @@ color-scheme: light;
   --chart-excelente: #818CF8;
   --chart-aceitavel: #34D399;
   --chart-atencao: #FBBF24;
-  --chart-ruim: #F87171;
+  --chart-ruim: #B3141B;
 }
 
 .dark {
 color-scheme: dark;
-/* Dark Theme Overrides */
-  --brand-primary: #F9F9F6;
-  --brand-highlight: #A7C0A5;
-  --brand-accent: #8E9B7B;
-  --brand-muted: #A3A69A;
-  --brand-subtle: #3D4035;
-  --brand-on-primary: #1A1C16; /* Dark text on light primary (Dark Mode) */
+/* Dark Theme Overrides — SaaS Dark Moderno (Profundo Grafite/Azul-Marinho) */
+  --brand-primary: #F8FAFC;
+  --brand-highlight: #F43F5E;
+  --brand-accent: #F43F5E;
+  --action-primary-bg: #E11D48;
+  --action-primary-fg: #FFFFFF;
+  --brand-muted: #94A3B8;
+  --brand-subtle: #1E283D;
+  --brand-on-primary: #0B0F17;
 
-  --surface-bg: #1A1C16;
-  --surface-card: #252820;
-  --surface-subtle: #31352A;
-  --surface-border: #3D4136;
+  /* Superfícies refinadas com profundidade harmônica */
+  --surface-bg: #0B0F17;
+  --surface-card: #131A29;
+  --surface-subtle: #192236;
+  --surface-hover: #1F2B44;
+  --surface-border: #232F48;
 
-  --shadow-premium: 0 10px 40px -10px rgba(0, 0, 0, 0.5);
-  --shadow-premium-sm: 0 4px 20px -5px rgba(0, 0, 0, 0.3);
+  --shadow-premium: 0 10px 30px -10px rgba(0, 0, 0, 0.45);
+  --shadow-premium-sm: 0 4px 16px -4px rgba(0, 0, 0, 0.25);
 
-  /* Role Sidebar Colors (Dark Mode — neutral gray) */
-  --sidebar-bg-admin: #1F2937;
-  --sidebar-bg-qualidade: #1F2937;
-  --sidebar-bg-gestor-qualidade: #1F2937;
-  --sidebar-bg-gestor-suporte: #1F2937;
-  --sidebar-bg-suporte: #1F2937;
+  /* Role Sidebar Colors (Dark Mode — deep slate-navy coeso) */
+  --sidebar-bg-admin: #0F1523;
+  --sidebar-bg-qualidade: #0F1523;
+  --sidebar-bg-gestor-qualidade: #0F1523;
+  --sidebar-bg-gestor-suporte: #0F1523;
+  --sidebar-bg-suporte: #0F1523;
 
-  /* Functional color tokens (dark mode — pastel/soft) */
+  /* Functional color tokens (dark mode — pastel/soft de significado direto) */
   --error-pastel: #FCA5A5;
-  --error-pastel-bg: #3B1C1C;
-  --warning-pastel: #FBBF24;
-  --warning-pastel-bg: rgba(69, 26, 3, 0.4);
+  --error-pastel-bg: rgba(239, 68, 68, 0.12);
+  --warning-pastel: #FCD34D;
+  --warning-pastel-bg: rgba(245, 158, 11, 0.12);
   --success-pastel: #6EE7B7;
-  --success-pastel-bg: #1A3A2A;
+  --success-pastel-bg: rgba(16, 185, 129, 0.12);
 
   --error-color: var(--error-pastel);
   --error-bg: var(--error-pastel-bg);
@@ -119,7 +247,7 @@ color-scheme: dark;
   --chart-excelente: #818CF8;
   --chart-aceitavel: #34D399;
   --chart-atencao: #FBBF24;
-  --chart-ruim: #F87171;
+  --chart-ruim: #EF5350;
 }
 
 
@@ -127,11 +255,96 @@ color-scheme: dark;
 *, *::before, *::after { box-sizing: border-box; }
 
 body {
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-family: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  font-weight: 400;
+  letter-spacing: -0.011em;
+  font-optical-sizing: auto;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   background-color: var(--color-surface-bg);
   color: var(--color-brand-primary);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+/* Readability guardrails for the dense dashboard. These intentionally tame
+   legacy utility combinations without changing component dimensions. */
+.font-black { font-weight: 700; }
+.font-extrabold { font-weight: 700; }
+.tracking-widest { letter-spacing: 0.055em; }
+.tracking-wider { letter-spacing: 0.035em; }
+.tracking-\[0\.2em\] { letter-spacing: 0.075em; }
+
+:where(.text-\[7px\], .text-\[8px\], .text-\[9px\], .text-\[10px\]) {
+  font-size: 0.6875rem;
+  line-height: 1.4;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  text-wrap: balance;
+}
+
+/* Keep branded actions calm and readable independently from accent text/icons. */
+.bg-brand-accent.text-white {
+  background-color: var(--action-primary-bg);
+  color: var(--action-primary-fg);
+}
+
+/* Authentication artwork is isolated from the logged-in application shell. */
+.auth-screen {
+  position: relative;
+  isolation: isolate;
+}
+
+.auth-screen::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -2;
+  background: url('/qualidadewp-login-wallpaper.png') center / cover no-repeat;
+  opacity: 0.32;
+  transform: scale(1.01);
+}
+
+.auth-screen::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(135deg, rgba(243, 246, 250, 0.78), rgba(243, 246, 250, 0.58));
+}
+
+.dark .auth-screen::before { opacity: 0.22; }
+.dark .auth-screen::after {
+  background: linear-gradient(135deg, rgba(17, 28, 47, 0.82), rgba(17, 28, 47, 0.68));
+}
+
+.auth-content { position: relative; z-index: 1; }
+.auth-card {
+  background-color: color-mix(in srgb, var(--surface-card) 94%, transparent);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 20px 55px -24px rgba(10, 31, 68, 0.38);
+}
+
+/* A aplicação é um app shell: a raiz ocupa exatamente a altura da janela
+   (h-screen + overflow-hidden em App.tsx) e todo o scroll acontece DENTRO
+   do painel de conteúdo. Sem fixar html/body/#root aqui, qualquer coisa
+   que ultrapasse 100vh — uma barra de rolagem horizontal, um portal de
+   toast, um elemento posicionado — dá ao body um scroll próprio, e o
+   usuário rola para além do painel encontrando só o fundo da página. */
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
 }
 
 /* ── Scrollbar ── */
@@ -148,6 +361,15 @@ body {
 .thin-scrollbar::-webkit-scrollbar-thumb:hover,
 .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: var(--color-brand-accent); }
 
+/* ── Shimmer Loading Animation ── */
+@keyframes shimmer-sweep {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+.animate-shimmer {
+  animation: shimmer-sweep 2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
 input[type="date"],
 input[type="time"] {
   color-scheme: light;
@@ -161,6 +383,26 @@ html.dark input[type="time"] {
 html:not(.dark) input[type="date"],
 html:not(.dark) input[type="time"] {
   color-scheme: light !important;
+}
+
+/* ── Native Select & Option Color Scheme (Prevents white-on-white text in Dark Mode) ── */
+select,
+option {
+  color-scheme: light;
+}
+
+html.dark select,
+html.dark option {
+  color-scheme: dark;
+  background-color: var(--surface-card, #131A29);
+  color: var(--brand-primary, #F8FAFC);
+}
+
+html:not(.dark) select,
+html:not(.dark) option {
+  color-scheme: light !important;
+  background-color: #FFFFFF;
+  color: var(--brand-primary, #000000);
 }
 
 input[type="date"]::-webkit-calendar-picker-indicator {
@@ -182,7 +424,7 @@ input[type="date"]::-webkit-datetime-edit {
 /* ── Focus ring standardization ── */
 .focus-ring:focus {
   outline: none;
-  box-shadow: 0 0 0 2px #A7C0A5;
+  box-shadow: 0 0 0 2px var(--brand-highlight);
 }
 
 /* ── Animations ── */
@@ -201,7 +443,13 @@ input[type="date"]::-webkit-datetime-edit {
   50% { opacity: 0.7; }
 }
 
+@keyframes slide-in-right {
+  from { opacity: 0; transform: translateX(100%); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
 .animate-slide-in-up { animation: slide-in-up 0.3s ease-out forwards; }
+.animate-slide-in-right { animation: slide-in-right 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
 .animate-fade-in { animation: fade-in 0.2s ease-out forwards; }
 .animate-pulse-soft { animation: pulse-soft 2s ease-in-out infinite; }
 
@@ -275,13 +523,40 @@ select {
 .bg-functional-success { background-color: var(--success-bg); }
 
 /* ── Icon background tokens (theme-aware, light bg for dark text) ── */
-.bg-icon-highlight { background-color: #E8F0E7; }
-.bg-icon-accent { background-color: #E8EBE3; }
-.bg-icon-primary { background-color: #E2E4D8; }
+/* Acao primaria de marca (ver tokens em :root) */
+.action-primary {
+  background-color: var(--action-primary-bg);
+  color: var(--action-primary-fg);
+  box-shadow: 0 2px 8px -1px rgba(217, 35, 42, 0.35);
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  cursor: pointer;
+}
+.action-primary:hover:not(:disabled) {
+  filter: brightness(1.06);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px -1px rgba(217, 35, 42, 0.45);
+}
+.action-primary:active:not(:disabled) {
+  transform: translateY(0) scale(0.98);
+}
 
-.dark .bg-icon-highlight { background-color: #2A3529; }
-.dark .bg-icon-accent { background-color: #2A2D24; }
-.dark .bg-icon-primary { background-color: #3D4136; }
+.bg-icon-highlight { background-color: #FBE4E4; }
+.bg-icon-accent { background-color: #FBE4E4; }
+.bg-icon-primary { background-color: #E8ECF3; }
+
+.dark .bg-icon-highlight { background-color: #35161A; }
+.dark .bg-icon-accent { background-color: #35161A; }
+.dark .bg-icon-primary { background-color: #203252; }
+
+/* O Edge injeta um botão próprio de revelar senha (e um "x" de limpar)
+   dentro de todo input[type="password"]. Como a aplicação já tem o seu
+   próprio botão de olho (Eye/EyeOff em App.tsx), o nativo aparecia como um
+   segundo ícone duplicado. Só afeta Edge/IE — nos demais navegadores estes
+   pseudo-elementos não existem e a regra é inerte. */
+input[type="password"]::-ms-reveal,
+input[type="password"]::-ms-clear {
+  display: none;
+}
 
 /* ── Universal SaaS Input & Textarea Standards (Light & Dark Mode) ── */
 input[type="text"],
@@ -308,8 +583,8 @@ input[type="time"],
 input[type="date"],
 textarea {
   background-color: #FFFFFF !important;
-  border: 1px solid #E2E4D8 !important; /* border-slate-200 / surface-border */
-  color: #0F172A !important; /* text-slate-900 */
+  border: 1px solid var(--surface-border) !important;
+  color: #000000 !important; /* text-black */
 }
 
 input[type="text"]::placeholder,
@@ -320,7 +595,7 @@ input[type="search"]::placeholder,
 input[type="time"]::placeholder,
 input[type="date"]::placeholder,
 textarea::placeholder {
-  color: #94A3B8 !important; /* text-slate-400 */
+  color: #475569 !important; /* text-slate-600 para alta legibilidade */
 }
 
 /* Dark mode overrides */
@@ -332,9 +607,9 @@ textarea::placeholder {
 .dark input[type="time"],
 .dark input[type="date"],
 .dark textarea {
-  background-color: #1A1C16 !important; /* dark:bg-surface-bg */
-  border: 1px solid #3D4136 !important; /* dark:border-surface-border */
-  color: #F9F9F6 !important; /* text-brand-primary */
+  background-color: var(--surface-subtle) !important;
+  border: 1px solid var(--surface-border) !important;
+  color: var(--brand-primary) !important;
 }
 
 .dark input[type="text"]::placeholder,
@@ -345,7 +620,7 @@ textarea::placeholder {
 .dark input[type="time"]::placeholder,
 .dark input[type="date"]::placeholder,
 .dark textarea::placeholder {
-  color: rgba(163, 166, 154, 0.5) !important; /* dark:placeholder-brand-muted/50 */
+  color: #64748B !important; /* text-slate-500 */
 }
 
 /* Focus States */
@@ -370,8 +645,8 @@ textarea:focus {
 .dark input[type="time"]:focus,
 .dark input[type="date"]:focus,
 .dark textarea:focus {
-  border-color: #475569 !important; /* focus:border-slate-600 */
-  box-shadow: 0 0 0 1px #475569 !important; /* focus:ring-slate-600 */
+  border-color: #38BDF8 !important; /* focus:border-sky-400 */
+  box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.4) !important; /* focus:ring-sky-400/40 */
 }
 
 /* Specific exceptions to keep transparent bg and border-none working despite the global override */
@@ -423,3 +698,35 @@ input[type="date"].bg-transparent:focus {
   box-shadow: none !important;
   outline: none !important;
 }
+
+/* ── Theme-Adaptive High-Contrast Typography ── */
+html:not(.dark) {
+  --brand-primary: #000000;
+  --brand-muted: #334155;
+}
+
+html:not(.dark) body {
+  color: #000000;
+}
+
+html.dark {
+  --brand-primary: #F8FAFC;
+  --brand-muted: #94A3B8;
+}
+
+html.dark body {
+  color: #F8FAFC;
+}
+
+/* ── Mobile Safe Area & Touch UX Utilities ── */
+.pb-safe {
+  padding-bottom: max(1rem, env(safe-area-inset-bottom, 1rem));
+}
+.pt-safe {
+  padding-top: max(0.5rem, env(safe-area-inset-top, 0.5rem));
+}
+.touch-callout-none {
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+

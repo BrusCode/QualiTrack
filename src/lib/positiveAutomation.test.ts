@@ -1,0 +1,80 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { fetchPositiveAutomation, mergePositiveAutomation, positiveAutomationLabel, type PositiveAutomationItem } from './positiveAutomation';
+import { activeMonitoriaTicketIds } from './activeMonitoriaTickets';
+
+vi.mock('./supabase',()=>({isMockMode:true,supabase:null}));
+const row: PositiveAutomationItem = {
+  ticket_id:'123',status:'blocked',last_error:'Confira o agente cadastrado.',
+  ticket_snapshot:{ticket_id:'123',subject:'Positiva preservada',status:'solved',ticket_date:'2026-10-07',csat_status:'good'},
+};
+
+describe('durable positive automation queue',()=>{
+  beforeEach(()=>localStorage.clear());
+  it('retains pending/blocked solved items in mock mode and omits completed items',async()=>{
+    localStorage.setItem('qualitrack-positive-ai-queue',JSON.stringify([row,{...row,ticket_id:'456',status:'completed'}]));
+    expect(await fetchPositiveAutomation()).toEqual([row]);
+  });
+  it('restores a captured ticket even when Zendesk returns no rows',()=>{
+    expect(mergePositiveAutomation([], [row],new Set())).toEqual([expect.objectContaining({ticket_id:'123',status:'solved',
+      positive_automation:{status:'blocked',last_error:'Confira o agente cadastrado.'}})]);
+  });
+  it('deduplicates a live ticket and keeps its newest UI metadata',()=>{
+    const live={...row.ticket_snapshot,subject:'Assunto atualizado',positive_cap_reached:true};
+    const result=mergePositiveAutomation([live],[row],new Set());
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({subject:'Assunto atualizado',positive_cap_reached:true,positive_automation:{status:'blocked'}});
+  });
+  it('does not resurrect a saved monitoria and drops completed automation after polling',()=>{
+    expect(mergePositiveAutomation([], [row],new Set(['123']))).toEqual([]);
+    const previous=mergePositiveAutomation([], [row],new Set());
+    expect(mergePositiveAutomation(previous,[],new Set())).toEqual([]);
+  });
+  it('honors search and labels pending without inventing a low score',()=>{
+    expect(mergePositiveAutomation([], [row],new Set(),'outro')).toEqual([]);
+    expect(mergePositiveAutomation([], [row],new Set(),'preservada')).toHaveLength(1);
+    expect(positiveAutomationLabel('blocked')).toBe('Automação aguardando conferência');
+    expect(positiveAutomationLabel('pending')).toBe('Salvo · aguardando IA');
+  });
+  it('keeps child intake separate and restores a solved child review',async()=>{
+    localStorage.setItem('qualitrack-child-ai-queue',JSON.stringify([row]));
+    expect(await fetchPositiveAutomation()).toEqual([]);
+    expect(await fetchPositiveAutomation('filhos')).toEqual([row]);
+    const children=mergePositiveAutomation([], [row],new Set(),undefined,'filhos');
+    expect(children[0]).toMatchObject({status:'solved',child_automation:{status:'blocked'}});
+    expect(children[0].positive_automation).toBeUndefined();
+    expect(mergePositiveAutomation(children,[],new Set(),undefined,'filhos')).toEqual([]);
+  });
+  it('keeps a child ticket awaiting review when it already has a monitoria',()=>{
+    const underReview={...row.ticket_snapshot,already_audited:true,monitoria_status:'pendente_revisao' as const};
+    expect(mergePositiveAutomation([underReview],[],new Set(['123']),undefined,'filhos'))
+      .toEqual([underReview]);
+    expect(mergePositiveAutomation([underReview],[],new Set(['123']),undefined,'positivas'))
+      .toEqual([]);
+  });
+  it('hides closed snapshots without deleting the saved automation', async () => {
+    const closed = { ...row, ticket_snapshot: { ...row.ticket_snapshot, status: 'closed' } };
+    localStorage.setItem('qualitrack-positive-ai-queue', JSON.stringify([closed]));
+    expect(await fetchPositiveAutomation()).toEqual([]);
+    expect(mergePositiveAutomation([], [closed], new Set())).toEqual([]);
+    expect(mergePositiveAutomation([closed.ticket_snapshot], [], new Set())).toEqual([]);
+  });
+  it('shows closed child reviews and blocks, but keeps closed pending intake hidden', async () => {
+    const closed = { ...row, ticket_snapshot: { ...row.ticket_snapshot, status: 'closed' } };
+    const review: PositiveAutomationItem = { ...closed, ticket_id: '176473', status: 'review_required' };
+    const pending: PositiveAutomationItem = { ...closed, ticket_id: '176647', status: 'pending' };
+    localStorage.setItem('qualitrack-child-ai-queue', JSON.stringify([closed, review, pending]));
+    expect((await fetchPositiveAutomation('filhos')).map(item => item.ticket_id)).toEqual(['123', '176473']);
+    expect(mergePositiveAutomation([], [closed, review, pending], new Set(), undefined, 'filhos').map(ticket => ticket.ticket_id))
+      .toEqual(['123', '176473']);
+  });
+  it('shows ticket 182786 again after its monitoria was removed', () => {
+    const audited = activeMonitoriaTicketIds([
+      { ticket_id: '182786', active: false },
+      { ticket_id: '180330', active: true },
+    ]);
+    const live = { ...row.ticket_snapshot, ticket_id: '182786', status: 'solved' };
+    expect([...audited]).toEqual(['180330']);
+    expect(mergePositiveAutomation([live], [], audited, undefined, 'filhos'))
+      .toEqual([live]);
+  });
+});

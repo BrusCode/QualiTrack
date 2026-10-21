@@ -1,0 +1,94 @@
+import { AIModelError, httpAIError, normalizeAIError } from './ai-fallback.ts';
+
+// Cadeia paga em ordem de custo/capacidade para prompts longos de tickets.
+export const OPENROUTER_MODEL = 'z-ai/glm-5.3-flash';
+export const OPENROUTER_FALLBACK_MODELS = [
+  'google/gemma-4-31b-it',
+] as const;
+export const OPENROUTER_FREE_FALLBACK_MODELS = [
+  'poolside/laguna-s-2.1:free',
+  'minimax/minimax-m3.1-flash:free',
+  'google/gemma-4-31b-it:free',
+] as const;
+export const OPENROUTER_FALLBACK_MODEL = OPENROUTER_FALLBACK_MODELS[0];
+// Sem um teto, o OpenRouter reserva até 131.072 tokens de saída para o GLM e
+// pode devolver HTTP 402 mesmo quando a ficha costuma usar muito menos.
+export const OPENROUTER_EVALUATION_MAX_TOKENS = 12_000;
+// Guarda contra requisição pendurada: só estoura se a IA realmente não retornar.
+export const OPENROUTER_HANG_GUARD_MS = 120_000;
+
+interface OpenRouterResponse {
+  id?: string;
+  model?: string;
+  usage?: { prompt_tokens?: number; completion_tokens?: number; cost?: number };
+  choices?: Array<{ message?: { content?: string | Array<{ text?: string }> } }>;
+  openrouter_metadata?: {
+    attempt?: number;
+    endpoints?: { available?: Array<{ provider?: string; selected?: boolean }> };
+  };
+}
+
+export async function callOpenRouter(options: {
+  prompt: string;
+  responseSchema: unknown;
+  apiKey?: string;
+  model?: string;
+  maxTokens?: number;
+  signal?: AbortSignal;
+  fetcher?: typeof fetch;
+}): Promise<{ text: string; model?: string; routedProvider?: string; routerAttempt?: number; requestId?: string; promptTokens?: number; completionTokens?: number; cost?: number }> {
+  const { prompt, responseSchema, apiKey, model = OPENROUTER_MODEL,
+    maxTokens = model.endsWith(':free') ? 4_096 : OPENROUTER_EVALUATION_MAX_TOKENS, signal, fetcher = fetch } = options;
+  if (!apiKey) throw new AIModelError('OPENROUTER_API_KEY não configurada.', 'credentials_error', false, 'provider');
+  if (!/^[a-zA-Z0-9._:-]+\/[a-zA-Z0-9._:-]+$/.test(model))
+    throw new AIModelError('Modelo não permitido.', 'request_configuration_error', false, 'global');
+
+  const response = await fetcher('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+      'X-OpenRouter-Metadata': 'enabled',
+      'HTTP-Referer': 'https://qualitrack.app',
+      'X-OpenRouter-Title': 'WP Qualidade',
+    },
+    body: JSON.stringify({
+      model,
+      // O schema no prompt é validado após a resposta pela aplicação.
+      messages: [{
+        role: 'user',
+        content: `${prompt}
+
+Responda SOMENTE com um objeto JSON válido (sem markdown, sem texto extra) que siga exatamente este JSON Schema:
+${JSON.stringify(responseSchema)}`,
+      }],
+      ...(maxTokens ? { max_tokens: maxTokens } : {}),
+      provider: { allow_fallbacks: true, sort: 'throughput' },
+    }),
+    signal: signal || AbortSignal.timeout(OPENROUTER_HANG_GUARD_MS),
+  });
+  if (!response.ok) throw await httpAIError('openrouter', model, response);
+
+  let data: OpenRouterResponse;
+  try {
+    data = await response.json() as OpenRouterResponse;
+  } catch (error) {
+    const normalized = normalizeAIError(error);
+    if (normalized.reason === 'timeout' || normalized.reason === 'network_error') throw normalized;
+    throw new AIModelError('OpenRouter retornou um envelope JSON inválido.', 'response_parse_error', true);
+  }
+  if (!data.model) throw new AIModelError('OpenRouter não confirmou o modelo esperado.', 'incomplete_response', true);
+  const content = data.choices?.[0]?.message?.content;
+  const text = typeof content === 'string' ? content : Array.isArray(content)
+    ? content.map(part => part.text || '').join('') : '';
+  if (!text.trim()) throw new AIModelError('OpenRouter retornou resposta vazia.', 'empty_response', true);
+  const routedProvider = data.openrouter_metadata?.endpoints?.available?.find(endpoint => endpoint.selected)?.provider;
+  const routerAttempt = data.openrouter_metadata?.attempt;
+  return {
+    text, model: data.model, routedProvider, routerAttempt,
+    requestId: response.headers.get('x-generation-id') || data.id,
+    promptTokens: data.usage?.prompt_tokens,
+    completionTokens: data.usage?.completion_tokens,
+    cost: data.usage?.cost,
+  };
+}

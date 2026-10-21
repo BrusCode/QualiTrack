@@ -2,6 +2,9 @@ import { useEffect, useRef, useCallback } from 'react';
 import { supabase, isMockMode } from '../lib/supabase';
 import { useTheme, resolveSystemTheme, applyThemeToDOM } from '../providers/ThemeProvider';
 import { toast } from 'sonner';
+import { endCurrentPresenceSession } from '../lib/presence';
+import { clearPrivateDrafts } from '../lib/sessionSecurity';
+import { queryClient } from '../lib/queryClient';
 
 export const IDLE_TIMEOUT_MS = 60 * 60 * 1000;
 const IDLE_WARNING_MS = 5 * 60 * 1000;
@@ -66,24 +69,31 @@ export function useSessionManager(opts: SessionManagerOptions) {
     const sb = supabase!;
     let reconnectInterval: ReturnType<typeof setInterval> | null = null;
     let wasOffline = false;
+    let pendingPing: Promise<boolean> | null = null;
 
-    const pingSupabase = async (): Promise<boolean> => {
-      try {
+    const pingSupabase = (): Promise<boolean> => {
+      if (pendingPing) return pendingPing;
+      pendingPing = (async () => {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5000);
-        const { error } = await sb.from('users').select('id').limit(1).abortSignal(controller.signal);
-        clearTimeout(timeout);
+        const timeout = setTimeout(() => controller.abort(), 20000);
+        try {
+          const { error } = await sb.from('users').select('id').limit(1).abortSignal(controller.signal);
 
-        if (error && error.message !== 'JWT expired') {
-          console.warn('[System] Ping falhou, erro retornado pelo DB:', error);
-          if (error.code === 'PGRST301' || error.message.includes('auth')) return true;
-          throw error;
+          if (error && error.message !== 'JWT expired') {
+            console.warn('[System] Ping falhou, erro retornado pelo DB:', error);
+            if (error.code === 'PGRST301' || error.message.includes('auth')) return true;
+            throw error;
+          }
+          return true;
+        } catch (e: any) {
+          console.error('[System] Ping catch error:', e.message || e);
+          return false;
+        } finally {
+          clearTimeout(timeout);
         }
-        return true;
-      } catch (e: any) {
-        console.error('[System] Ping catch error:', e.message || e);
-        return false;
-      }
+      })();
+      void pendingPing.finally(() => { pendingPing = null; });
+      return pendingPing;
     };
 
     const handleOnlineStatusChange = async (online: boolean) => {
@@ -182,24 +192,44 @@ export function useSessionManager(opts: SessionManagerOptions) {
     let idleTimerId: NodeJS.Timeout;
     let warningIntervalId: NodeJS.Timeout;
     let lastActivity = Number(localStorage.getItem(LAST_ACTIVITY_KEY)) || Date.now();
+    let ending = false;
 
     const forceLogout = async (reason: string) => {
+      if (ending) return;
+      ending = true;
+      clearTimeout(idleTimerId);
+      clearInterval(warningIntervalId);
       setShowIdleWarning(false);
       setAppReady(false);
+      clearPrivateDrafts(currentUser.id);
+      queryClient.clear();
+      setCurrentUser(null);
+      setUserData(null);
+      setAuthView('login');
       localStorage.removeItem(MOCK_SESSION_KEY);
       localStorage.removeItem(LAST_ACTIVITY_KEY);
-      // Don't reset theme/sidebar_color preferences on force logout
+      // Theme preference remains stored per user.
       lastDbThemeRef.current = null;
       prevUserIdRef.current = null;
       if (!isMockMode && supabase) {
         isCleaningSessionRef.current = true;
-        await supabase.auth.signOut();
+        try {
+          await endCurrentPresenceSession();
+        } catch (error) {
+          console.warn('[Session] Falha ao encerrar presença expirada:', error);
+        }
+        await supabase.auth.signOut({ scope: 'local' }).catch(() => undefined);
       }
       setCurrentUser(null);
       setUserData(null);
       setAuthView('login');
       sessionStartTimeRef.current = null;
       toast.error(reason);
+    };
+    const enforceAbsoluteTimeout = () => {
+      if (!checkAbsoluteTimeout()) return false;
+      void forceLogout('Sessão encerrada após 8 horas contínuas. Faça login novamente.');
+      return true;
     };
 
     const idleElapsed = Date.now() - lastActivity;
@@ -227,7 +257,7 @@ export function useSessionManager(opts: SessionManagerOptions) {
       setShowIdleWarning(false);
 
       idleTimerId = setTimeout(() => {
-        if (checkAbsoluteTimeout()) return;
+        if (enforceAbsoluteTimeout()) return;
 
         setShowIdleWarning(true);
         setIdleCountdown(Math.ceil(IDLE_WARNING_MS / 1000));
@@ -236,7 +266,7 @@ export function useSessionManager(opts: SessionManagerOptions) {
           setIdleCountdown(prev => {
             if (prev <= 1) {
               clearInterval(warningIntervalId);
-              if (checkAbsoluteTimeout()) return 0;
+              if (enforceAbsoluteTimeout()) return 0;
               forceLogout('Sessão encerrada por inatividade (60 minutos). Faça login novamente.');
               return 0;
             }
@@ -247,6 +277,7 @@ export function useSessionManager(opts: SessionManagerOptions) {
     };
 
     const handleUserActivity = () => {
+      if (ending || enforceAbsoluteTimeout()) return;
       const now = Date.now();
       if (now - lastActivity < 1000) return;
       lastActivity = now;
@@ -266,8 +297,13 @@ export function useSessionManager(opts: SessionManagerOptions) {
     // Note: visibilitychange is handled in the first useEffect (consolidated)
 
     startIdleTimer();
+    const absoluteTimer = setTimeout(() => { enforceAbsoluteTimeout(); },
+      Math.max(0, ABSOLUTE_TIMEOUT_MS - (Date.now() - (sessionStartTimeRef.current ?? Date.now()))));
+    document.addEventListener('visibilitychange', enforceAbsoluteTimeout);
 
     return () => {
+      clearTimeout(absoluteTimer);
+      document.removeEventListener('visibilitychange', enforceAbsoluteTimeout);
       clearTimeout(idleTimerId);
       clearInterval(warningIntervalId);
       events.forEach(event => document.removeEventListener(event, handleUserActivity));

@@ -1,4 +1,12 @@
 
+# Active authenticated functions validate the user token explicitly with
+# Auth getUser(token) and check the active role before privileged operations.
+# This supports both legacy and new project signing/API keys.
+[functions.helpdesk-publish-evaluation]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/helpdesk-publish-evaluation/index.ts"
+
 [functions.admin-create-user]
 enabled = true
 verify_jwt = true
@@ -12,11 +20,67 @@ entrypoint = "./functions/admin-create-user/index.ts"
 
 [functions.admin-invite-user]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/admin-invite-user/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
 entrypoint = "./functions/admin-invite-user/index.ts"
+
+[functions.admin-end-user-session]
+enabled = true
+# A função valida o token e o papel explicitamente para permitir mensagens
+# de erro claras e evitar depender de chaves JWT legadas.
+verify_jwt = false
+entrypoint = "./functions/admin-end-user-session/index.ts"
 # Specifies static files to be bundled with the function. Supports glob patterns.
 # For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/admin-invite-user/*.html" ]
+
+[functions.admin-update-user-email]
+enabled = true
+verify_jwt = false
+import_map = "./functions/admin-update-user-email/deno.json"
+entrypoint = "./functions/admin-update-user-email/index.ts"
+[functions.send-email]
+enabled = true
+# JWT is validated explicitly with getUser(token), including new signing keys.
+verify_jwt = false
+entrypoint = "./functions/send-email/index.ts"
+
+[functions.public-access]
+enabled = true
+# Intentionally public; validates CAPTCHA and persistent rate limits internally.
+verify_jwt = false
+entrypoint = "./functions/public-access/index.ts"
+
+[functions.helpdesk-queue]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/helpdesk-queue/index.ts"
+
+[functions.legacy-zendesk-closure-sync]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/legacy-zendesk-closure-sync/index.ts"
+
+[functions.qwp-closure-window]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/qwp-closure-window/index.ts"
+
+[functions.zendesk-closure-policy-admin]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/zendesk-closure-policy-admin/index.ts"
+
+[functions.helpdesk-webhook]
+enabled = true
+# Zendesk authenticates with HELPDESK_WEBHOOK_SECRET inside the function.
+verify_jwt = false
+entrypoint = "./functions/helpdesk-webhook/index.ts"
+
+[functions.zendesk-agent-webhook]
+enabled = true
+# Zendesk signs each raw request; the function verifies HMAC and rechecks the user role.
+verify_jwt = false
+entrypoint = "./functions/zendesk-agent-webhook/index.ts"

@@ -1,3 +1,6 @@
+import { PageSkeleton } from './components/ui/PageSkeleton';
+import { userCacheScope } from './lib/pageCache';
+import { ProtectedAuthForm } from './components/ui/ProtectedAuthForm';
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -6,24 +9,67 @@
 import React, { useEffect, useState } from 'react';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { queryClient } from './lib/queryClient';
-import { Layout, LayoutDashboard as DashboardIcon, ClipboardCheck, Settings, LogOut, ChevronRight, ChevronLeft, ChevronDown, Check, Palette, Search, Plus, User as UserIcon, Clock, Sun, Moon, Users, X, Monitor, AlertTriangle, BarChart3 } from 'lucide-react';
+import { Layout, LayoutDashboard as DashboardIcon, ClipboardCheck, Settings, LogOut, ChevronRight, ChevronLeft, ChevronDown, Search, Plus, User as UserIcon, Clock, Sun, Moon, Users, X, Monitor, AlertTriangle, BarChart3, Eye, EyeOff, Layers, Bell, CheckCheck, Mail, MailOpen, BookOpen, Sparkles, Brain, Menu, MessageSquare, Award, Trash2 } from 'lucide-react';
 import { m, AnimatePresence } from 'motion/react';
 import { format as formatDate } from 'date-fns';
 import { ptBR } from 'date-fns/locale';
 import { Toaster, toast } from 'sonner';
-import { User, ROLE_LABELS, UserRole } from './types';
+import { User, ROLE_LABELS, UserRole, AIEvaluationGuideline, QueueSubTab, AuditingQueueType } from './types';
 import { QualityConfigProvider } from './lib/useQualityConfig';
 import { StaticDataProvider, useStaticData } from './lib/StaticDataContext';
-import { ThemeProvider, useTheme, resolveSystemTheme, applyThemeToDOM, type Theme } from './providers/ThemeProvider';
+import { ThemeProvider, useTheme } from './providers/ThemeProvider';
 import { AuthProvider, useAuth } from './providers/AuthProvider';
+import { PresenceProvider } from './providers/PresenceProvider';
 import { useSidebarManager } from './hooks/useSidebarManager';
+import { useMonitoriaIndex } from './hooks/useMonitoriaIndex';
+import { useMonitoriaNotifications } from './hooks/useMonitoriaNotifications';
+import { useFeedbacks } from './hooks/useFeedbacks';
+import { useQueueEventNotifications } from './hooks/useQueueEventNotifications';
+import { useNotificationPreferences } from './hooks/useNotificationPreferences';
+import type { NotificationKind } from './lib/notificationPreferences';
+import { supabase } from './lib/supabase';
+import { fetchAIGuidelines } from './lib/aiGuidelines';
+import { fetchQueuePendingCounts, type QueueBadgeCounts } from './lib/helpdeskQueue';
+import { releaseQueueTicketAssignment, canManageQueueAssignments } from './lib/queueDistribution';
+import { getContestationNotifications } from './lib/contestationNotifications';
+import { canAuditTickets } from './lib/auditPermissions';
+import { isChildTicketMonitoria } from './lib/childTicketForm';
+import type { AdminSubTab } from './components/AdminPanel';
+
+export const QUEUE_TITLES: Record<QueueSubTab, string> = {
+  negativas: 'CSAT Negativas',
+  proativas: 'Fila Proativa',
+  positivas: 'CSAT Positivas',
+  filhos: 'Chamados Filhos',
+  filhos_invalidos: 'Filhos Inválidos',
+  monitores: 'Monitores na Triagem',
+};
+
+export const QUEUE_SUBTITLES: Record<QueueSubTab, string> = {
+  negativas: 'Triagem inteligente de atendimentos com CSAT Ruim ou Insatisfeito',
+  proativas: 'Identificação e auditoria antecipada de casos de risco operacional',
+  positivas: 'Reconhecimento e análise de atendimentos com CSAT Bom ou Excelente',
+  filhos: 'Auditoria de tickets vinculados e demandas de apoio entre equipes',
+  filhos_invalidos: 'Validação e saneamento de chamados filhos fora do padrão',
+  monitores: 'Gestão de presença, elegibilidade e distribuição de chamados da equipe',
+};
+
+const EMPTY_QUEUE_COUNTS: QueueBadgeCounts = {
+  negativas: null, proativas: null, positivas: null, filhos: null, filhos_invalidos: null,
+};
+
+import { lazyWithRetry } from './utils/lazyWithRetry';
 
 // Components
-const DashboardMain = React.lazy(() => import('./components/dashboard/DashboardMain'));
-const MonitoriaList = React.lazy(() => import('./components/MonitoriaList'));
-const MonitoriaForm = React.lazy(() => import('./components/MonitoriaForm'));
-const AdminPanel = React.lazy(() => import('./components/AdminPanel'));
-const CustomDashboardManagement = React.lazy(() => import('./components/CustomDashboardManagement'));
+const DashboardMain = lazyWithRetry(() => import('./components/dashboard/DashboardMain'));
+const MonitoriaList = lazyWithRetry(() => import('./components/MonitoriaList'));
+const MonitoriaForm = lazyWithRetry(() => import('./components/MonitoriaForm'));
+const AdminPanel = lazyWithRetry(() => import('./components/AdminPanel'));
+const CustomDashboardManagement = lazyWithRetry(() => import('./components/CustomDashboardManagement'));
+const AuditingQueueView = lazyWithRetry(() => import('./components/AuditingQueueView'));
+const InPlaceMonitoriaModal = lazyWithRetry(() => import('./components/InPlaceMonitoriaModal'));
+const CommandPaletteModal = lazyWithRetry(() => import('./components/CommandPaletteModal'));
+const NewMonitoriaModal = lazyWithRetry(() => import('./components/NewMonitoriaModal'));
 
 export default function App() {
   return (
@@ -38,6 +84,7 @@ export default function App() {
 }
 
 function AppContent() {
+  const { resolvedTheme } = useTheme();
   const {
     currentUser,
     userData,
@@ -57,7 +104,6 @@ function AppContent() {
     setResetEmail,
     isExistingRequest,
     setIsExistingRequest,
-    prefetchedSidebarColor,
     activeTab,
     setActiveTab,
     handleLogin,
@@ -74,17 +120,24 @@ function AppContent() {
     setIsFormOpen,
     isSidebarOpen,
     setIsSidebarOpen,
-    sidebarColor,
-    setSidebarColor,
-    sidebarContrastClass,
-    sidebarContrastSubtle,
-    sidebarIsDark,
     loadingPreferences,
+    maintenanceNotice,
   } = useAuth();
+  const [adminMaintenanceAcknowledged, setAdminMaintenanceAcknowledged] = useState(false);
+  useEffect(() => {
+    setAdminMaintenanceAcknowledged(false);
+  }, [userData?.id, maintenanceNotice?.adminNotice]);
+
+  // Alternar visibilidade da senha. Cada campo tem seu proprio estado para
+  // que revelar um nao exponha os demais (ex.: na tela de nova senha, ver a
+  // senha digitada sem revelar a confirmacao).
+  const [showLoginPassword, setShowLoginPassword] = useState(false);
+  const [showNewPassword, setShowNewPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
 
   return (
     <>
-      <Toaster position="top-right" richColors />
+      <Toaster position="top-right" richColors closeButton duration={2500} />
       <AnimatePresence>
         {showIdleWarning && currentUser && (
           <m.div
@@ -144,16 +197,22 @@ function AppContent() {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -15 }}
             transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-            className="h-screen w-screen flex flex-col items-center justify-center bg-surface-bg p-6 text-brand-primary"
+            className="auth-screen h-dvh w-screen flex flex-col items-center overflow-y-auto bg-surface-bg px-4 py-6 sm:p-6 text-brand-primary"
           >
-            <div className="max-w-md w-full text-center space-y-8">
-              <h1 className="text-5xl font-bold tracking-tight text-brand-primary">QualiTrack</h1>
-              <div className="bg-surface-card p-8 rounded-[40px] border border-surface-border shadow-premium min-h-[400px] flex flex-col justify-center">
+            <div className="auth-content max-w-md w-full text-center space-y-5 sm:space-y-8 my-auto">
+              <div className="flex justify-center items-center">
+                <img
+                  src={resolvedTheme === 'light' ? '/logo-light.png' : '/logo-login.png'}
+                  alt="Qualidade WP"
+                  className="h-12 md:h-14 w-auto max-w-[280px] sm:max-w-[340px] object-contain drop-shadow-md select-none"
+                />
+              </div>
+              <div className="auth-card bg-surface-card p-5 sm:p-8 rounded-[28px] sm:rounded-[40px] border border-surface-border shadow-premium min-h-[400px] flex flex-col justify-center">
                 <AnimatePresence mode="wait">
                   {authView === 'login' && (
                     <m.div key="login" initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }} className="space-y-6">
                       <h3 className="text-xl font-bold text-center mb-6">Acesse sua Conta</h3>
-                      <form onSubmit={handleLogin} className="space-y-4 text-left">
+                      <ProtectedAuthForm onSubmit={handleLogin} className="space-y-4 text-left">
                         <div>
                           <label className="block text-xs font-semibold text-brand-muted uppercase mb-2">E-mail corporativo</label>
                           <input type="email" required className="w-full bg-surface-subtle border border-surface-border rounded-lg py-3 px-4 text-sm focus:border-brand-accent focus:outline-none text-brand-primary" value={credentials.email} onChange={e => setCredentials({...credentials, email: e.target.value})} />
@@ -163,12 +222,30 @@ function AppContent() {
                             <label className="block text-xs font-semibold text-brand-muted uppercase mb-2">Senha</label>
                             <button type="button" onClick={() => setAuthView('forgot-password')} className="text-[10px] font-bold text-brand-accent hover:text-brand-primary transition-colors">Esqueci a senha</button>
                           </div>
-                          <input type="password" required className="w-full bg-surface-subtle border border-surface-border rounded-lg py-3 px-4 text-sm focus:border-brand-accent focus:outline-none text-brand-primary" value={credentials.password} onChange={e => setCredentials({...credentials, password: e.target.value})} />
+                          <div className="relative">
+                            <input
+                              type={showLoginPassword ? 'text' : 'password'}
+                              required
+                              className="w-full bg-surface-subtle border border-surface-border rounded-lg py-3 pl-4 pr-12 text-sm focus:border-brand-accent focus:outline-none text-brand-primary"
+                              value={credentials.password}
+                              onChange={e => setCredentials({...credentials, password: e.target.value})}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => setShowLoginPassword(v => !v)}
+                              aria-label={showLoginPassword ? 'Ocultar senha' : 'Mostrar senha'}
+                              aria-pressed={showLoginPassword}
+                              title={showLoginPassword ? 'Ocultar senha' : 'Mostrar senha'}
+                              className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-brand-muted hover:text-brand-primary transition-colors"
+                            >
+                              {showLoginPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                            </button>
+                          </div>
                         </div>
                         <button className="w-full bg-brand-accent text-white py-4 rounded-lg font-bold uppercase tracking-wider shadow-lg hover:bg-brand-accent/90 active:scale-[0.98] transition-all flex items-center justify-center">
                           <span className="text-white">Entrar</span>
                         </button>
-                      </form>
+                      </ProtectedAuthForm>
                       <button onClick={() => setAuthView('request-access')} className="text-sm font-bold text-brand-accent hover:text-brand-primary transition-colors">Não tem acesso? Solicite aqui</button>
                     </m.div>
                   )}
@@ -176,7 +253,7 @@ function AppContent() {
                   {authView === 'request-access' && (
                     <m.div key="request" initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }} className="space-y-6 text-left">
                       <h3 className="text-xl font-bold text-center mb-6 text-brand-primary">Solicitar Novo Acesso</h3>
-                      <form onSubmit={handleRequestAccess} className="space-y-4">
+                      <ProtectedAuthForm onSubmit={handleRequestAccess} className="space-y-4">
                         <div>
                           <label className="block text-xs font-semibold text-brand-muted uppercase mb-2">Nome completo</label>
                           <input type="text" required className="w-full bg-surface-subtle border border-surface-border rounded-lg py-3 px-4 text-sm focus:border-brand-accent focus:outline-none text-brand-primary" value={requestData.name} onChange={e => setRequestData({...requestData, name: e.target.value})} />
@@ -189,7 +266,7 @@ function AppContent() {
                           <span className="text-white">Enviar Solicitação</span>
                         </button>
                         <button type="button" onClick={() => setAuthView('login')} className="w-full text-sm font-bold text-brand-muted hover:text-brand-primary transition-colors mt-2 text-center">Voltar para Login</button>
-                      </form>
+                      </ProtectedAuthForm>
                     </m.div>
                   )}
 
@@ -212,11 +289,48 @@ function AppContent() {
                       <form onSubmit={handleUpdatePassword} className="space-y-4">
                         <div>
                           <label className="block text-xs font-semibold text-brand-muted uppercase mb-2">Nova senha</label>
-                          <input type="password" required className="w-full bg-surface-subtle border border-surface-border rounded-lg py-3 px-4 text-sm focus:border-brand-accent focus:outline-none text-brand-primary" value={newPassword} onChange={e => setNewPassword(e.target.value)} placeholder="Mínimo 6 caracteres" />
+                          <div className="relative">
+                            <input
+                              type={showNewPassword ? 'text' : 'password'}
+                              required
+                              className="w-full bg-surface-subtle border border-surface-border rounded-lg py-3 pl-4 pr-12 text-sm focus:border-brand-accent focus:outline-none text-brand-primary"
+                              value={newPassword}
+                              onChange={e => setNewPassword(e.target.value)}
+                              placeholder="Mínimo 6 caracteres"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => setShowNewPassword(v => !v)}
+                              aria-label={showNewPassword ? 'Ocultar senha' : 'Mostrar senha'}
+                              aria-pressed={showNewPassword}
+                              title={showNewPassword ? 'Ocultar senha' : 'Mostrar senha'}
+                              className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-brand-muted hover:text-brand-primary transition-colors"
+                            >
+                              {showNewPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                            </button>
+                          </div>
                         </div>
                         <div>
                           <label className="block text-xs font-semibold text-brand-muted uppercase mb-2">Confirmar nova senha</label>
-                          <input type="password" required className="w-full bg-surface-subtle border border-surface-border rounded-lg py-3 px-4 text-sm focus:border-brand-accent focus:outline-none text-brand-primary" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} />
+                          <div className="relative">
+                            <input
+                              type={showConfirmPassword ? 'text' : 'password'}
+                              required
+                              className="w-full bg-surface-subtle border border-surface-border rounded-lg py-3 pl-4 pr-12 text-sm focus:border-brand-accent focus:outline-none text-brand-primary"
+                              value={confirmPassword}
+                              onChange={e => setConfirmPassword(e.target.value)}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => setShowConfirmPassword(v => !v)}
+                              aria-label={showConfirmPassword ? 'Ocultar senha' : 'Mostrar senha'}
+                              aria-pressed={showConfirmPassword}
+                              title={showConfirmPassword ? 'Ocultar senha' : 'Mostrar senha'}
+                              className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-brand-muted hover:text-brand-primary transition-colors"
+                            >
+                              {showConfirmPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                            </button>
+                          </div>
                         </div>
                         <button className="w-full bg-brand-accent text-white py-4 rounded-lg font-bold uppercase tracking-wider shadow-lg hover:bg-brand-accent/90 active:scale-[0.98] transition-all flex items-center justify-center">
                           <span className="text-white">Definir Nova Senha</span>
@@ -228,7 +342,7 @@ function AppContent() {
                   {authView === 'forgot-password' && (
                     <m.div key="forgot" initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }} className="space-y-6 text-left">
                       <h3 className="text-xl font-bold text-center mb-6 text-brand-primary">Recuperar Senha</h3>
-                      <form onSubmit={handleForgotPassword} className="space-y-4">
+                      <ProtectedAuthForm onSubmit={handleForgotPassword} className="space-y-4">
                         <div>
                           <label className="block text-xs font-semibold text-brand-muted uppercase mb-2">E-mail cadastrado</label>
                           <input type="email" required className="w-full bg-surface-subtle border border-surface-border rounded-lg py-3 px-4 text-sm focus:border-brand-accent focus:outline-none text-brand-primary" value={resetEmail} onChange={e => setResetEmail(e.target.value)} />
@@ -237,14 +351,14 @@ function AppContent() {
                           <span className="text-white">Enviar Link</span>
                         </button>
                         <button type="button" onClick={() => setAuthView('login')} className="w-full py-4 text-brand-muted font-bold hover:text-brand-primary transition-colors text-center">Voltar</button>
-                      </form>
+                      </ProtectedAuthForm>
                     </m.div>
                   )}
                 </AnimatePresence>
               </div>
             </div>
           </m.div>
-        ) : loadingPreferences || !appReady ? (
+        ) : loadingPreferences || !appReady || maintenanceNotice === undefined ? (
           <m.div
             key="app-transition"
             initial={{ opacity: 0 }}
@@ -265,6 +379,15 @@ function AppContent() {
               </div>
             )}
           </m.div>
+        ) : maintenanceNotice?.active ? (
+          <MaintenanceScreen expectedReturnAt={maintenanceNotice.expectedReturnAt} onLogout={() => void handleLogout()} />
+        ) : maintenanceNotice?.adminNotice && !adminMaintenanceAcknowledged ? (
+          <MaintenanceScreen
+            expectedReturnAt={maintenanceNotice.expectedReturnAt}
+            adminBypass
+            onContinue={() => setAdminMaintenanceAcknowledged(true)}
+            onLogout={() => void handleLogout()}
+          />
         ) : (
           <m.div
             key="app-main"
@@ -275,27 +398,57 @@ function AppContent() {
             className="h-screen w-full"
           >
             <QualityConfigProvider>
-              <StaticDataProvider>
-                <MainApp
-                  isSidebarOpen={isSidebarOpen}
-                  setIsSidebarOpen={setIsSidebarOpen}
-                  currentUser={currentUser}
-                  activeTab={activeTab}
-                  setActiveTab={setActiveTab}
-                  userData={userData}
-                  handleLogout={handleLogout}
-                  isFormOpen={isFormOpen}
-                  setIsFormOpen={setIsFormOpen}
-                  isSystemOnline={isSystemOnline}
-                  isReconnecting={isReconnecting}
-                  prefetchedSidebarColor={prefetchedSidebarColor}
-                />
+              <StaticDataProvider key={userCacheScope(userData)} user={userData}>
+                <PresenceProvider user={userData}>
+                  <MainApp
+                    isSidebarOpen={isSidebarOpen}
+                    setIsSidebarOpen={setIsSidebarOpen}
+                    currentUser={currentUser}
+                    activeTab={activeTab}
+                    setActiveTab={setActiveTab}
+                    userData={userData}
+                    handleLogout={handleLogout}
+                    isFormOpen={isFormOpen}
+                    setIsFormOpen={setIsFormOpen}
+                    isSystemOnline={isSystemOnline}
+                    isReconnecting={isReconnecting}
+                  />
+                </PresenceProvider>
               </StaticDataProvider>
             </QualityConfigProvider>
           </m.div>
         )}
       </AnimatePresence>
     </>
+  );
+}
+
+function MaintenanceScreen({ expectedReturnAt, onLogout, adminBypass = false, onContinue }: {
+  expectedReturnAt: string | null;
+  onLogout: () => void;
+  adminBypass?: boolean;
+  onContinue?: () => void;
+}) {
+  const returnLabel = expectedReturnAt
+    ? new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(expectedReturnAt))
+    : 'horário ainda não definido';
+
+  return (
+    <main className="min-h-screen w-full flex items-center justify-center bg-surface-bg px-4 py-10 text-brand-primary">
+      <section className="w-full max-w-xl rounded-3xl border border-surface-border bg-surface-card p-8 text-center shadow-premium">
+        <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-brand-accent/10 text-brand-accent">
+          <Clock className="h-8 w-8" aria-hidden="true" />
+        </div>
+        <p className="mb-2 text-xs font-bold uppercase tracking-[0.18em] text-brand-accent">Qualidade WP</p>
+        <h1 className="mb-3 text-2xl font-black">Sistema em manutenção</h1>
+        <p className="text-sm leading-6 text-brand-muted">{adminBypass
+          ? 'A manutenção está ativa para os cargos selecionados. Sua conta de administrador mantém acesso para acompanhar ou desativar a manutenção.'
+          : 'Estamos realizando uma manutenção. Seu acesso será liberado automaticamente quando o período terminar.'}</p>
+        <p className="mt-6 rounded-xl bg-surface-subtle px-4 py-3 text-sm font-semibold">Previsão de retorno: {returnLabel}</p>
+        {adminBypass && <button type="button" onClick={onContinue} className="mt-6 rounded-lg bg-brand-accent px-5 py-2.5 text-sm font-bold text-white">Continuar como administrador</button>}
+        <button type="button" onClick={onLogout} className="mt-6 rounded-lg border border-surface-border px-5 py-2.5 text-sm font-bold hover:bg-surface-subtle">Sair da conta</button>
+      </section>
+    </main>
   );
 }
 
@@ -311,28 +464,646 @@ function MainApp({
   setIsFormOpen,
   isSystemOnline,
   isReconnecting,
-  prefetchedSidebarColor
 }: any) {
-  const { resolvedTheme } = useTheme();
   const { theme } = useAuth();
-  const { teams } = useStaticData();
+  const { users, teams, forms, refreshAll } = useStaticData();
+  const notificationMonitorias = useMonitoriaNotifications(userData);
+  const { feedbacks } = useFeedbacks(userData);
+  const queueEvents = useQueueEventNotifications(userData);
+  const notificationPreferences = useNotificationPreferences(userData?.role);
+  const [formPrefillData, setFormPrefillData] = React.useState<any>(undefined);
+  const [isSettingsHovered, setIsSettingsHovered] = React.useState(false);
+  const [focusMonitoriaTarget, setFocusMonitoriaTarget] = React.useState<{ monitoriaId?: string; ticketId?: string } | null>(null);
+  const [inPlaceMonitoriaId, setInPlaceMonitoriaId] = React.useState<string | null>(null);
+  const [isCommandPaletteOpen, setIsCommandPaletteOpen] = React.useState(false);
+
+  // Atalho global universal para abrir Command Palette (Ctrl + K ou Cmd + K)
+  React.useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setIsCommandPaletteOpen(prev => !prev);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  const handleStartAuditFromQueue = (prefill: any) => {
+    if (!canAuditTickets(userData?.role)) return;
+    // O agente pode ter sido criado agora mesmo (conta provisória) pela
+    // Edge Function de triagem — se ainda não está no cache local de
+    // usuários, atualiza para que o formulário já abra com o nome
+    // preenchido no lugar de um seletor vazio.
+    if (prefill.ticket_group_team_id || (prefill.evaluated_id && !users.some((u: User) => u.id === prefill.evaluated_id))) {
+      refreshAll();
+    }
+
+    setFormPrefillData({
+      ticket_id: prefill.ticket_id,
+      ticket_subject: prefill.ticket_subject,
+      ticket_group_name: prefill.ticket_group_name || prefill.group_name,
+      form_id: prefill.form_id,
+      evaluated_id: prefill.evaluated_id,
+      team_id: prefill.team_id,
+      ticket_group_team_id: prefill.ticket_group_team_id,
+      group_name: prefill.group_name,
+      channel: prefill.channel,
+      ticket_date: prefill.ticket_date,
+      satisfaction_result: prefill.satisfaction_result,
+      satisfaction_has_record: prefill.satisfaction_has_record,
+      satisfaction_record_text: prefill.satisfaction_record_text,
+      isAiLocked: prefill.isAiLocked,
+      customerType: prefill.customerType,
+      ticket_fields: prefill.ticket_fields || prefill.aiEvaluation?.ticket_fields,
+      aiEvaluation: prefill.aiEvaluation,
+      childAiEvaluation: prefill.child_evaluation || prefill.childAiEvaluation,
+      dialogue: prefill.dialogue || prefill.aiEvaluation?.dialogue,
+      queue_assignment: prefill.queue_assignment,
+      ...(prefill.aiEvaluation ? {
+        answers: prefill.aiEvaluation.suggested_answers,
+        question_observations: prefill.aiEvaluation.suggested_observations,
+        selected_critical_errors: Object.keys(prefill.aiEvaluation.suggested_critical_errors).filter(k => prefill.aiEvaluation.suggested_critical_errors[k]),
+        evaluator_note: prefill.aiEvaluation.summary
+      } : {})
+    });
+    setIsFormOpen(true);
+  };
+
+  const handleCancelMonitoriaForm = () => {
+    const assignment = formPrefillData?.queue_assignment;
+    setIsFormOpen(false);
+    setFormPrefillData(undefined);
+    if (assignment?.ticket_id && assignment?.queue_type) {
+      void releaseQueueTicketAssignment(assignment.ticket_id, assignment.queue_type).catch(error => {
+        console.error('[App] Falha ao liberar ticket após cancelar a avaliação:', error);
+        toast.error('A avaliação foi fechada, mas não foi possível liberar o ticket. Atualize a fila.');
+      });
+    }
+  };
+
+  const [isNewMonitoriaModalOpen, setIsNewMonitoriaModalOpen] = useState(false);
+  const { monitorias } = useMonitoriaIndex(
+    userData,
+    activeTab === 'filas' || isNewMonitoriaModalOpen || isCommandPaletteOpen,
+  );
+
+  const handleOpenNewMonitoria = () => {
+    if (!canAuditTickets(userData?.role)) return;
+    setIsNewMonitoriaModalOpen(true);
+  };
 
   const {
     sidebarColor,
-    sidebarColors,
-    handleSidebarColorChange,
-    handleThemeChange,
     sidebarIsDark,
     sidebarContrastClass,
     sidebarContrastSubtle,
     sidebarBorderClass,
     sidebarStyle,
-  } = useSidebarManager({ userData, currentUser, prefetchedSidebarColor });
+  } = useSidebarManager({ userData });
 
   const [showTeamList, setShowTeamList] = React.useState(false);
-  const [sidebarAccordion, setSidebarAccordion] = React.useState<'teams' | 'avatar' | 'appearance' | 'color' | null>(null);
+  const [showNotifications, setShowNotifications] = React.useState(false);
+  const notificationsStorageKey = userData?.id ? `qualitrack_read_notifications_${userData.id}` : 'qualitrack_read_notifications';
+  const dismissedStorageKey = userData?.id ? `qualitrack_dismissed_notifications_${userData.id}` : 'qualitrack_dismissed_notifications';
+  const [readNotificationIds, setReadNotificationIds] = React.useState<Set<string>>(() => {
+    try {
+      const saved = localStorage.getItem(notificationsStorageKey);
+      return saved ? new Set(JSON.parse(saved)) : new Set();
+    } catch {
+      return new Set();
+    }
+  });
+
+  React.useEffect(() => {
+    try {
+      const saved = localStorage.getItem(notificationsStorageKey);
+      setReadNotificationIds(saved ? new Set(JSON.parse(saved)) : new Set());
+    } catch {
+      setReadNotificationIds(new Set());
+    }
+  }, [notificationsStorageKey]);
+  const [dismissedNotificationIds, setDismissedNotificationIds] = React.useState<Set<string>>(() => {
+    try {
+      const saved = localStorage.getItem(dismissedStorageKey);
+      return saved ? new Set(JSON.parse(saved) as string[]) : new Set();
+    } catch { return new Set(); }
+  });
+  React.useEffect(() => {
+    try {
+      const saved = localStorage.getItem(dismissedStorageKey);
+      setDismissedNotificationIds(saved ? new Set(JSON.parse(saved) as string[]) : new Set());
+    } catch { setDismissedNotificationIds(new Set()); }
+  }, [dismissedStorageKey]);
+
+  const [sidebarAccordion, setSidebarAccordion] = React.useState<'teams' | 'avatar' | 'appearance' | null>(null);
   const [sidebarTextVisible, setSidebarTextVisible] = React.useState(isSidebarOpen);
   const [isSettingsOpen, setIsSettingsOpen] = React.useState(activeTab === 'admin' || activeTab === 'custom_dashboard');
+  const [isQueueModalOpen, setIsQueueModalOpen] = React.useState(false);
+
+  const [activeQueueSubTab, setActiveQueueSubTab] = React.useState<QueueSubTab>(() => {
+    try {
+      const saved = sessionStorage.getItem('qualitrack_queue_subtab');
+      if (saved && ['negativas', 'proativas', 'positivas', 'filhos', 'filhos_invalidos', 'monitores'].includes(saved)) {
+        return saved as QueueSubTab;
+      }
+    } catch {}
+    return 'negativas';
+  });
+  const [isQueueMenuOpen, setIsQueueMenuOpen] = React.useState(activeTab === 'filas');
+  const [isQueueHovered, setIsQueueHovered] = React.useState(false);
+  const [queueCounts, setQueueCounts] = React.useState<QueueBadgeCounts>(EMPTY_QUEUE_COUNTS);
+  const queueBadge = (queue: AuditingQueueType) => (queueCounts[queue] || 0) > 0 ? queueCounts[queue]! : undefined;
+  const distributedBadgeScope = userData?.role === 'qualidade' ? 'assigned' : 'view';
+  const updatePendingNegativesCount = React.useCallback((count: number) => {
+    setQueueCounts(previous => previous.negativas === count ? previous : { ...previous, negativas: count });
+  }, []);
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = React.useState(false);
+
+  React.useEffect(() => {
+    setIsMobileMenuOpen(false);
+  }, [activeTab, isFormOpen]);
+
+  React.useEffect(() => {
+    if (!userData?.id || userData.role === 'suporte') return;
+    let active = true;
+    const refreshCounts = async () => {
+      try {
+        const counts = await fetchQueuePendingCounts();
+        if (active) setQueueCounts(counts);
+      } catch (error) {
+        console.warn('[App] Falha ao atualizar contadores das filas:', error);
+      }
+    };
+    void refreshCounts();
+    const timer = window.setInterval(() => void refreshCounts(), 120_000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [userData?.id, userData?.role]);
+
+  React.useEffect(() => {
+    try {
+      sessionStorage.setItem('qualitrack_queue_subtab', activeQueueSubTab);
+    } catch {}
+  }, [activeQueueSubTab]);
+
+  React.useEffect(() => {
+    if (activeQueueSubTab === 'monitores' && !canManageQueueAssignments(userData?.role)) {
+      setActiveQueueSubTab('negativas');
+    }
+  }, [activeQueueSubTab, userData?.role]);
+
+  React.useEffect(() => {
+    if (activeTab === 'filas') {
+      setIsQueueMenuOpen(true);
+    }
+  }, [activeTab]);
+
+  const [guidelines, setGuidelines] = React.useState<AIEvaluationGuideline[]>([]);
+  const [adminSubTab, setAdminSubTab] = React.useState<AdminSubTab | undefined>(undefined);
+
+  const loadGuidelines = React.useCallback(async () => {
+    try {
+      const data = await fetchAIGuidelines();
+      setGuidelines(data);
+    } catch (e) {
+      console.warn('[App] Falha ao carregar manuais de IA:', e);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    if (!userData) return;
+    loadGuidelines();
+
+    const handleGuidelineEvent = (e: any) => {
+      loadGuidelines();
+      const detail = e.detail;
+      if (!detail) return;
+
+      if (userData.role === 'admin' && detail.type === 'proposed') {
+        toast.info(
+          `Nova proposta de alteração recebida para o manual "${detail.title}"! Verifique no envelope de notificações.`,
+          { duration: 6000 }
+        );
+      } else if (
+        (userData.role === 'qualidade' || userData.role === 'gestor_qualidade') &&
+        detail.type === 'approved'
+      ) {
+        toast.success(
+          `Manual "${detail.title}" homologado pelo Administrador (v${detail.version})! As novas diretrizes já estão ativas para a IA.`,
+          { duration: 6000 }
+        );
+      } else if (
+        (userData.role === 'qualidade' || userData.role === 'gestor_qualidade') &&
+        detail.type === 'rejected'
+      ) {
+        toast.error(
+          `A proposta para o manual "${detail.title}" foi devolvida pelo Administrador.`,
+          { duration: 6000 }
+        );
+      }
+    };
+
+    window.addEventListener('qualitrack:guideline_event', handleGuidelineEvent);
+
+    let channel: any = null;
+    if (supabase) {
+      const channelName = `guidelines-rt-${Math.random().toString(36).substring(2, 9)}`;
+      channel = supabase
+        .channel(channelName)
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'ai_evaluation_guidelines' },
+          (payload: any) => {
+            loadGuidelines();
+            const record = payload.new;
+            if (!record) return;
+            if (userData.role === 'admin' && record.status === 'pending_approval') {
+              toast.info(
+                `Nova proposta de manual recebida: "${record.pending_title || record.title}". Verifique no envelope de notificações.`,
+                { duration: 6000 }
+              );
+            } else if (
+              (userData.role === 'qualidade' || userData.role === 'gestor_qualidade') &&
+              record.status === 'approved' &&
+              record.version > 1
+            ) {
+              toast.success(
+                `Manual de IA atualizado: "${record.title}" foi homologado pelo Administrador (v${record.version}).`,
+                { duration: 6000 }
+              );
+            }
+          }
+        )
+        .subscribe();
+    }
+
+    return () => {
+      window.removeEventListener('qualitrack:guideline_event', handleGuidelineEvent);
+      if (channel && supabase) {
+        supabase.removeChannel(channel);
+      }
+    };
+  }, [userData, loadGuidelines]);
+
+  const notifications = React.useMemo(() => {
+    const list: Array<{
+      id: string;
+      kind: NotificationKind;
+      title: string;
+      message: string;
+      time: string;
+      type: 'contestacao' | 'monitoria' | 'fila' | 'sistema' | 'manual';
+      iconBg: string;
+      icon: React.ReactNode;
+      targetTab?: string;
+      targetSubTab?: AdminSubTab;
+      targetQueueSubTab?: QueueSubTab;
+      guidelineId?: string;
+      actionType?: 'review';
+      monitoriaId?: string;
+      ticketId?: string;
+      read: boolean;
+    }> = [];
+
+    // Notificações de Contestação (WQ-25: status 'em_contestacao', estável por evento/monitoria, auditor + gestores de qualidade)
+    const contestationNotifs = getContestationNotifications(userData, notificationMonitorias, readNotificationIds);
+    for (const cn of contestationNotifs) {
+      list.push({
+        id: cn.id,
+        kind: 'contestation',
+        title: cn.title,
+        message: cn.message,
+        time: cn.time,
+        type: 'contestacao',
+        iconBg: 'bg-amber-500/10 text-amber-600 dark:text-amber-400',
+        icon: <AlertTriangle className="w-3.5 h-3.5" />,
+        targetTab: 'monitorias',
+        monitoriaId: cn.monitoriaId,
+        ticketId: cn.ticketId,
+        read: cn.read,
+      });
+    }
+
+    // Notificações para Suporte (Nova Avaliação Disponível)
+    if (userData?.role === 'suporte') {
+      const myMonitorias = notificationMonitorias.filter(m => m.evaluated_id === userData.id);
+      if (myMonitorias.length > 0) {
+        const latest = myMonitorias[0];
+        const childVerdict = latest.child_verdict || (latest.form_snapshot as { child_verdict?: 'valido' | 'invalido' } | undefined)?.child_verdict;
+        const timeStr = latest.created_at
+          ? formatDate(new Date(latest.created_at), "dd/MM 'às' HH:mm")
+          : 'Data não informada';
+        list.push({
+          id: `eval-${latest.id}`,
+          kind: 'new_monitoria',
+          title: 'Nova Avaliação Disponível',
+          message: isChildTicketMonitoria(latest)
+            ? `Monitoria do chamado filho #${latest.ticket_id} foi publicada${childVerdict ? ` como ${childVerdict === 'valido' ? 'válido' : 'inválido'}` : ''}.`
+            : `Monitoria referente ao chamado #${latest.ticket_id} foi publicada com nota ${latest.score}%.`,
+          time: timeStr,
+          type: 'monitoria',
+          iconBg: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+          icon: <ClipboardCheck className="w-3.5 h-3.5" />,
+          targetTab: 'monitorias',
+          monitoriaId: latest.id,
+          ticketId: latest.ticket_id,
+          read: readNotificationIds.has(`eval-${latest.id}`)
+        });
+      }
+    }
+
+    // Notificações de Feedbacks 1:1 para Atendente (Pendente de Ciência)
+    if (userData?.role === 'suporte') {
+      const pendingFeedbacks = feedbacks.filter(
+        fb => fb.agent_id === userData.id && fb.status === 'pendente_ciencia'
+      );
+      pendingFeedbacks.forEach(fb => {
+        const notifId = `feedback-pending-${fb.id}`;
+        const timeStr = fb.created_at
+          ? formatDate(new Date(fb.created_at), "dd/MM 'às' HH:mm")
+          : 'Data não informada';
+        list.push({
+          id: notifId,
+          kind: 'feedback_pending',
+          title: 'Feedback 1:1 Aguardando Ciência',
+          message: `Você possui um novo alinhamento "${fb.title}" com Plano de Ação Combinado aguardando sua assinatura digital.`,
+          time: timeStr,
+          type: 'monitoria',
+          iconBg: 'bg-blue-500/10 text-blue-600 dark:text-blue-400',
+          icon: <MessageSquare className="w-3.5 h-3.5" />,
+          targetTab: 'dashboard',
+          read: readNotificationIds.has(notifId),
+        });
+      });
+    }
+
+    // Notificações de Feedbacks para Gestores (Ciência Confirmada Recentemente)
+    if (['gestor_suporte', 'gestor_qualidade', 'admin'].includes(userData?.role || '')) {
+      const acknowledgedFeedbacks = feedbacks.filter(
+        fb => fb.status === 'ciente' && fb.agent_acknowledged_at
+      );
+      acknowledgedFeedbacks.slice(0, 3).forEach(fb => {
+        const notifId = `feedback-ack-${fb.id}`;
+        const timeStr = fb.agent_acknowledged_at
+          ? formatDate(new Date(fb.agent_acknowledged_at), "dd/MM 'às' HH:mm")
+          : 'Data não informada';
+        list.push({
+          id: notifId,
+          kind: 'feedback_ack',
+          title: 'Ciência de Feedback Confirmada',
+          message: `O atendente confirmou a ciência do alinhamento "${fb.title}".`,
+          time: timeStr,
+          type: 'monitoria',
+          iconBg: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+          icon: <CheckCheck className="w-3.5 h-3.5" />,
+          targetTab: 'dashboard',
+          read: readNotificationIds.has(notifId),
+        });
+      });
+    }
+
+    // Alerta de SLA / Prazo de Ação Próximo (< 4 horas)
+    const nowMs = Date.now();
+    const urgentDeadlines = notificationMonitorias.filter(m => {
+      if (m.active === false || m.status === 'concluida') return false;
+      if (userData?.role === 'suporte' && m.evaluated_id !== userData.id) return false;
+      if (!m.action_deadline_at) return false;
+      const dlMs = new Date(m.action_deadline_at).getTime();
+      const diffHours = (dlMs - nowMs) / (1000 * 3600);
+      return diffHours > 0 && diffHours <= 4;
+    });
+    urgentDeadlines.slice(0, 3).forEach(m => {
+      const notifId = `sla-urgent-${m.id}`;
+      list.push({
+        id: notifId,
+        kind: 'deadline',
+        title: 'Prazo de Ação Expirando (SLA)',
+        message: `A monitoria do chamado #${m.ticket_id} possui menos de 4h para expirar o prazo regulamentar.`,
+        time: 'Urgente',
+        type: 'contestacao',
+        iconBg: 'bg-rose-500/10 text-rose-600 dark:text-rose-400',
+        icon: <Clock className="w-3.5 h-3.5" />,
+        targetTab: 'monitorias',
+        monitoriaId: m.id,
+        ticketId: m.ticket_id,
+        read: readNotificationIds.has(notifId),
+      });
+    });
+
+    queueEvents.forEach(event => {
+      const isNegative = event.event_type === 'csat_bad';
+      const notifId = `queue-event-${event.id}`;
+      list.push({
+        id: notifId,
+        kind: isNegative ? 'queue_negative' : 'queue_child_review',
+        title: isNegative ? 'Novo CSAT Ruim' : 'Chamado Filho para Revisão',
+        message: isNegative
+          ? `O ticket #${event.ticket_id} entrou na fila CSAT Negativas.`
+          : `O ticket #${event.ticket_id} precisa de revisão do monitor.`,
+        time: formatDate(new Date(event.occurred_at), "dd/MM 'às' HH:mm"),
+        type: 'fila',
+        iconBg: 'bg-rose-500/10 text-rose-600 dark:text-rose-400',
+        icon: <Layers className="w-3.5 h-3.5" />,
+        targetTab: 'filas',
+        targetQueueSubTab: isNegative ? 'negativas' : 'filhos',
+        ticketId: event.ticket_id,
+        read: readNotificationIds.has(notifId),
+      });
+    });
+
+    // Notificações de Manuais para Administrador (Propostas de Atualização Pendentes)
+    if (userData?.role === 'admin') {
+      const pendingGuidelines = guidelines.filter(
+        g => g.status === 'pending_approval' && Boolean(g.pending_content)
+      );
+
+      pendingGuidelines.forEach(g => {
+        const itemDate = g.pending_modified_at || g.updated_at;
+        const timeStr = itemDate
+          ? formatDate(new Date(itemDate), "dd/MM 'às' HH:mm")
+          : 'Data não informada';
+        // Sem fallback para Date.now(): um id baseado no relógio local mudaria a
+        // cada re-render (recomputa o useMemo), fazendo a mesma proposta pendente
+        // — já lida — voltar a aparecer como não lida a qualquer atualização de
+        // estado (troca de aba, nova monitoria chegando, etc.), não só de um dia
+        // para o outro. O id só deve mudar quando pending_modified_at realmente
+        // muda (nova proposta submetida).
+        const notifId = `guideline-pending-${g.id}-${g.pending_modified_at || g.updated_at || 'v' + (g.version || 1)}`;
+
+        list.push({
+          id: notifId,
+          kind: 'manual_pending',
+          title: 'Revisão de Manual Pendente',
+          message: `O monitor ${g.pending_modified_by_name || 'de Qualidade'} enviou uma proposta de alteração no manual "${g.pending_title || g.title}". Clique para analisar e homologar.`,
+          time: timeStr,
+          type: 'manual',
+          iconBg: 'bg-amber-500/10 text-amber-600 dark:text-amber-400',
+          icon: <BookOpen className="w-3.5 h-3.5" />,
+          targetTab: 'admin',
+          targetSubTab: 'ia_hub',
+          guidelineId: g.id,
+          actionType: 'review',
+          read: readNotificationIds.has(notifId)
+        });
+      });
+    }
+
+    // Notificações de Manuais para Monitores de Qualidade (Homologação Concluída)
+    if (userData?.role === 'qualidade' || userData?.role === 'gestor_qualidade') {
+      guidelines.forEach(g => {
+        const approvedEntry = g.history?.find(h => h.status === 'approved');
+        const hasApproval = (g.version && g.version > 1) || Boolean(approvedEntry);
+
+        if (g.status === 'approved' && hasApproval) {
+          const versionNum = approvedEntry?.version || g.version || 1;
+          const itemDate = approvedEntry?.created_at || g.updated_at;
+          const timeStr = itemDate
+            ? formatDate(new Date(itemDate), "dd/MM 'às' HH:mm")
+            : 'Data não informada';
+          const notifId = `guideline-approved-${g.id}-v${versionNum}`;
+          const approverName = approvedEntry?.approved_by_name || 'Administrador';
+
+          list.push({
+            id: notifId,
+            kind: 'manual_updated',
+            title: 'Manual de IA Atualizado',
+            message: `O manual "${g.title}" foi homologado pelo Administrador (${approverName}) na versão v${versionNum}. As diretrizes já estão ativas para as auditorias com IA.`,
+            time: timeStr,
+            type: 'manual',
+            iconBg: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+            icon: <Sparkles className="w-3.5 h-3.5" />,
+            targetTab: 'admin',
+            targetSubTab: 'ia_hub',
+            guidelineId: g.id,
+            read: readNotificationIds.has(notifId)
+          });
+        }
+
+        const latestEntry = g.history?.[0];
+        if (latestEntry && latestEntry.status === 'rejected') {
+          const itemDate = latestEntry.created_at;
+          const timeStr = itemDate
+            ? formatDate(new Date(itemDate), "dd/MM 'às' HH:mm")
+            : 'Data não informada';
+          const notifId = `guideline-rejected-${g.id}-${new Date(itemDate).getTime()}`;
+
+          list.push({
+            id: notifId,
+            kind: 'manual_rejected',
+            title: 'Proposta de Manual Devolvida',
+            message: `A proposta para o manual "${g.title}" foi devolvida pelo Administrador: "${latestEntry.rejection_reason || 'Sem justificativa'}".`,
+            time: timeStr,
+            type: 'manual',
+            iconBg: 'bg-rose-500/10 text-rose-600 dark:text-rose-400',
+            icon: <AlertTriangle className="w-3.5 h-3.5" />,
+            targetTab: 'admin',
+            targetSubTab: 'ia_hub',
+            guidelineId: g.id,
+            read: readNotificationIds.has(notifId)
+          });
+        }
+      });
+    }
+
+    return list.filter(notification => notificationPreferences[notification.kind] !== false);
+  }, [userData, notificationMonitorias, readNotificationIds, guidelines, feedbacks, queueEvents, notificationPreferences]);
+
+  const visibleNotifications = React.useMemo(
+    () => notifications.filter(notification => !dismissedNotificationIds.has(notification.id)),
+    [notifications, dismissedNotificationIds],
+  );
+  const unreadNotificationsCount = visibleNotifications.filter(n => !n.read).length;
+
+  const markAllNotificationsAsRead = () => {
+    const allIds = new Set([...readNotificationIds, ...visibleNotifications.map(n => n.id)]);
+    setReadNotificationIds(allIds);
+    try {
+      localStorage.setItem(notificationsStorageKey, JSON.stringify(Array.from(allIds)));
+    } catch {}
+    toast.success('Todas as notificações foram marcadas como lidas.', { duration: 1500 });
+  };
+
+  const clearNotifications = () => {
+    const next = new Set([...dismissedNotificationIds, ...visibleNotifications.map(notification => notification.id)]);
+    setDismissedNotificationIds(next);
+    try { localStorage.setItem(dismissedStorageKey, JSON.stringify(Array.from(next))); } catch {}
+    toast.success('Histórico de notificações limpo neste navegador.', { duration: 1500 });
+  };
+
+  const handleNotificationClick = (item: any) => {
+    const next = new Set(readNotificationIds);
+    next.add(item.id);
+    setReadNotificationIds(next);
+    try {
+      localStorage.setItem(notificationsStorageKey, JSON.stringify(Array.from(next)));
+    } catch {}
+
+    if (item.targetTab) {
+      setActiveTab(item.targetTab);
+    }
+    if (item.targetQueueSubTab) {
+      setActiveQueueSubTab(item.targetQueueSubTab);
+      setIsQueueMenuOpen(true);
+    }
+    if (item.monitoriaId) {
+      setTimeout(() => {
+        window.dispatchEvent(
+          new CustomEvent('qualitrack:focus_monitoria', {
+            detail: { monitoriaId: item.monitoriaId, ticketId: item.ticketId }
+          })
+        );
+      }, 100);
+    }
+    if (item.targetSubTab) {
+      setAdminSubTab(item.targetSubTab);
+      window.dispatchEvent(
+        new CustomEvent('qualitrack:switch_admin_subtab', {
+          detail: { subTab: item.targetSubTab }
+        })
+      );
+    }
+    if (item.actionType === 'review' && item.guidelineId) {
+      setTimeout(() => {
+        window.dispatchEvent(
+          new CustomEvent('qualitrack:open_guideline_review', {
+            detail: { guidelineId: item.guidelineId }
+          })
+        );
+      }, 100);
+    }
+    setShowNotifications(false);
+  };
+
+  React.useEffect(() => {
+    const handleFocus = async (e: Event) => {
+      const detail = (e as CustomEvent<{ monitoriaId?: string; ticketId?: string }>)?.detail;
+      if (!detail) return;
+
+      // Se a aba ativa não for 'monitorias', abre in-place como popup!
+      // Não migra de aba na sidebar!
+      if (activeTab !== 'monitorias') {
+        if (detail.monitoriaId) {
+          setInPlaceMonitoriaId(detail.monitoriaId);
+        } else if (detail.ticketId) {
+          const found = monitorias.find(m => String(m.ticket_id) === String(detail.ticketId));
+          if (found) {
+            setInPlaceMonitoriaId(found.id);
+          } else if (supabase) {
+            const source = userData?.role === 'suporte' ? 'vw_monitorias_suporte' : 'monitorias';
+            const { data, error } = await supabase.from(source).select('id')
+              .eq('ticket_id', detail.ticketId).eq('active', true)
+              .order('created_at', { ascending: false }).limit(1).maybeSingle();
+            if (error) console.error('[App] Falha ao localizar monitoria do ticket:', error);
+            if (data?.id) setInPlaceMonitoriaId(data.id);
+          }
+        }
+      } else {
+        setFocusMonitoriaTarget(detail);
+      }
+    };
+    window.addEventListener('qualitrack:focus_monitoria', handleFocus);
+    return () => window.removeEventListener('qualitrack:focus_monitoria', handleFocus);
+  }, [activeTab, monitorias, userData?.role]);
 
   const toggleSidebar = () => {
     const willBeOpen = !isSidebarOpen;
@@ -351,8 +1122,35 @@ function MainApp({
     }
   };
 
+  const handleQueueMenuClick = () => {
+    if (!isSidebarOpen) {
+      toggleSidebar();
+      setIsQueueMenuOpen(true);
+      setActiveTab('filas');
+    } else {
+      if (activeTab !== 'filas') {
+        setActiveTab('filas');
+        setIsQueueMenuOpen(true);
+      } else {
+        setIsQueueMenuOpen(!isQueueMenuOpen);
+      }
+    }
+  };
+
+  const handleQueueSubTabClick = (subTab: QueueSubTab) => {
+    if (subTab === 'monitores' && !canManageQueueAssignments(userData?.role)) {
+      return;
+    }
+    setActiveQueueSubTab(subTab);
+    setActiveTab('filas');
+  };
+
   React.useEffect(() => {
-    if (userData && userData.role !== 'admin' && (activeTab === 'admin' || activeTab === 'custom_dashboard')) {
+    const allowedAdminRoles = ['admin', 'gestor_qualidade', 'qualidade', 'gestor_suporte'];
+    if (userData && !allowedAdminRoles.includes(userData.role) && activeTab === 'admin') {
+      setActiveTab('dashboard');
+    }
+    if (userData && userData.role !== 'admin' && activeTab === 'custom_dashboard') {
       setActiveTab('dashboard');
     }
   }, [userData?.role, activeTab]);
@@ -374,7 +1172,20 @@ function MainApp({
 
   useEffect(() => {
     setShowTeamList(false);
+    setShowNotifications(false);
   }, [isSidebarOpen]);
+
+  useEffect(() => {
+    if (!showNotifications) return;
+    const handleOutsideClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!target.closest('.notifications-popover') && !target.closest('.notifications-toggle-btn')) {
+        setShowNotifications(false);
+      }
+    };
+    document.addEventListener('click', handleOutsideClick, true);
+    return () => document.removeEventListener('click', handleOutsideClick, true);
+  }, [showNotifications]);
 
   const userTeams = teams.filter(t => (userData?.team_ids || []).includes(t.id));
   const teamNames = userTeams.map(t => t.name).join(', ');
@@ -385,12 +1196,301 @@ function MainApp({
         {isFormOpen && (
           <MonitoriaForm
             user={userData}
-            onCancel={() => setIsFormOpen(false)}
-            onSaved={() => { setIsFormOpen(false); setActiveTab('monitorias'); }}
+            initialData={formPrefillData}
+            onCancel={handleCancelMonitoriaForm}
+            // O id da monitoria salva não é usado aqui; a lista recarrega ao trocar de aba.
+            onSaved={() => { setIsFormOpen(false); setFormPrefillData(undefined); setActiveTab('monitorias'); }}
           />
         )}
       </AnimatePresence>
 
+      {/* Inspecionar Monitoria In-Place (abre em popup sobre a tela atual, sem trocar aba na sidebar) */}
+      {inPlaceMonitoriaId && (
+        <React.Suspense fallback={null}>
+          <InPlaceMonitoriaModal
+            monitoriaId={inPlaceMonitoriaId}
+            user={userData}
+            users={users}
+            teams={teams}
+            onClose={() => setInPlaceMonitoriaId(null)}
+          />
+        </React.Suspense>
+      )}
+
+      {/* Modal Inteligente de Busca e Início de Nova Monitoria */}
+      {isNewMonitoriaModalOpen && (
+        <React.Suspense fallback={null}>
+          <NewMonitoriaModal
+            isOpen={isNewMonitoriaModalOpen}
+            onClose={() => setIsNewMonitoriaModalOpen(false)}
+            monitorias={monitorias}
+            users={users}
+            teams={teams}
+            forms={forms}
+            currentUser={userData}
+            onStartAudit={handleStartAuditFromQueue}
+            onViewExistingMonitoria={id => setInPlaceMonitoriaId(id)}
+            onOpenBlankForm={() => {
+              setFormPrefillData(undefined);
+              setIsFormOpen(true);
+            }}
+          />
+        </React.Suspense>
+      )}
+
+      {/* Command Palette Global (Ctrl + K) */}
+      <React.Suspense fallback={null}>
+        <CommandPaletteModal
+          isOpen={isCommandPaletteOpen}
+          onClose={() => setIsCommandPaletteOpen(false)}
+          onNavigateTab={setActiveTab}
+          onNewMonitoria={handleOpenNewMonitoria}
+          canCreateMonitoria={canAuditTickets(userData?.role)}
+          monitorias={monitorias}
+          users={users}
+        />
+      </React.Suspense>
+
+      {/* Mobile Navigation Drawer Overlay */}
+      <AnimatePresence>
+        {isMobileMenuOpen && (
+          <>
+            <m.div
+              key="mobile-drawer-backdrop"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsMobileMenuOpen(false)}
+              className="fixed inset-0 bg-black/60 backdrop-blur-xs z-50 md:hidden"
+            />
+            <m.aside
+              key="mobile-drawer"
+              initial={{ x: '-100%' }}
+              animate={{ x: 0 }}
+              exit={{ x: '-100%' }}
+              transition={{ type: 'spring', damping: 26, stiffness: 280 }}
+              style={sidebarStyle}
+              className={`${sidebarContrastClass} fixed inset-y-0 left-0 z-50 w-72 max-w-[85vw] flex flex-col border-r ${sidebarBorderClass} shadow-2xl md:hidden`}
+            >
+              {/* Drawer Header with Logo & Close button */}
+              <div className="h-16 flex items-center justify-between px-5 border-b border-white/10">
+                <img
+                  src={sidebarIsDark ? '/logo-dark.png' : '/logo-light.png'}
+                  alt="Qualidade WP"
+                  className="h-7 w-auto max-w-[150px] object-contain select-none"
+                />
+                <button
+                  type="button"
+                  onClick={() => setIsMobileMenuOpen(false)}
+                  className="p-2 rounded-xl bg-black/10 hover:bg-black/20 text-current transition-colors cursor-pointer"
+                  title="Fechar menu"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Drawer Navigation List */}
+              <nav className="flex-1 overflow-y-auto custom-scrollbar px-3 py-4 space-y-1">
+                <NavItem
+                  isDark={sidebarIsDark}
+                  icon={AnimatedDashboardIcon}
+                  label="Dashboard"
+                  active={activeTab === 'dashboard'}
+                  onClick={() => { setActiveTab('dashboard'); setIsMobileMenuOpen(false); }}
+                  isOpen={true}
+                />
+                <NavItem
+                  isDark={sidebarIsDark}
+                  icon={AnimatedMonitoriasIcon}
+                  label="Monitorias"
+                  active={activeTab === 'monitorias'}
+                  onClick={() => { setActiveTab('monitorias'); setIsMobileMenuOpen(false); }}
+                  isOpen={true}
+                />
+                {userData?.role !== 'suporte' && (
+                  <div className="space-y-1">
+                    <button
+                      onClick={() => setIsQueueMenuOpen(!isQueueMenuOpen)}
+                      className={`
+                        w-full flex items-center gap-3 px-4 h-11 rounded-xl transition-all font-bold group relative text-left cursor-pointer
+                        ${(activeTab === 'filas' && !isQueueMenuOpen)
+                          ? (sidebarIsDark ? 'bg-white/10 text-white' : 'bg-black/10 text-black font-extrabold')
+                          : (sidebarIsDark ? 'text-white/40 hover:text-white hover:bg-white/5' : 'text-slate-800 hover:text-black hover:bg-black/5 font-bold')}
+                      `}
+                    >
+                      <div className="text-current">
+                        <AnimatedLayersIcon active={activeTab === 'filas' || isQueueMenuOpen} className="w-5 h-5" />
+                      </div>
+                      <div className="flex-1 flex items-center justify-between">
+                        <span className="text-sm tracking-tight whitespace-nowrap block pl-1">
+                          Filas de Triagem
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <ChevronDown className={`w-4 h-4 text-current transition-transform duration-200 ${isQueueMenuOpen ? 'rotate-180' : ''}`} />
+                        </div>
+                      </div>
+                    </button>
+
+                    <AnimatePresence initial={false}>
+                      {isQueueMenuOpen && (
+                        <m.div
+                          initial={{ height: 0, opacity: 0 }}
+                          animate={{ height: "auto", opacity: 1 }}
+                          exit={{ height: 0, opacity: 0 }}
+                          transition={{ duration: 0.2, ease: "easeInOut" }}
+                          className="overflow-hidden pl-1 space-y-1"
+                        >
+                          {canManageQueueAssignments(userData?.role) && (
+                            <QueueSubNavItem
+                              label="Monitores na Triagem"
+                              active={activeTab === 'filas' && activeQueueSubTab === 'monitores'}
+                              onClick={() => { handleQueueSubTabClick('monitores'); setIsMobileMenuOpen(false); }}
+                              isOpen={true}
+                              isDark={sidebarIsDark}
+                              colorType="monitores"
+                            />
+                          )}
+                          <QueueSubNavItem
+                            label="CSAT Negativas"
+                            active={activeTab === 'filas' && activeQueueSubTab === 'negativas'}
+                            onClick={() => { handleQueueSubTabClick('negativas'); setIsMobileMenuOpen(false); }}
+                            isOpen={true}
+                            isDark={sidebarIsDark}
+                            colorType="negativas"
+                            badge={queueBadge('negativas')}
+                            badgeScope={distributedBadgeScope}
+                          />
+                          <QueueSubNavItem
+                            label="Fila Proativa"
+                            active={activeTab === 'filas' && activeQueueSubTab === 'proativas'}
+                            onClick={() => { handleQueueSubTabClick('proativas'); setIsMobileMenuOpen(false); }}
+                            isOpen={true}
+                            isDark={sidebarIsDark}
+                            colorType="proativas"
+                            badge={queueBadge('proativas')}
+                          />
+                          <QueueSubNavItem
+                            label="CSAT Positivas"
+                            active={activeTab === 'filas' && activeQueueSubTab === 'positivas'}
+                            onClick={() => { handleQueueSubTabClick('positivas'); setIsMobileMenuOpen(false); }}
+                            isOpen={true}
+                            isDark={sidebarIsDark}
+                            colorType="positivas"
+                            badge={queueBadge('positivas')}
+                          />
+                          <QueueSubNavItem
+                            label="Chamados Filhos"
+                            active={activeTab === 'filas' && activeQueueSubTab === 'filhos'}
+                            onClick={() => { handleQueueSubTabClick('filhos'); setIsMobileMenuOpen(false); }}
+                            isOpen={true}
+                            isDark={sidebarIsDark}
+                            colorType="filhos"
+                            badge={queueBadge('filhos')}
+                            badgeScope={distributedBadgeScope}
+                          />
+                          <QueueSubNavItem
+                            label="Filhos Inválidos"
+                            active={activeTab === 'filas' && activeQueueSubTab === 'filhos_invalidos'}
+                            onClick={() => { handleQueueSubTabClick('filhos_invalidos'); setIsMobileMenuOpen(false); }}
+                            isOpen={true}
+                            isDark={sidebarIsDark}
+                            colorType="filhos_invalidos"
+                            badge={queueBadge('filhos_invalidos')}
+                          />
+                        </m.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
+                )}
+
+                {/* Configurações (Admin / Gestores) */}
+                {userData?.role === 'admin' ? (
+                  <div className="space-y-1">
+                    <button
+                      onClick={() => setIsSettingsOpen(!isSettingsOpen)}
+                      className={`
+                        w-full flex items-center gap-3 px-4 h-11 rounded-xl transition-all font-bold group relative text-left cursor-pointer
+                        ${((activeTab === 'admin' || activeTab === 'custom_dashboard') && !isSettingsOpen)
+                          ? (sidebarIsDark ? 'bg-white/10 text-white' : 'bg-black/10 text-black')
+                          : (sidebarIsDark ? 'text-white/40 hover:text-white hover:bg-white/5' : 'text-slate-800 hover:text-black hover:bg-black/5')}
+                      `}
+                    >
+                      <div className="text-current">
+                        <AnimatedSettingsIcon active={(activeTab === 'admin' || activeTab === 'custom_dashboard') || isSettingsOpen} className="w-5 h-5" />
+                      </div>
+                      <div className="flex-1 flex items-center justify-between">
+                        <span className="text-sm tracking-tight whitespace-nowrap block pl-1">
+                          Configurações
+                        </span>
+                        <ChevronDown className={`w-4 h-4 text-current transition-transform duration-200 ${isSettingsOpen ? 'rotate-180' : ''}`} />
+                      </div>
+                    </button>
+
+                    <AnimatePresence initial={false}>
+                      {isSettingsOpen && (
+                        <m.div
+                          initial={{ height: 0, opacity: 0 }}
+                          animate={{ height: "auto", opacity: 1 }}
+                          exit={{ height: 0, opacity: 0 }}
+                          transition={{ duration: 0.2, ease: "easeInOut" }}
+                          className="overflow-hidden pl-1 space-y-1"
+                        >
+                          <SubNavItem
+                            label="Geral"
+                            active={activeTab === 'admin'}
+                            onClick={() => { setActiveTab('admin'); setIsMobileMenuOpen(false); }}
+                            isOpen={true}
+                            isDark={sidebarIsDark}
+                          />
+                          <SubNavItem
+                            label="Customizar Dashboards"
+                            active={activeTab === 'custom_dashboard'}
+                            onClick={() => { setActiveTab('custom_dashboard'); setIsMobileMenuOpen(false); }}
+                            isOpen={true}
+                            isDark={sidebarIsDark}
+                          />
+                        </m.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
+                ) : ['gestor_qualidade', 'qualidade', 'gestor_suporte'].includes(userData?.role || '') ? (
+                  <NavItem
+                    isDark={sidebarIsDark}
+                    icon={AnimatedSettingsIcon}
+                    label="Configurações"
+                    active={activeTab === 'admin'}
+                    onClick={() => { setActiveTab('admin'); setIsMobileMenuOpen(false); }}
+                    isOpen={true}
+                  />
+                ) : null}
+              </nav>
+
+              {/* Drawer Bottom Actions: User, Theme & Logout */}
+              <div className="p-3 border-t border-white/10 space-y-2">
+                <div className="p-2.5 rounded-xl bg-black/10 flex items-center justify-between">
+                  <div className="min-w-0 pr-2">
+                    <p className="text-xs font-bold truncate">{userData?.name}</p>
+                    <p className="text-[10px] text-brand-muted truncate opacity-80">{userData ? ROLE_LABELS[userData.role as UserRole] : ''}</p>
+                  </div>
+                  <button
+                    onClick={() => { setIsMobileMenuOpen(false); handleLogout(); }}
+                    className="p-1.5 rounded-lg text-red-500 hover:bg-red-500/10 cursor-pointer"
+                    title="Sair"
+                  >
+                    <LogOut className="w-4 h-4" />
+                  </button>
+                </div>
+                <div className="flex items-center gap-2 py-2 text-xs text-current">
+                  <Monitor className="w-4 h-4" />
+                  Tema automático do sistema
+                </div>
+              </div>
+            </m.aside>
+          </>
+        )}
+      </AnimatePresence>
+
+      {/* Desktop Sidebar */}
       <m.aside
         initial={false}
         animate={{ width: isSidebarOpen ? 260 : 80 }}
@@ -404,7 +1504,7 @@ function MainApp({
           }
           toggleSidebar();
         }}
-        className={`${sidebarContrastClass} flex flex-col relative z-20 transition-all transition-colors duration-300 border-r ${sidebarBorderClass} group/sidebar cursor-pointer`}
+        className={`${sidebarContrastClass} hidden md:flex flex-col relative z-20 border-r ${sidebarBorderClass} group/sidebar cursor-pointer`}
       >
         <div
           onClick={(e) => { e.stopPropagation(); toggleSidebar(); }}
@@ -412,39 +1512,160 @@ function MainApp({
         >
           {isSidebarOpen ? <ChevronLeft className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
         </div>
-        <div className="h-20 flex items-center px-6 overflow-hidden">
-          <div className="flex items-center gap-3 whitespace-nowrap">
-            <div className="w-8 h-8 bg-white/10 rounded-lg flex items-center justify-center flex-shrink-0">
-              <div className="w-4 h-4 border-2 border-white rounded-[2px]" />
-            </div>
-            {sidebarTextVisible && (
-              <h2 className="font-bold text-lg tracking-tight">QualiTrack</h2>
+        <div className="h-20 flex-shrink-0 flex items-center px-6 overflow-hidden">
+          <div
+            className="flex items-center gap-3 whitespace-nowrap cursor-pointer interactive-sidebar-item"
+            onClick={(e) => {
+              e.stopPropagation();
+              setActiveTab('dashboard');
+            }}
+            title="Ir para o Dashboard"
+          >
+            {sidebarTextVisible ? (
+              <img
+                src={sidebarIsDark ? '/logo-dark.png' : '/logo-light.png'}
+                alt="Qualidade WP"
+                className="h-8 w-auto max-w-[170px] object-contain select-none transition-opacity duration-200"
+              />
+            ) : (
+              <div className="w-8 h-8 flex items-center justify-center flex-shrink-0">
+                <img
+                  src={sidebarIsDark ? '/logo-icon-dark.png' : '/logo-icon-light.png'}
+                  alt="Qualidade WP"
+                  className="h-7 w-auto max-w-[42px] object-contain select-none transition-opacity duration-200"
+                />
+              </div>
             )}
           </div>
         </div>
 
-        <nav className="flex-1 px-3 space-y-1 py-4">
-          <NavItem isDark={sidebarIsDark} icon={<DashboardIcon className="w-5 h-5" />} label="Dashboard" active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} isOpen={sidebarTextVisible} />
-          <NavItem isDark={sidebarIsDark} icon={<ClipboardCheck className="w-5 h-5" />} label="Monitorias" active={activeTab === 'monitorias'} onClick={() => setActiveTab('monitorias')} isOpen={sidebarTextVisible} />
-          {userData?.role === 'admin' && (
+        <nav className="flex-1 min-h-0 overflow-y-auto custom-scrollbar px-3 space-y-1 py-4">
+          <NavItem isDark={sidebarIsDark} icon={AnimatedDashboardIcon} label="Dashboard" active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} isOpen={sidebarTextVisible} />
+          <NavItem isDark={sidebarIsDark} icon={AnimatedMonitoriasIcon} label="Monitorias" active={activeTab === 'monitorias'} onClick={() => setActiveTab('monitorias')} isOpen={sidebarTextVisible} />
+          {userData?.role !== 'suporte' && (
+            <div className="space-y-1">
+              <button
+                onClick={handleQueueMenuClick}
+                onMouseEnter={() => setIsQueueHovered(true)}
+                onMouseLeave={() => setIsQueueHovered(false)}
+                className={`
+                  w-full flex items-center gap-3 px-4 h-11 rounded-xl transition-all font-bold group relative text-left cursor-pointer
+                  ${(activeTab === 'filas' && !isQueueMenuOpen)
+                    ? (sidebarIsDark ? 'bg-white/10 text-white' : 'bg-black/10 text-black font-extrabold')
+                    : (sidebarIsDark ? 'text-white/40 hover:text-white hover:bg-white/5' : 'text-slate-800 hover:text-black hover:bg-black/5 font-bold')}
+                `}
+              >
+                {(activeTab === 'filas' && !isQueueMenuOpen) && (
+                  <m.div
+                    layoutId="active-bar"
+                    className={`absolute left-0 w-1 h-6 rounded-full ${sidebarIsDark ? 'bg-white' : 'bg-black'}`}
+                  />
+                )}
+                <div className={`${(activeTab === 'filas' && !isQueueMenuOpen) ? 'text-current' : (sidebarIsDark ? 'text-white/30 group-hover:text-white' : 'text-slate-700 group-hover:text-black')}`}>
+                  <AnimatedLayersIcon isHovered={isQueueHovered} active={activeTab === 'filas' || isQueueMenuOpen} className="w-5 h-5" />
+                </div>
+                <div className={`flex-1 flex items-center justify-between overflow-hidden transition-all duration-300 ${sidebarTextVisible ? 'opacity-100 max-w-full' : 'opacity-0 max-w-0'}`}>
+                  <span className="text-sm tracking-tight whitespace-nowrap block pl-1">
+                    Filas de Triagem
+                  </span>
+                  <div className="flex items-center gap-1.5">
+                    <ChevronDown className={`w-4 h-4 text-current transition-transform duration-200 ${isQueueMenuOpen ? 'rotate-180' : ''}`} />
+                  </div>
+                </div>
+              </button>
+
+              <AnimatePresence initial={false}>
+                {isQueueMenuOpen && sidebarTextVisible && (
+                  <m.div
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: "auto", opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    transition={{ duration: 0.2, ease: "easeInOut" }}
+                    className="overflow-hidden pl-1 space-y-1"
+                  >
+                    {canManageQueueAssignments(userData?.role) && (
+                      <QueueSubNavItem
+                        label="Monitores na Triagem"
+                        active={activeTab === 'filas' && activeQueueSubTab === 'monitores'}
+                        onClick={() => handleQueueSubTabClick('monitores')}
+                        isOpen={sidebarTextVisible}
+                        isDark={sidebarIsDark}
+                        colorType="monitores"
+                      />
+                    )}
+                    <QueueSubNavItem
+                      label="CSAT Negativas"
+                      active={activeTab === 'filas' && activeQueueSubTab === 'negativas'}
+                      onClick={() => handleQueueSubTabClick('negativas')}
+                      isOpen={sidebarTextVisible}
+                      isDark={sidebarIsDark}
+                      colorType="negativas"
+                      badge={queueBadge('negativas')}
+                      badgeScope={distributedBadgeScope}
+                    />
+                    <QueueSubNavItem
+                      label="Fila Proativa"
+                      active={activeTab === 'filas' && activeQueueSubTab === 'proativas'}
+                      onClick={() => handleQueueSubTabClick('proativas')}
+                      isOpen={sidebarTextVisible}
+                      isDark={sidebarIsDark}
+                      colorType="proativas"
+                      badge={queueBadge('proativas')}
+                    />
+                    <QueueSubNavItem
+                      label="CSAT Positivas"
+                      active={activeTab === 'filas' && activeQueueSubTab === 'positivas'}
+                      onClick={() => handleQueueSubTabClick('positivas')}
+                      isOpen={sidebarTextVisible}
+                      isDark={sidebarIsDark}
+                      colorType="positivas"
+                      badge={queueBadge('positivas')}
+                    />
+                    <QueueSubNavItem
+                      label="Chamados Filhos"
+                      active={activeTab === 'filas' && activeQueueSubTab === 'filhos'}
+                      onClick={() => handleQueueSubTabClick('filhos')}
+                      isOpen={sidebarTextVisible}
+                      isDark={sidebarIsDark}
+                      colorType="filhos"
+                      badge={queueBadge('filhos')}
+                      badgeScope={distributedBadgeScope}
+                    />
+                    <QueueSubNavItem
+                      label="Filhos Inválidos"
+                      active={activeTab === 'filas' && activeQueueSubTab === 'filhos_invalidos'}
+                      onClick={() => handleQueueSubTabClick('filhos_invalidos')}
+                      isOpen={sidebarTextVisible}
+                      isDark={sidebarIsDark}
+                      colorType="filhos_invalidos"
+                      badge={queueBadge('filhos_invalidos')}
+                    />
+                  </m.div>
+                )}
+              </AnimatePresence>
+            </div>
+          )}
+          {userData?.role === 'admin' ? (
             <div className="space-y-1">
               <button
                 onClick={handleSettingsClick}
+                onMouseEnter={() => setIsSettingsHovered(true)}
+                onMouseLeave={() => setIsSettingsHovered(false)}
                 className={`
                   w-full flex items-center gap-3 px-4 h-11 rounded-xl transition-all font-bold group relative text-left cursor-pointer
                   ${((activeTab === 'admin' || activeTab === 'custom_dashboard') && !isSettingsOpen)
-                    ? (sidebarIsDark ? 'bg-white/10 text-white' : 'bg-black/10 text-slate-900')
-                    : (sidebarIsDark ? 'text-white/40 hover:text-white hover:bg-white/5' : 'text-slate-900/40 hover:text-slate-900 hover:bg-black/5')}
+                    ? (sidebarIsDark ? 'bg-white/10 text-white' : 'bg-black/10 text-black')
+                    : (sidebarIsDark ? 'text-white/40 hover:text-white hover:bg-white/5' : 'text-slate-800 hover:text-black hover:bg-black/5')}
                 `}
               >
                 {(activeTab === 'admin' || activeTab === 'custom_dashboard') && !isSettingsOpen && (
                   <m.div
                     layoutId="active-bar"
-                    className={`absolute left-0 w-1 h-6 rounded-full ${sidebarIsDark ? 'bg-white' : 'bg-slate-900'}`}
+                    className={`absolute left-0 w-1 h-6 rounded-full ${sidebarIsDark ? 'bg-white' : 'bg-black'}`}
                   />
                 )}
-                <div className={`${((activeTab === 'admin' || activeTab === 'custom_dashboard') && !isSettingsOpen) ? 'text-current' : (sidebarIsDark ? 'text-white/30 group-hover:text-white' : 'text-slate-900/30 group-hover:text-slate-900')}`}>
-                  <Settings className="w-5 h-5" />
+                <div className={`${((activeTab === 'admin' || activeTab === 'custom_dashboard') && !isSettingsOpen) ? 'text-current' : (sidebarIsDark ? 'text-white/30 group-hover:text-white' : 'text-slate-700 group-hover:text-black')}`}>
+                  <AnimatedSettingsIcon isHovered={isSettingsHovered} active={(activeTab === 'admin' || activeTab === 'custom_dashboard') || isSettingsOpen} className="w-5 h-5" />
                 </div>
                 <div className={`flex-1 flex items-center justify-between overflow-hidden transition-all duration-300 ${sidebarTextVisible ? 'opacity-100 max-w-full' : 'opacity-0 max-w-0'}`}>
                   <span className="text-sm tracking-tight whitespace-nowrap block pl-1">
@@ -481,251 +1702,86 @@ function MainApp({
                 )}
               </AnimatePresence>
             </div>
-          )}
+          ) : ['gestor_qualidade', 'qualidade', 'gestor_suporte'].includes(userData?.role || '') ? (
+            <NavItem
+              isDark={sidebarIsDark}
+              icon={AnimatedSettingsIcon}
+              label="Configurações"
+              active={activeTab === 'admin'}
+              onClick={() => setActiveTab('admin')}
+              isOpen={sidebarTextVisible}
+            />
+          ) : null}
         </nav>
 
-        <div className="p-3 border-t border-white/5 interactive-sidebar-item">
-          <div className="relative interactive-sidebar-item">
-            <div className="flex items-center gap-3 p-2 rounded-xl bg-black/10 overflow-hidden">
-              <button
-                onClick={() => setShowTeamList(!showTeamList)}
-                className="profile-toggle-btn w-9 h-9 rounded-lg bg-black/10 flex items-center justify-center flex-shrink-0 hover:bg-black/20 transition-all relative cursor-pointer"
-              >
-                <UserIcon className="w-5 h-5" />
-                <div className="absolute -bottom-0.5 -right-0.5 w-3 h-3 bg-green-500 border-2 rounded-full transition-colors duration-300" style={{ borderColor: sidebarColor || `var(--sidebar-bg-${(userData?.role || 'admin').replace('_', '-')})` }} />
-              </button>
-
-              <div className="flex-1 flex items-center gap-2 min-w-0 overflow-hidden" style={{ opacity: sidebarTextVisible ? 1 : 0, maxWidth: sidebarTextVisible ? undefined : 0, transition: 'opacity 0.15s ease' }}>
-                <button
-                  onClick={() => setShowTeamList(!showTeamList)}
-                  className="profile-toggle-btn min-w-0 flex-1 py-1 text-left cursor-pointer hover:opacity-80 transition-opacity"
-                >
-                  <p className="text-xs font-bold leading-tight truncate">{userData?.name}</p>
-                  <p className={`text-[10px] font-medium ${sidebarContrastSubtle} uppercase tracking-wider mt-0.5 leading-tight truncate`}>
-                    {userData ? ROLE_LABELS[userData.role as UserRole] : ''}
-                  </p>
-                </button>
-
-                <button
-                  onClick={handleLogout}
-                  className={`p-1.5 ${sidebarIsDark ? 'hover:bg-white/10 text-white/40 hover:text-white' : 'hover:bg-black/10 text-slate-900/40 hover:text-slate-900'} rounded-lg transition-colors cursor-pointer flex-shrink-0`}
-                  title="Sair"
-                >
-                  <LogOut className="w-4 h-4" />
-                </button>
-              </div>
+        <div className="p-3 flex-shrink-0 border-t border-white/5 interactive-sidebar-item">
+          <div
+            className="flex items-center gap-3 p-2 rounded-xl bg-black/10 overflow-hidden"
+            title={`${isReconnecting ? 'Reconectando...' : isSystemOnline ? 'Sistema Online' : 'Sistema Offline'} — ${formatDate(new Date(), "EEEE, dd 'de' MMMM", { locale: ptBR })}`}
+          >
+            <div className="w-9 h-9 rounded-lg bg-black/10 flex items-center justify-center flex-shrink-0 relative">
+              <div className={`w-2.5 h-2.5 rounded-full ${isSystemOnline ? 'bg-success animate-pulse' : 'bg-error'} ${isReconnecting ? 'animate-pulse' : ''}`} />
             </div>
 
-            <AnimatePresence>
-              {showTeamList && (
-                <m.div
-                  initial={{ opacity: 0, y: 10, scale: 0.95 }}
-                  animate={{ opacity: 1, y: 0, scale: 1 }}
-                  exit={{ opacity: 0, y: 10, scale: 0.95 }}
-                  className={`absolute w-56 bg-surface-card border border-surface-border rounded-2xl shadow-premium z-50 text-brand-primary interactive-sidebar-popover overflow-hidden ${isSidebarOpen ? 'bottom-full left-0 mb-2' : 'bottom-0 left-full ml-2' }`}
-                >
-                  <div className="p-3 space-y-0.5">
-                    <div>
-                      <button
-                        onClick={() => setSidebarAccordion(sidebarAccordion === 'teams' ? null : 'teams')}
-                        className="w-full flex items-center justify-between gap-2 py-2 px-2 rounded-xl hover:bg-surface-subtle transition-colors cursor-pointer group"
-                      >
-                        <div className="flex items-center gap-2">
-                          <Users className="w-4 h-4 text-brand-accent" />
-                          <span className="text-[11px] font-black uppercase tracking-wider">Equipes</span>
-                        </div>
-                        <ChevronDown className={`w-3.5 h-3.5 text-brand-muted transition-transform duration-200 ${sidebarAccordion === 'teams' ? 'rotate-180' : ''}`} />
-                      </button>
-                      <AnimatePresence initial={false}>
-                        {sidebarAccordion === 'teams' && (
-                          <m.div
-                            initial={{ height: 0, opacity: 0 }}
-                            animate={{ height: 'auto', opacity: 1 }}
-                            exit={{ height: 0, opacity: 0 }}
-                            transition={{ duration: 0.2, ease: 'easeInOut' }}
-                            className="overflow-hidden"
-                          >
-                            <div className="pb-2 px-2 space-y-0.5">
-                              {userTeams.length > 0 ? userTeams.map(t => (
-                                <div key={t.id} className="text-[11px] py-1 px-2 rounded-lg font-semibold text-brand-muted">{t.name}</div>
-                              )) : (
-                                <div className="text-[10px] text-brand-muted italic px-2 py-1">Nenhuma equipe vinculada</div>
-                              )}
-                            </div>
-                          </m.div>
-                        )}
-                      </AnimatePresence>
-                    </div>
-
-                    <div className="border-t border-surface-border">
-                      <button
-                        onClick={() => setSidebarAccordion(sidebarAccordion === 'avatar' ? null : 'avatar')}
-                        className="w-full flex items-center justify-between gap-2 py-2 px-2 rounded-xl hover:bg-surface-subtle transition-colors cursor-pointer group"
-                      >
-                        <div className="flex items-center gap-2">
-                          <UserIcon className="w-4 h-4 text-brand-accent" />
-                          <span className="text-[11px] font-black uppercase tracking-wider">Avatar</span>
-                        </div>
-                        <ChevronDown className={`w-3.5 h-3.5 text-brand-muted transition-transform duration-200 ${sidebarAccordion === 'avatar' ? 'rotate-180' : ''}`} />
-                      </button>
-                      <AnimatePresence initial={false}>
-                        {sidebarAccordion === 'avatar' && (
-                          <m.div
-                            initial={{ height: 0, opacity: 0 }}
-                            animate={{ height: 'auto', opacity: 1 }}
-                            exit={{ height: 0, opacity: 0 }}
-                            transition={{ duration: 0.2, ease: 'easeInOut' }}
-                            className="overflow-hidden"
-                          >
-                            <div className="pb-2 px-2">
-                              <div className="text-[10px] text-brand-muted italic py-1">Em breve</div>
-                            </div>
-                          </m.div>
-                        )}
-                      </AnimatePresence>
-                    </div>
-
-                    <div className="border-t border-surface-border">
-                      <button
-                        onClick={() => setSidebarAccordion(sidebarAccordion === 'appearance' ? null : 'appearance')}
-                        className="w-full flex items-center justify-between gap-2 py-2 px-2 rounded-xl hover:bg-surface-subtle transition-colors cursor-pointer group"
-                      >
-                        <div className="flex items-center gap-2">
-                          {theme === 'dark' ? <Moon className="w-4 h-4 text-brand-accent" /> : theme === 'light' ? <Sun className="w-4 h-4 text-brand-accent" /> : <Monitor className="w-4 h-4 text-brand-accent" />}
-                          <span className="text-[11px] font-black uppercase tracking-wider">Aparência</span>
-                          <span className="text-[10px] font-semibold text-brand-muted normal-case tracking-normal">
-                            {theme === 'light' ? 'Claro' : theme === 'dark' ? 'Escuro' : 'Sistema'}
-                          </span>
-                        </div>
-                        <ChevronDown className={`w-3.5 h-3.5 text-brand-muted transition-transform duration-200 ${sidebarAccordion === 'appearance' ? 'rotate-180' : ''}`} />
-                      </button>
-                      <AnimatePresence initial={false}>
-                        {sidebarAccordion === 'appearance' && (
-                          <m.div
-                            initial={{ height: 0, opacity: 0 }}
-                            animate={{ height: 'auto', opacity: 1 }}
-                            exit={{ height: 0, opacity: 0 }}
-                            transition={{ duration: 0.2, ease: 'easeInOut' }}
-                            className="overflow-hidden"
-                          >
-                            <div className="pb-2 px-2">
-                              <div className="grid grid-cols-3 gap-1 bg-surface-subtle p-1 rounded-xl border border-surface-border">
-                                {[
-                                  { value: 'light', label: 'Claro', icon: Sun },
-                                  { value: 'dark', label: 'Escuro', icon: Moon },
-                                  { value: 'system', label: 'Sistema', icon: Monitor }
-                                ].map(opt => {
-                                  const Icon = opt.icon;
-                                  const isActive = theme === opt.value;
-                                  return (
-                                    <button
-                                      key={opt.value}
-                                      onClick={(e) => { e.stopPropagation(); handleThemeChange(opt.value as Theme); }}
-                                      className={`flex flex-col items-center gap-1 py-1.5 px-1 rounded-lg text-[10px] font-bold transition-all cursor-pointer ${
-                                        isActive
-                                          ? 'bg-surface-card text-brand-primary shadow-sm border border-surface-border'
-                                          : 'text-brand-muted hover:text-brand-primary hover:bg-surface-card/30 border border-transparent'
-                                      }`}
-                                    >
-                                      <Icon className={`w-3.5 h-3.5 ${isActive ? 'text-brand-accent' : 'text-brand-muted'}`} />
-                                      <span>{opt.label}</span>
-                                    </button>
-                                  );
-                                })}
-                              </div>
-                            </div>
-                          </m.div>
-                        )}
-                      </AnimatePresence>
-                    </div>
-
-                    <div className="border-t border-surface-border">
-                      <button
-                        onClick={() => setSidebarAccordion(sidebarAccordion === 'color' ? null : 'color')}
-                        className="w-full flex items-center justify-between gap-2 py-2 px-2 rounded-xl hover:bg-surface-subtle transition-colors cursor-pointer group"
-                      >
-                        <div className="flex items-center gap-2">
-                          <Palette className="w-4 h-4 text-brand-accent" />
-                          <span className="text-[11px] font-black uppercase tracking-wider">Cor do Menu</span>
-                          {sidebarColor && (
-                            <span className="w-3.5 h-3.5 rounded-full flex-shrink-0 border border-surface-border" style={{ backgroundColor: sidebarColor }} />
-                          )}
-                        </div>
-                        <ChevronDown className={`w-3.5 h-3.5 text-brand-muted transition-transform duration-200 ${sidebarAccordion === 'color' ? 'rotate-180' : ''}`} />
-                      </button>
-                      <AnimatePresence initial={false}>
-                        {sidebarAccordion === 'color' && (
-                          <m.div
-                            initial={{ height: 0, opacity: 0 }}
-                            animate={{ height: 'auto', opacity: 1 }}
-                            exit={{ height: 0, opacity: 0 }}
-                            transition={{ duration: 0.2, ease: 'easeInOut' }}
-                            className="overflow-hidden"
-                          >
-                            <div className="pb-2 px-2">
-                              <div className="grid grid-cols-5 gap-1.5">
-                                {sidebarColors.map(opt => {
-                                  const isActive = sidebarColor === opt.value;
-                                  return (
-                                    <button
-                                      key={opt.label}
-                                      onClick={() => { handleSidebarColorChange(opt.value); }}
-                                      className={`w-7 h-7 rounded-full ${opt.hex} border-2 hover:scale-110 active:scale-95 transition-all flex items-center justify-center cursor-pointer ${isActive ? 'border-brand-accent shadow-md scale-105' : 'border-surface-border'}`}
-                                      title={opt.label}
-                                    >
-                                      {isActive && <Check className="w-3.5 h-3.5 text-white drop-shadow" />}
-                                    </button>
-                                  );
-                                })}
-                              </div>
-                            </div>
-                          </m.div>
-                        )}
-                      </AnimatePresence>
-                    </div>
-
-                    <div className="border-t border-surface-border pt-1 mt-1">
-                      <button
-                        onClick={() => { setShowTeamList(false); handleLogout(); }}
-                        className="w-full flex items-center gap-2 py-2 px-2 rounded-xl hover:bg-red-50 dark:hover:bg-red-950/20 text-red-500 hover:text-red-600 dark:hover:text-red-400 transition-colors cursor-pointer"
-                      >
-                        <LogOut className="w-4 h-4" />
-                        <span className="text-[11px] font-black uppercase tracking-wider">Sair</span>
-                      </button>
-                    </div>
-                  </div>
-                </m.div>
-              )}
-            </AnimatePresence>
+            <div
+              className="flex-1 min-w-0 overflow-hidden"
+              style={{
+                opacity: sidebarTextVisible ? 1 : 0,
+                maxWidth: sidebarTextVisible ? undefined : 0,
+                transition: 'opacity 0.15s ease'
+              }}
+            >
+              <div className="flex items-center gap-1.5">
+                <span className={`text-[11px] font-bold tracking-normal leading-tight truncate ${isSystemOnline ? '' : 'text-error'}`}>
+                  {isReconnecting ? 'Reconectando...' : isSystemOnline ? 'Sistema Online' : 'Sistema Offline'}
+                </span>
+              </div>
+              <p className={`text-[10px] font-medium ${sidebarContrastSubtle} capitalize tracking-wider mt-0.5 leading-tight truncate`}>
+                {formatDate(new Date(), "EEEE, dd 'de' MMMM", { locale: ptBR })}
+              </p>
+            </div>
           </div>
         </div>
       </m.aside>
 
       <main className="flex-1 flex flex-col min-w-0 overflow-hidden bg-surface-bg">
-        <header className="px-8 h-20 flex items-center gap-4 border-b border-surface-border/50">
+        <header className="px-3.5 sm:px-6 md:px-8 h-16 md:h-20 flex items-center gap-2.5 sm:gap-4 border-b border-surface-border/60 bg-surface-bg/85 backdrop-blur-md sticky top-0 z-20 transition-colors">
           <button
-            onClick={() => toggleSidebar()}
-            className="sidebar-toggle-btn p-2 hover:bg-surface-subtle border border-surface-border/40 rounded-xl transition-all text-brand-muted hover:text-brand-primary shadow-sm flex-shrink-0 flex items-center justify-center w-10 h-10 cursor-pointer"
+            onClick={() => {
+              if (typeof window !== 'undefined' && window.innerWidth < 768) {
+                setIsMobileMenuOpen(prev => !prev);
+              } else {
+                toggleSidebar();
+              }
+            }}
+            className="sidebar-toggle-btn p-2 hover:bg-surface-subtle border border-surface-border/40 rounded-xl transition-all text-brand-muted hover:text-brand-primary shadow-xs flex-shrink-0 flex items-center justify-center w-10 h-10 cursor-pointer"
             title={isSidebarOpen ? "Recolher Menu" : "Expandir Menu"}
           >
-            <Layout className="w-4 h-4 layout-icon" />
-            {isSidebarOpen ? (
-              <ChevronLeft className="w-4 h-4 arrow-icon" />
-            ) : (
-              <ChevronRight className="w-4 h-4 arrow-icon" />
-            )}
+            <div className="md:hidden">
+              <Menu className="w-5 h-5" />
+            </div>
+            <div className="hidden md:flex items-center">
+              <Layout className="w-4 h-4 layout-icon" />
+              {isSidebarOpen ? (
+                <ChevronLeft className="w-4 h-4 arrow-icon" />
+              ) : (
+                <ChevronRight className="w-4 h-4 arrow-icon" />
+              )}
+            </div>
           </button>
 
           <div className="min-w-0 flex-1">
             <div className="flex flex-col">
-              <h2 className="text-xl font-black text-brand-primary tracking-tight">
+              <h2 className="text-base sm:text-xl font-bold text-brand-primary tracking-tight leading-snug truncate">
                 {activeTab === 'dashboard'
                   ? `Olá, ${userData?.name.split(' ')[0]}! 👋`
                   : activeTab === 'monitorias'
                   ? 'Gestão de Monitorias'
+                  : activeTab === 'filas'
+                  ? (QUEUE_TITLES[activeQueueSubTab] || 'Filas de Triagem')
                   : 'Configurações do Sistema'}
               </h2>
-              <p className="text-[10px] font-black text-brand-muted uppercase tracking-widest mt-0.5">
+              <p className="hidden sm:block text-xs font-semibold text-brand-muted tracking-wide mt-1 leading-relaxed truncate">
                 {activeTab === 'dashboard'
                   ? (userData?.role === 'suporte'
                     ? 'Acompanhe seu desempenho e evolução individual'
@@ -734,37 +1790,319 @@ function MainApp({
                     : 'Visão executiva da performance e KPIs globais')
                   : activeTab === 'monitorias'
                   ? 'Fluxo de auditoria, contestações e reavaliações'
-                  : 'Parâmetros de qualidade, prazos de ação e horários comerciais'}
+                  : activeTab === 'filas'
+                  ? (QUEUE_SUBTITLES[activeQueueSubTab] || 'Triagem inteligente de chamados do Zendesk')
+                  : 'Parâmetros de qualidade, usuários, equipes e inteligência artificial'}
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-6">
-            <div className="hidden xl:flex flex-col items-end">
-              <p className="text-[10px] font-black text-brand-muted uppercase tracking-widest">{formatDate(new Date(), "EEEE, dd 'de' MMMM", { locale: ptBR })}</p>
-              <div className="flex items-center gap-1.5 mt-0.5">
-                <div className={`w-1.5 h-1.5 rounded-full ${isSystemOnline ? 'bg-success animate-pulse' : 'bg-error'} ${isReconnecting ? 'animate-bounce' : ''}`} />
-                <span className={`text-[9px] font-bold uppercase tracking-tight ${isSystemOnline ? 'text-brand-primary' : 'text-error'}`}>
-                  {isReconnecting ? 'Reconectando...' : isSystemOnline ? 'Sistema Online' : 'Sistema Offline'}
-                </span>
-              </div>
+          <div className="flex items-center gap-2 sm:gap-4">
+            {(userData?.role === 'qualidade' || userData?.role === 'gestor_qualidade' || userData?.role === 'admin') && (
+              <button
+                onClick={handleOpenNewMonitoria}
+                className="hidden sm:flex action-primary h-10 px-5 rounded-xl text-sm font-semibold shadow-premium transition-all items-center gap-2"
+              >
+                <Plus className="w-4 h-4" /> Nova Monitoria
+              </button>
+            )}
+
+            {/* Command Palette Trigger (Ctrl + K) */}
+            <button
+              onClick={() => setIsCommandPaletteOpen(true)}
+              className="flex items-center gap-2 h-10 px-3 py-1.5 rounded-xl border border-surface-border/60 bg-surface-card hover:bg-surface-subtle text-brand-muted hover:text-brand-primary transition-all text-xs font-medium shadow-xs"
+              title="Busca rápida universal (Ctrl + K)"
+            >
+              <Search className="w-3.5 h-3.5 text-brand-muted" />
+              <span className="hidden md:inline text-xs text-brand-muted">Buscar...</span>
+              <kbd className="hidden sm:inline-flex items-center px-1.5 py-0.5 text-[10px] font-semibold text-brand-muted bg-surface-subtle/80 rounded border border-surface-border/80">
+                Ctrl K
+              </kbd>
+            </button>
+
+            {/* Notificações do Sistema: Carta Animada (Fechada com animação e branco preenchido quando há novas / Aberta estática quando todas lidas) */}
+            <div className="relative">
+              <button
+                onClick={() => {
+                  setShowNotifications(!showNotifications);
+                  setShowTeamList(false);
+                }}
+                className={`notifications-toggle-btn relative p-2.5 rounded-xl border transition-all cursor-pointer shadow-xs flex items-center justify-center ${
+                  unreadNotificationsCount > 0
+                    ? 'bg-brand-highlight text-white border-brand-highlight hover:bg-brand-highlight/90 shadow-md ring-2 ring-brand-highlight/25'
+                    : 'bg-surface-card border-surface-border/60 hover:bg-surface-subtle text-brand-muted hover:text-brand-primary'
+                }`}
+                title={unreadNotificationsCount > 0 ? `${unreadNotificationsCount} novas notificações (carta fechada)` : 'Todas as notificações foram lidas (carta aberta)'}
+              >
+                {unreadNotificationsCount > 0 ? (
+                  <m.div
+                    animate={{
+                      scale: [1, 1.14, 1],
+                      rotate: [0, -6, 6, 0]
+                    }}
+                    transition={{
+                      repeat: Infinity,
+                      duration: 2.2,
+                      ease: "easeInOut"
+                    }}
+                    className="flex items-center justify-center"
+                  >
+                    <Mail className="w-4 h-4" />
+                  </m.div>
+                ) : (
+                  <MailOpen className="w-4 h-4 text-brand-muted hover:text-brand-primary transition-colors" />
+                )}
+
+                {unreadNotificationsCount > 0 && (
+                  <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] rounded-full bg-red-600 !text-white text-[9px] font-black flex items-center justify-center px-1 border-2 border-white shadow-sm">
+                    {unreadNotificationsCount}
+                  </span>
+                )}
+              </button>
+
+              <AnimatePresence>
+                {showNotifications && (
+                  <m.div
+                    initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: 10, scale: 0.95 }}
+                    transition={{ duration: 0.15 }}
+                    className="absolute -right-12 sm:right-0 top-full mt-2 w-[calc(100vw-2rem)] sm:w-96 max-w-sm bg-surface-card border border-surface-border rounded-2xl shadow-premium z-50 text-brand-primary notifications-popover overflow-hidden"
+                  >
+                    {/* Header do Menu */}
+                    <div className="p-3.5 border-b border-surface-border bg-surface-subtle/40 flex flex-col gap-2">
+                      <div className="flex items-center gap-2">
+                        {unreadNotificationsCount > 0 ? (
+                          <div className="w-7 h-7 rounded-lg bg-brand-highlight/15 text-brand-highlight flex items-center justify-center">
+                            <Mail className="w-4 h-4" />
+                          </div>
+                        ) : (
+                          <div className="w-7 h-7 rounded-lg bg-surface-card text-brand-muted border border-surface-border flex items-center justify-center">
+                            <MailOpen className="w-4 h-4" />
+                          </div>
+                        )}
+                        <div>
+                          <h4 className="text-xs font-black text-brand-primary leading-tight">Histórico de Notificações</h4>
+                          <p className="text-[10px] text-brand-muted">
+                            {unreadNotificationsCount > 0
+                              ? `${unreadNotificationsCount} pendente(s) de leitura`
+                              : 'Todas as notificações marcadas como lidas'}
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-end gap-1.5">
+                        {unreadNotificationsCount > 0 && (
+                          <button
+                            onClick={markAllNotificationsAsRead}
+                            className="text-[10px] font-bold text-brand-highlight hover:text-brand-highlight/80 hover:bg-brand-highlight/10 px-2 py-1 rounded-lg flex items-center gap-1 cursor-pointer transition-all border border-brand-highlight/30"
+                            title="Marcar todas como lidas e abrir o envelope"
+                          >
+                            <CheckCheck className="w-3.5 h-3.5" />
+                            <span>Marcar lidas</span>
+                          </button>
+                        )}
+                        {visibleNotifications.length > 0 && (
+                          <button
+                            onClick={clearNotifications}
+                            className="text-[10px] font-bold text-brand-muted hover:text-brand-primary hover:bg-surface-subtle px-2 py-1 rounded-lg flex items-center gap-1 cursor-pointer transition-all border border-surface-border"
+                            title="Limpar o histórico de notificações neste navegador"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>Limpar</span>
+                          </button>
+                        )}
+                        <button
+                          onClick={() => setShowNotifications(false)}
+                          className="p-1 text-brand-muted hover:text-brand-primary hover:bg-surface-subtle rounded-lg transition-colors cursor-pointer"
+                          title="Fechar notificações"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Lista do Histórico */}
+                    <div className="max-h-80 overflow-y-auto divide-y divide-surface-border/50 no-scrollbar">
+                      {visibleNotifications.length === 0 ? (
+                        <div className="p-8 text-center text-brand-muted">
+                          <MailOpen className="w-8 h-8 opacity-35 mx-auto mb-2 text-brand-muted" />
+                          <p className="text-xs font-semibold">Caixa de entrada limpa!</p>
+                          <p className="text-[10px]">Nenhuma nova notificação pendente.</p>
+                        </div>
+                      ) : (
+                        visibleNotifications.map(item => (
+                          <div
+                            key={item.id}
+                            onClick={() => handleNotificationClick(item)}
+                            className={`p-3.5 hover:bg-surface-subtle transition-colors cursor-pointer flex items-start gap-3 ${
+                              item.read ? 'opacity-65' : 'bg-brand-highlight/[0.04]'
+                            }`}
+                          >
+                            <div className={`w-8 h-8 rounded-xl flex items-center justify-center flex-shrink-0 mt-0.5 shadow-xs ${item.iconBg}`}>
+                              {item.icon}
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center justify-between gap-1.5">
+                                <p className="text-xs font-bold text-brand-primary truncate">{item.title}</p>
+                                <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-brand-muted whitespace-nowrap bg-surface-subtle px-1.5 py-0.5 rounded-md border border-surface-border/40">
+                                  <Clock className="w-2.5 h-2.5 opacity-70" />
+                                  {item.time}
+                                </span>
+                              </div>
+                              <p className="text-[11px] text-brand-muted line-clamp-2 mt-0.5 leading-snug">{item.message}</p>
+                            </div>
+                            {!item.read && (
+                              <div className="w-2 h-2 rounded-full bg-brand-highlight flex-shrink-0 mt-2 shadow-xs animate-pulse" />
+                            )}
+                          </div>
+                        ))
+                      )}
+                    </div>
+
+                    {/* Rodapé com status do envelope */}
+                    <div className="p-2.5 border-t border-surface-border bg-surface-subtle/20 flex items-center justify-between text-[10px] text-brand-muted">
+                      <span>{visibleNotifications.length} evento(s) no histórico</span>
+                      {unreadNotificationsCount === 0 && (
+                        <span className="inline-flex items-center gap-1 text-functional-success font-bold">
+                          <CheckCheck className="w-3 h-3" /> Em dia
+                        </span>
+                      )}
+                    </div>
+                  </m.div>
+                )}
+              </AnimatePresence>
             </div>
 
-            <div className="flex items-center gap-4">
-              {userData?.role === 'qualidade' && (
-                <button
-                  onClick={() => setIsFormOpen(true)}
-                  className="bg-brand-primary text-brand-on-primary h-10 px-5 rounded-xl text-xs font-black shadow-premium hover:opacity-90 transition-all flex items-center gap-2"
-                >
-                  <Plus className="w-4 h-4" /> Nova Monitoria
-                </button>
-              )}
+            {/* Perfil do Usuário com Menu Dropdown Completo */}
+            <div className="relative">
+              <button
+                onClick={() => setShowTeamList(!showTeamList)}
+                className="profile-toggle-btn flex items-center gap-2.5 p-1.5 pr-3 rounded-xl border border-surface-border/60 hover:bg-surface-subtle transition-all cursor-pointer shadow-xs group"
+                title="Meu Perfil"
+              >
+                <div className="w-8 h-8 rounded-lg bg-brand-highlight/10 text-brand-highlight flex items-center justify-center font-bold text-xs flex-shrink-0 relative">
+                  {userData?.name ? userData.name.substring(0, 2).toUpperCase() : <UserIcon className="w-4 h-4" />}
+                  <div className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-surface-bg ${isSystemOnline ? 'bg-success' : 'bg-error'}`} />
+                </div>
+                <div className="hidden sm:flex flex-col text-left min-w-0 max-w-[140px]">
+                  <p className="text-xs font-bold text-brand-primary truncate leading-tight">{userData?.name}</p>
+                  <p className="text-[10px] font-medium text-brand-muted uppercase tracking-wider truncate leading-tight mt-0.5">
+                    {userData ? ROLE_LABELS[userData.role as UserRole] : ''}
+                  </p>
+                </div>
+                <ChevronDown className={`w-3.5 h-3.5 text-brand-muted transition-transform duration-200 ${showTeamList ? 'rotate-180' : ''}`} />
+              </button>
+
+              <AnimatePresence>
+                {showTeamList && (
+                  <m.div
+                    initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: 10, scale: 0.95 }}
+                    transition={{ duration: 0.15 }}
+                    className="absolute right-0 top-full mt-2 w-64 bg-surface-card border border-surface-border rounded-2xl shadow-premium z-50 text-brand-primary interactive-sidebar-popover overflow-hidden"
+                  >
+                    <div className="p-3 border-b border-surface-border bg-surface-subtle/30">
+                      <p className="text-xs font-bold text-brand-primary truncate">{userData?.name}</p>
+                      <p className="text-[10px] text-brand-muted truncate">{userData?.email}</p>
+                      <div className="mt-1.5 flex items-center gap-1.5 flex-wrap">
+                        <span className="px-1.5 py-0.5 rounded-md bg-brand-highlight/10 text-brand-highlight text-[9px] font-bold uppercase tracking-wider">
+                          {userData ? ROLE_LABELS[userData.role as UserRole] : ''}
+                        </span>
+                        {userTeams.length > 0 && (
+                          <span className="text-[10px] text-brand-muted truncate max-w-[160px]" title={teamNames}>
+                            • {userTeams[0].name} {userTeams.length > 1 ? `(+${userTeams.length - 1})` : ''}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="p-2 space-y-0.5">
+                      <div>
+                        <button
+                          onClick={() => setSidebarAccordion(sidebarAccordion === 'teams' ? null : 'teams')}
+                          className="w-full flex items-center justify-between gap-2 py-2 px-2 rounded-xl hover:bg-surface-subtle transition-colors cursor-pointer group"
+                        >
+                          <div className="flex items-center gap-2">
+                            <Users className="w-4 h-4 text-brand-accent" />
+                            <span className="text-[11px] font-bold">Minhas Equipes</span>
+                          </div>
+                          <ChevronDown className={`w-3.5 h-3.5 text-brand-muted transition-transform duration-200 ${sidebarAccordion === 'teams' ? 'rotate-180' : ''}`} />
+                        </button>
+                        <AnimatePresence initial={false}>
+                          {sidebarAccordion === 'teams' && (
+                            <m.div
+                              initial={{ height: 0, opacity: 0 }}
+                              animate={{ height: 'auto', opacity: 1 }}
+                              exit={{ height: 0, opacity: 0 }}
+                              transition={{ duration: 0.2, ease: 'easeInOut' }}
+                              className="overflow-hidden"
+                            >
+                              <div className="pb-2 px-2 space-y-0.5">
+                                {userTeams.length > 0 ? userTeams.map(t => (
+                                  <div key={t.id} className="text-[11px] py-1 px-2 rounded-lg font-semibold text-brand-muted">{t.name}</div>
+                                )) : (
+                                  <div className="text-[10px] text-brand-muted italic px-2 py-1">Nenhuma equipe vinculada</div>
+                                )}
+                              </div>
+                            </m.div>
+                          )}
+                        </AnimatePresence>
+                      </div>
+
+                      <div className="border-t border-surface-border">
+                        <button
+                          onClick={() => setSidebarAccordion(sidebarAccordion === 'appearance' ? null : 'appearance')}
+                          className="w-full flex items-center justify-between gap-2 py-2 px-2 rounded-xl hover:bg-surface-subtle transition-colors cursor-pointer group"
+                        >
+                          <div className="flex items-center gap-2">
+                            {theme === 'dark' ? <Moon className="w-4 h-4 text-brand-accent" /> : theme === 'light' ? <Sun className="w-4 h-4 text-brand-accent" /> : <Monitor className="w-4 h-4 text-brand-accent" />}
+                            <span className="text-[11px] font-bold">Aparência</span>
+                            <span className="text-[10px] font-semibold text-brand-muted normal-case tracking-normal">
+                              {theme === 'light' ? 'Claro' : theme === 'dark' ? 'Escuro' : 'Sistema'}
+                            </span>
+                          </div>
+                          <ChevronDown className={`w-3.5 h-3.5 text-brand-muted transition-transform duration-200 ${sidebarAccordion === 'appearance' ? 'rotate-180' : ''}`} />
+                        </button>
+                        <AnimatePresence initial={false}>
+                          {sidebarAccordion === 'appearance' && (
+                            <m.div
+                              initial={{ height: 0, opacity: 0 }}
+                              animate={{ height: 'auto', opacity: 1 }}
+                              exit={{ height: 0, opacity: 0 }}
+                              transition={{ duration: 0.2, ease: 'easeInOut' }}
+                              className="overflow-hidden"
+                            >
+                              <div className="pb-2 px-2">
+                                <p className="py-2 text-xs text-brand-muted">
+                                  Acompanha automaticamente o tema claro ou escuro do seu dispositivo.
+                                </p>
+                              </div>
+                            </m.div>
+                          )}
+                        </AnimatePresence>
+                      </div>
+
+                      <div className="border-t border-surface-border pt-1 mt-1">
+                        <button
+                          onClick={() => { setShowTeamList(false); handleLogout(); }}
+                          className="w-full flex items-center gap-2 py-2 px-2 rounded-xl hover:bg-red-50 dark:hover:bg-red-950/20 text-red-500 hover:text-red-600 dark:hover:text-red-400 transition-colors cursor-pointer"
+                        >
+                          <LogOut className="w-4 h-4" />
+                          <span className="text-[11px] font-bold">Sair da Conta</span>
+                        </button>
+                      </div>
+                    </div>
+                  </m.div>
+                )}
+              </AnimatePresence>
             </div>
           </div>
         </header>
 
-        <div className="flex-1 overflow-auto px-8 pb-8 pt-6 min-w-0" style={{ scrollbarGutter: 'stable' }}>
-          <React.Suspense fallback={<div className="flex justify-center items-center h-full"><div className="w-8 h-8 border-4 border-brand-accent border-t-transparent rounded-full animate-spin"></div></div>}>
+        <div className="flex-1 overflow-auto px-3.5 sm:px-6 md:px-8 pb-24 md:pb-8 pt-4 md:pt-6 min-w-0" style={{ scrollbarGutter: 'stable' }}>
+          <React.Suspense fallback={<PageSkeleton dashboard={activeTab === 'dashboard'} />}>
             {activeTab === 'dashboard' && (
               <div className="animate-fade-in">
                 <DashboardMain user={userData} activeTab={activeTab} />
@@ -772,56 +2110,287 @@ function MainApp({
             )}
             {activeTab === 'monitorias' && (
               <div className="animate-fade-in">
-                <MonitoriaList user={userData} onNew={() => setIsFormOpen(true)} activeTab={activeTab} />
+                <MonitoriaList
+                  user={userData}
+                  activeTab={activeTab}
+                  initialFocusTarget={focusMonitoriaTarget}
+                  onClearFocusTarget={() => setFocusMonitoriaTarget(null)}
+                />
               </div>
             )}
-            {userData?.role === 'admin' && (
-              <>
-                {activeTab === 'admin' && (
-                  <div className="animate-fade-in">
-                    <AdminPanel user={userData} />
-                  </div>
-                )}
-                {activeTab === 'custom_dashboard' && (
-                  <div className="animate-fade-in">
-                    <CustomDashboardManagement user={userData} />
-                  </div>
-                )}
-              </>
+            {activeTab === 'filas' && (
+              <div className="animate-fade-in">
+                <AuditingQueueView
+                  agents={users.filter(u => u.role === 'suporte' && u.active !== false)}
+                  teams={teams}
+                  forms={forms}
+                  guidelines={guidelines}
+                  monitorias={monitorias}
+                  currentUserId={userData?.id}
+                  currentUserRole={userData?.role}
+                  qualityMonitors={users.filter(u => u.role === 'qualidade' && u.active !== false)}
+                  onStartAudit={handleStartAuditFromQueue}
+                  onOpenExistingMonitoria={id => setInPlaceMonitoriaId(id)}
+                  onModalStateChange={setIsQueueModalOpen}
+                  activeSubTab={activeQueueSubTab}
+                  onSubTabChange={setActiveQueueSubTab}
+                  onPendingNegativesCountChange={updatePendingNegativesCount}
+                />
+              </div>
+            )}
+            {['admin', 'gestor_qualidade', 'qualidade', 'gestor_suporte'].includes(userData?.role || '') && activeTab === 'admin' && (
+              <div className="animate-fade-in">
+                <AdminPanel user={userData} initialSubTab={adminSubTab} />
+              </div>
+            )}
+            {userData?.role === 'admin' && activeTab === 'custom_dashboard' && (
+              <div className="animate-fade-in">
+                <CustomDashboardManagement user={userData} />
+              </div>
             )}
           </React.Suspense>
         </div>
+
+        {/* Mobile Bottom Navigation Bar */}
+        <nav
+          aria-label="Navegação Principal Mobile"
+          className="fixed bottom-0 inset-x-0 z-40 md:hidden bg-surface-card/95 backdrop-blur-lg border-t border-surface-border/80 px-2 pt-1 pb-safe flex items-center justify-around shadow-premium select-none"
+        >
+          {/* Dashboard */}
+          <button
+            type="button"
+            onClick={() => { setActiveTab('dashboard'); setIsMobileMenuOpen(false); }}
+            className={`flex flex-col items-center justify-center min-w-[56px] py-1 transition-all cursor-pointer ${
+              activeTab === 'dashboard' ? 'text-brand-accent' : 'text-brand-muted hover:text-brand-primary'
+            }`}
+          >
+            <AnimatedDashboardIcon active={activeTab === 'dashboard'} className="w-5 h-5" />
+            <span className={`text-[10px] tracking-tight mt-1 ${activeTab === 'dashboard' ? 'font-black' : 'font-medium'}`}>
+              Dashboard
+            </span>
+          </button>
+
+          {/* Monitorias */}
+          <button
+            type="button"
+            onClick={() => { setActiveTab('monitorias'); setIsMobileMenuOpen(false); }}
+            className={`flex flex-col items-center justify-center min-w-[56px] py-1 transition-all cursor-pointer ${
+              activeTab === 'monitorias' ? 'text-brand-accent' : 'text-brand-muted hover:text-brand-primary'
+            }`}
+          >
+            <AnimatedMonitoriasIcon active={activeTab === 'monitorias'} className="w-5 h-5" />
+            <span className={`text-[10px] tracking-tight mt-1 ${activeTab === 'monitorias' ? 'font-black' : 'font-medium'}`}>
+              Monitorias
+            </span>
+          </button>
+
+          {/* Botão Central de Nova Monitoria (para perfis autorizados) */}
+          {(userData?.role === 'qualidade' || userData?.role === 'gestor_qualidade' || userData?.role === 'admin') && (
+            <button
+              type="button"
+              onClick={handleOpenNewMonitoria}
+              className="relative -top-3 w-12 h-12 rounded-2xl bg-brand-accent text-white flex items-center justify-center shadow-lg active:scale-95 transition-transform cursor-pointer"
+              title="Nova Monitoria"
+              aria-label="Nova Monitoria"
+            >
+              <Plus className="w-6 h-6" />
+            </button>
+          )}
+
+          {/* Filas de Triagem (se não for suporte) */}
+          {userData?.role !== 'suporte' && (
+            <button
+              type="button"
+              onClick={() => { setActiveTab('filas'); setIsMobileMenuOpen(false); }}
+              className={`relative flex flex-col items-center justify-center min-w-[56px] py-1 transition-all cursor-pointer ${
+                activeTab === 'filas' ? 'text-brand-accent' : 'text-brand-muted hover:text-brand-primary'
+              }`}
+            >
+              <AnimatedLayersIcon active={activeTab === 'filas'} className="w-5 h-5" />
+              <span className={`text-[10px] tracking-tight mt-1 ${activeTab === 'filas' ? 'font-black' : 'font-medium'}`}>
+                Filas
+              </span>
+            </button>
+          )}
+
+          {/* Menu / Mais */}
+          <button
+            type="button"
+            onClick={() => setIsMobileMenuOpen(true)}
+            className={`relative flex flex-col items-center justify-center min-w-[56px] py-1 transition-all cursor-pointer ${
+              isMobileMenuOpen ? 'text-brand-accent' : 'text-brand-muted hover:text-brand-primary'
+            }`}
+            title="Abrir menu"
+          >
+            <div className="w-5 h-5 flex items-center justify-center">
+              <Layout className="w-5 h-5" />
+            </div>
+            {unreadNotificationsCount > 0 && (
+              <span className="absolute top-0 right-2 w-2 h-2 rounded-full bg-red-600 ring-2 ring-surface-card" />
+            )}
+            <span className="text-[10px] tracking-tight mt-1 font-medium">
+              Menu
+            </span>
+          </button>
+        </nav>
       </main>
     </div>
   );
 }
 
-function NavItem({ icon, label, active, onClick, isOpen, isDark, badge }: any) {
+function AnimatedDashboardIcon({ isHovered, active, className }: { isHovered?: boolean; active?: boolean; className?: string }) {
+  const isTriggered = !!(isHovered || active);
+  return (
+    <m.svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className || "w-5 h-5"}
+      animate={{ scale: isTriggered ? 1.08 : 1 }}
+      transition={{ type: "spring", stiffness: 400, damping: 20 }}
+    >
+      {/* Top-left: grande */}
+      <m.rect
+        x="3" y="3" width="7" height="9" rx="1"
+        animate={{ width: isTriggered ? 8 : 7, height: isTriggered ? 10 : 9 }}
+        transition={{ type: "spring", stiffness: 380, damping: 22 }}
+      />
+      {/* Top-right: pequeno */}
+      <m.rect
+        x="14" y="3" width="7" height="5" rx="1"
+        animate={{ width: isTriggered ? 8 : 7, height: isTriggered ? 4 : 5 }}
+        transition={{ type: "spring", stiffness: 380, damping: 22 }}
+      />
+      {/* Bottom-right: grande */}
+      <m.rect
+        x="14" y="12" width="7" height="9" rx="1"
+        animate={{ width: isTriggered ? 8 : 7, height: isTriggered ? 10 : 9 }}
+        transition={{ type: "spring", stiffness: 380, damping: 22 }}
+      />
+      {/* Bottom-left: pequeno */}
+      <m.rect
+        x="3" y="16" width="7" height="5" rx="1"
+        animate={{ width: isTriggered ? 8 : 7, height: isTriggered ? 4 : 5 }}
+        transition={{ type: "spring", stiffness: 380, damping: 22 }}
+      />
+    </m.svg>
+  );
+}
+
+function AnimatedMonitoriasIcon({ isHovered, active, className }: { isHovered?: boolean; active?: boolean; className?: string }) {
+  const isTriggered = !!(isHovered || active);
+  return (
+    <m.svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className || "w-5 h-5"}
+      animate={{ scale: isTriggered ? [1, 1.08, 1] : 1 }}
+      transition={{ duration: 0.3 }}
+    >
+      <rect x="8" y="2" width="8" height="4" rx="1" ry="1" />
+      <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+      <m.path
+        d="m9 14 2 2 4-4"
+        animate={isTriggered ? { pathLength: [0, 1], opacity: [0.4, 1] } : { pathLength: 1, opacity: 1 }}
+        transition={{ duration: 0.35, ease: "easeOut" }}
+      />
+    </m.svg>
+  );
+}
+
+function AnimatedLayersIcon({ isHovered, active, className }: { isHovered?: boolean; active?: boolean; className?: string }) {
+  const isTriggered = !!(isHovered || active);
+  return (
+    <m.svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={`overflow-visible ${className || "w-5 h-5"}`}
+      style={{ overflow: 'visible' }}
+    >
+      <g transform="translate(0, 1) scale(0.92) translate(1, 0)">
+        <m.path
+          d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"
+          animate={{ y: isTriggered ? -2 : 0 }}
+          transition={{ type: "spring", stiffness: 350, damping: 20 }}
+        />
+        <path d="M2 12a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 12" />
+        <m.path
+          d="M2 17a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 17"
+          animate={{ y: isTriggered ? 2 : 0 }}
+          transition={{ type: "spring", stiffness: 350, damping: 20 }}
+        />
+      </g>
+    </m.svg>
+  );
+}
+
+function AnimatedSettingsIcon({ isHovered, active, className }: { isHovered?: boolean; active?: boolean; className?: string }) {
+  const isTriggered = !!(isHovered || active);
+  return (
+    <m.svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className || "w-5 h-5"}
+      animate={{ rotate: isTriggered ? 90 : 0 }}
+      transition={{ type: "spring", stiffness: 220, damping: 18 }}
+    >
+      <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
+      <circle cx="12" cy="12" r="3" />
+    </m.svg>
+  );
+}
+
+function NavItem({ icon: IconComponent, label, active, onClick, isOpen, isDark, badge }: any) {
+  const [isHovered, setIsHovered] = React.useState(false);
+
   return (
     <button
       onClick={onClick}
+      onMouseEnter={() => setIsHovered(true)}
+      onMouseLeave={() => setIsHovered(false)}
       className={`
         w-full flex items-center gap-3 px-4 h-11 rounded-xl transition-all font-bold group relative
         ${active
-          ? (isDark ? 'bg-white/10 text-white' : 'bg-black/10 text-slate-900')
-          : (isDark ? 'text-white/40 hover:text-white hover:bg-white/5' : 'text-slate-900/40 hover:text-slate-900 hover:bg-black/5')}
+          ? (isDark ? 'bg-white/10 text-white' : 'bg-black/10 text-black font-extrabold')
+          : (isDark ? 'text-white/40 hover:text-white hover:bg-white/5' : 'text-slate-800 hover:text-black hover:bg-black/5 font-bold')}
       `}
     >
       {active && (
         <m.div
           layoutId="active-bar"
-          className={`absolute left-0 w-1 h-6 rounded-full ${isDark ? 'bg-white' : 'bg-slate-900'}`}
+          className={`absolute left-0 w-1 h-6 rounded-full ${isDark ? 'bg-white' : 'bg-black'}`}
         />
       )}
-      <div className={`${active ? 'text-current' : (isDark ? 'text-white/30 group-hover:text-white' : 'text-slate-900/30 group-hover:text-slate-900')}`}>
-        {icon}
+      <div className={`${active ? 'text-current' : (isDark ? 'text-white/30 group-hover:text-white' : 'text-slate-700 group-hover:text-black')}`}>
+        {typeof IconComponent === 'function' ? (
+          <IconComponent isHovered={isHovered} active={active} className="w-5 h-5" />
+        ) : React.isValidElement(IconComponent) ? (
+          React.cloneElement(IconComponent as React.ReactElement<any>, { isHovered, active })
+        ) : (
+          IconComponent
+        )}
       </div>
       <div className={`flex-1 flex items-center justify-between overflow-hidden transition-all duration-300 ${isOpen ? 'opacity-100 max-w-full' : 'opacity-0 max-w-0'}`}>
         <span className="text-sm tracking-tight whitespace-nowrap block pl-1">
           {label}
         </span>
         {badge && (
-          <span className={`text-[9px] font-black uppercase tracking-wider px-2 py-0.5 rounded-full border border-dashed ml-2 leading-none whitespace-nowrap ${isDark ? 'border-white/10 text-white/40 bg-white/5' : 'border-slate-300/60 text-slate-500/80 bg-slate-50'}`}>
+          <span className={`text-[9px] font-black uppercase tracking-wider px-2 py-0.5 rounded-full border border-dashed ml-2 leading-none whitespace-nowrap ${isDark ? 'border-white/10 text-white/40 bg-white/5' : 'border-slate-300/60 text-slate-800 bg-slate-100'}`}>
             {badge}
           </span>
         )}
@@ -837,13 +2406,13 @@ function SubNavItem({ label, active, onClick, isOpen, isDark, badge }: any) {
       className={`
         w-full flex items-center justify-between pl-11 pr-4 h-9 rounded-xl transition-all font-medium text-xs group relative
         ${active
-          ? (isDark ? 'bg-white/5 text-white font-bold' : 'bg-black/5 text-slate-900 font-bold')
-          : (isDark ? 'text-white/40 hover:text-white hover:bg-white/5' : 'text-slate-900/40 hover:text-slate-900 hover:bg-black/5')}
+          ? (isDark ? 'bg-white/5 text-white font-bold' : 'bg-black/5 text-black font-bold')
+          : (isDark ? 'text-white/40 hover:text-white hover:bg-white/5' : 'text-slate-800 hover:text-black hover:bg-black/5 font-semibold')}
       `}
     >
       {active && (
         <div
-          className={`absolute left-5 w-1 h-4 rounded-full ${isDark ? 'bg-white' : 'bg-slate-900'}`}
+          className={`absolute left-5 w-1 h-4 rounded-full ${isDark ? 'bg-white' : 'bg-black'}`}
         />
       )}
       <span className="tracking-tight whitespace-nowrap block">
@@ -857,3 +2426,126 @@ function SubNavItem({ label, active, onClick, isOpen, isDark, badge }: any) {
     </button>
   );
 }
+
+const QUEUE_COLOR_MAP: Record<QueueSubTab, {
+  dot: string;
+  bar: string;
+  activeTextLight: string;
+  activeTextDark: string;
+  activeBgLight: string;
+  activeBgDark: string;
+  badgeBg: string;
+}> = {
+  negativas: {
+    dot: 'bg-rose-500 shadow-sm shadow-rose-500/40',
+    bar: 'bg-rose-500',
+    activeTextLight: 'text-rose-950 font-bold',
+    activeTextDark: 'text-rose-200 font-bold',
+    activeBgLight: 'bg-rose-500/10',
+    activeBgDark: 'bg-rose-500/15',
+    badgeBg: 'bg-rose-500 text-white',
+  },
+  proativas: {
+    dot: 'bg-indigo-500 shadow-sm shadow-indigo-500/40',
+    bar: 'bg-indigo-500',
+    activeTextLight: 'text-indigo-950 font-bold',
+    activeTextDark: 'text-indigo-200 font-bold',
+    activeBgLight: 'bg-indigo-500/10',
+    activeBgDark: 'bg-indigo-500/15',
+    badgeBg: 'bg-indigo-500 text-white',
+  },
+  positivas: {
+    dot: 'bg-emerald-500 shadow-sm shadow-emerald-500/40',
+    bar: 'bg-emerald-500',
+    activeTextLight: 'text-emerald-950 font-bold',
+    activeTextDark: 'text-emerald-200 font-bold',
+    activeBgLight: 'bg-emerald-500/10',
+    activeBgDark: 'bg-emerald-500/15',
+    badgeBg: 'bg-emerald-500 text-white',
+  },
+  filhos: {
+    dot: 'bg-sky-500 shadow-sm shadow-sky-500/40',
+    bar: 'bg-sky-500',
+    activeTextLight: 'text-sky-950 font-bold',
+    activeTextDark: 'text-sky-200 font-bold',
+    activeBgLight: 'bg-sky-500/10',
+    activeBgDark: 'bg-sky-500/15',
+    badgeBg: 'bg-sky-500 text-white',
+  },
+  filhos_invalidos: {
+    dot: 'bg-amber-500 shadow-sm shadow-amber-500/40',
+    bar: 'bg-amber-500',
+    activeTextLight: 'text-amber-950 font-bold',
+    activeTextDark: 'text-amber-200 font-bold',
+    activeBgLight: 'bg-amber-500/10',
+    activeBgDark: 'bg-amber-500/15',
+    badgeBg: 'bg-amber-500 text-white',
+  },
+  monitores: {
+    dot: 'bg-blue-600 shadow-sm shadow-blue-500/40',
+    bar: 'bg-blue-600',
+    activeTextLight: 'text-blue-950 font-bold',
+    activeTextDark: 'text-blue-200 font-bold',
+    activeBgLight: 'bg-blue-600/10',
+    activeBgDark: 'bg-blue-600/15',
+    badgeBg: 'bg-blue-600 text-white',
+  },
+};
+
+function QueueSubNavItem({
+  label,
+  active,
+  onClick,
+  isDark,
+  colorType,
+  badge,
+  badgeScope = 'view',
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+  isOpen?: boolean;
+  isDark: boolean;
+  colorType: QueueSubTab;
+  badge?: number | string;
+  badgeScope?: 'assigned' | 'view';
+}) {
+  const color = QUEUE_COLOR_MAP[colorType] || QUEUE_COLOR_MAP.negativas;
+  return (
+    <button
+      onClick={onClick}
+      className={`
+        w-full flex items-center justify-between pl-8 pr-3 h-9 rounded-xl transition-all text-xs group relative cursor-pointer
+        ${active
+          ? (isDark ? `${color.activeBgDark} ${color.activeTextDark}` : `${color.activeBgLight} ${color.activeTextLight}`)
+          : (isDark ? 'text-white/60 hover:text-white hover:bg-white/5 font-medium' : 'text-slate-700 hover:text-black hover:bg-black/5 font-medium')}
+      `}
+    >
+      {active && (
+        <m.div
+          layoutId="queue-active-indicator"
+          className={`absolute left-3 w-1 h-4 rounded-full ${color.bar}`}
+        />
+      )}
+      <div className="flex items-center min-w-0 gap-2">
+        <span
+          className={`w-2 h-2 rounded-full shrink-0 ${color.dot} transition-transform group-hover:scale-125 ${active ? 'ring-2 ring-current/25 scale-110' : 'opacity-85'}`}
+        />
+        <span className="tracking-tight truncate block">
+          {label}
+        </span>
+      </div>
+      {Boolean(badge) && (
+        <span
+          title={badgeScope === 'assigned'
+            ? 'Chamados atribuídos pendentes no QWP'
+            : 'Total da view do Zendesk; confira as monitorias já existentes na fila'}
+          className={`text-[9px] font-black px-1.5 py-0.5 rounded-full leading-none ml-2 shrink-0 ${color.badgeBg}`}>
+          {badge}
+        </span>
+      )}
+    </button>
+  );
+}
+
+

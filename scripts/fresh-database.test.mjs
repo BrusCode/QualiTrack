@@ -1,0 +1,276 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { PGlite } from '@electric-sql/pglite';
+import { buildFreshSql, discoverFreshMigrations } from './prepare-supabase.mjs';
+
+const id = n => `10000000-0000-4000-8000-${String(n).padStart(12,'0')}`;
+test('clean Supabase install: exact generated SQL, no demo data, approved system form only', async t => {
+  const db = new PGlite();
+  try {
+    // Emulate ONLY managed Supabase objects. Application tables come exclusively
+    // from the actual deployment artifact, not a hand-written test schema.
+    await db.exec(`CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE service_role BYPASSRLS;
+      CREATE SCHEMA auth; CREATE SCHEMA storage;
+      CREATE SCHEMA realtime;
+      CREATE SCHEMA cron;
+      CREATE SCHEMA extensions;
+      CREATE FUNCTION realtime.topic() RETURNS text LANGUAGE sql AS $$ SELECT current_setting('realtime.topic', true) $$;
+      CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql AS $$ SELECT nullif(current_setting('request.jwt.claim.sub',true),'')::uuid $$;
+      CREATE TABLE auth.users(id uuid PRIMARY KEY,email text,raw_user_meta_data jsonb,created_at timestamptz,email_confirmed_at timestamptz);
+      CREATE TABLE storage.buckets(id text PRIMARY KEY,name text,public boolean,file_size_limit bigint,allowed_mime_types text[]);
+      CREATE TABLE storage.objects(id uuid PRIMARY KEY DEFAULT gen_random_uuid(),bucket_id text REFERENCES storage.buckets(id),name text);
+      ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;
+      GRANT USAGE ON SCHEMA public,auth,storage TO anon,authenticated,service_role;
+      GRANT SELECT,INSERT,UPDATE,DELETE ON storage.objects TO authenticated,service_role;
+      CREATE PUBLICATION supabase_realtime;
+      CREATE TABLE realtime.messages(id bigint GENERATED ALWAYS AS IDENTITY, topic text, extension text, payload jsonb, private boolean, inserted_at timestamptz DEFAULT now());
+      CREATE FUNCTION cron.schedule(text, text, text) RETURNS bigint LANGUAGE sql AS $$ SELECT 1::bigint $$;
+      CREATE FUNCTION cron.unschedule(text) RETURNS boolean LANGUAGE sql AS $$ SELECT true $$;
+    `);
+    const { sql, manifest } = await buildFreshSql();
+    await db.exec(sql);
+    const migrations = await discoverFreshMigrations();
+    assert.ok(migrations.length >= 25, 'the complete post-boundary chain is included');
+    assert.equal(migrations.filter(m => m.name === '20260924000001_privileged_queue_evaluation.sql').length, 1);
+    for (const migration of migrations) {
+      // PGlite cannot load Supabase's managed pg_cron/pg_net binaries. Their
+      // SQL-facing cron API is the managed fixture above; apply all other SQL
+      // verbatim while treating CREATE EXTENSION as platform provisioning.
+      const sqlWithManagedExtensions = migration.sql.replace(/^CREATE EXTENSION IF NOT EXISTS pg_(?:cron|net).*;\s*$/gm, '');
+      await db.exec(sqlWithManagedExtensions);
+    }
+    const asUser = async (n, run) => {
+      await db.query("SELECT set_config('request.jwt.claim.sub',$1,false)",[id(n)]);
+      await db.exec('SET ROLE authenticated');
+      try { return await run(); } finally { await db.exec('RESET ROLE'); }
+    };
+    await t.test('trigger entry points are private while business RPCs remain callable', async () => {
+      const { rows } = await db.query(`SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+        WHERE n.nspname='public' AND p.prorettype='trigger'::regtype
+          AND (has_function_privilege('anon',p.oid,'EXECUTE') OR has_function_privilege('authenticated',p.oid,'EXECUTE'))`);
+      assert.deepEqual(rows, []);
+      assert.equal((await db.query("SELECT has_function_privilege('authenticated','public.acknowledge_agent_feedback(uuid,text)','EXECUTE') AS allowed")).rows[0].allowed, true);
+    });
+    await t.test('application tables contain only the approved child-ticket form and enforce RLS', async () => {
+      const { rows } = await db.query("SELECT relname,relrowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND relkind='r'");
+      assert.ok(rows.length >= 20, `expected baseline and incremental tables, got ${rows.length}`);
+      assert.ok(rows.some(row => row.relname === 'queue_ticket_assignments'));
+      assert.ok(rows.some(row => row.relname === 'agent_feedbacks'));
+      assert.deepEqual(migrations.map(m => m.name), [...new Set(migrations.map(m => m.name))].sort());
+      for (const row of rows) {
+        assert.equal(row.relrowsecurity,true,row.relname);
+        if (row.relname === 'forms') continue;
+        if (row.relname === 'system_maintenance') {
+          const singleton = (await db.query('SELECT id,enabled,blocked_roles,expected_duration_minutes FROM public.system_maintenance')).rows;
+          assert.deepEqual(singleton, [{ id: 1, enabled: false, blocked_roles: [], expected_duration_minutes: 60 }]);
+          continue;
+        }
+        assert.equal((await db.query(`SELECT count(*)::int AS n FROM public.${row.relname}`)).rows[0].n,0,row.relname);
+      }
+      const childForms = (await db.query(`SELECT id::text, title, created_by, active,
+        jsonb_array_length(sections) AS section_count FROM public.forms ORDER BY id`)).rows;
+      assert.deepEqual(childForms.map(form => form.id), [
+        '6c7d1e88-841b-4da9-9a66-9f1464ce896f',
+        '6c7d1e88-841b-4da9-9a66-9f1464ce8970',
+        '6c7d1e88-841b-4da9-9a66-9f1464ce8971',
+        '6c7d1e88-841b-4da9-9a66-9f1464ce8972',
+        '6c7d1e88-841b-4da9-9a66-9f1464ce8973',
+      ]);
+      assert.ok(childForms.every((form, index) => form.created_by === null
+        && form.active === (index === 0) && form.section_count === 3), JSON.stringify(childForms));
+      assert.equal((await db.query('SELECT count(*)::int AS n FROM auth.users')).rows[0].n,0);
+      assert.equal((await db.query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name IN ('password','reset_token','team_ids','team_id')")).rows[0].n,0);
+      assert.ok(manifest.every(x => /^[a-f0-9]{64}$/.test(x.sha256)));
+    });
+    await t.test('second application refuses without erasing existing architecture', async () => {
+      await assert.rejects(db.exec(sql),/Clean install refused/);
+      await db.exec('ROLLBACK');
+      assert.ok((await db.query("SELECT to_regclass('public.monitorias') AS name")).rows[0].name);
+    });
+    await t.test('Auth trigger cannot grant admin from email or metadata; one-time admin is guarded', async () => {
+      await db.query('INSERT INTO auth.users(id,email,raw_user_meta_data,email_confirmed_at) VALUES ($1,$2,$3,now())',[id(1),'owner@example.invalid',{role:'admin',name:'Owner'}]);
+      assert.deepEqual((await db.query('SELECT role,active FROM public.users WHERE id=$1',[id(1)])).rows,[{role:'suporte',active:false}]);
+      const adminTemplate = await readFile(new URL('../supabase/bootstrap/first-admin.sql',import.meta.url),'utf8');
+      await assert.rejects(db.exec(adminTemplate),/Replace both/);
+      await db.exec('ROLLBACK');
+      // Replace only declarations; guard constants intentionally remain unchanged.
+      const corrected = adminTemplate.replace("expected_id uuid := '00000000-0000-0000-0000-000000000000'",`expected_id uuid := '${id(1)}'`).replace("expected_email text := 'REPLACE_WITH_CONFIRMED_EMAIL'","expected_email text := 'owner@example.invalid'");
+      await db.exec(corrected);
+      await assert.rejects(db.exec(corrected),/administrator already exists/);
+      await db.exec('ROLLBACK');
+    });
+    await t.test('admin creates team/form/monitoria; support and managers cannot read another team', async () => {
+      for (const [n,role] of [[2,'suporte'],[3,'gestor_suporte'],[4,'qualidade'],[5,'suporte']]) {
+        await db.query('INSERT INTO public.users(id,email,name,role,active) VALUES ($1,$2,$3,$4,true)',[id(n),`u${n}@example.invalid`,`User ${n}`,role]);
+      }
+      await db.query("SELECT set_config('request.jwt.claim.sub',$1,false)",[id(1)]);
+      await db.exec(`INSERT INTO teams(id,name) VALUES ('${id(10)}','Team A'),('${id(11)}','Team B');
+        INSERT INTO user_teams(user_id,team_id) VALUES ('${id(2)}','${id(10)}'),('${id(3)}','${id(10)}'),('${id(5)}','${id(11)}');
+        INSERT INTO forms(id,title,created_by) VALUES ('${id(20)}','Form','${id(1)}');
+        INSERT INTO form_teams(form_id,team_id) VALUES ('${id(20)}','${id(10)}');
+        INSERT INTO monitorias(id,form_id,evaluated_id,evaluator_id,team_id,score,question_observations,form_snapshot,applied_config)
+          VALUES ('${id(30)}','${id(20)}','${id(2)}','${id(4)}','${id(10)}',80,'{}','{}','{}'),('${id(31)}','${id(20)}','${id(5)}','${id(4)}','${id(11)}',90,'{}','{}','{}');`);
+      assert.equal((await asUser(2,() => db.query('SELECT * FROM monitorias'))).rows.length,0);
+      assert.equal((await asUser(5,() => db.query('SELECT * FROM monitorias'))).rows.length,0);
+      assert.equal((await asUser(1,() => db.query('SELECT * FROM monitorias'))).rows.length,2);
+      assert.equal((await asUser(3,() => db.query('SELECT * FROM monitorias'))).rows.length,1);
+      assert.equal((await asUser(4,() => db.query('SELECT * FROM monitorias'))).rows.length,2);
+      assert.equal((await db.query('SELECT ticket_group_team_id FROM monitorias WHERE id=$1',[id(30)])).rows[0].ticket_group_team_id,null);
+      assert.equal((await asUser(2,() => db.query('SELECT * FROM user_teams'))).rows.length,1);
+      assert.equal((await asUser(3,() => db.query('SELECT * FROM user_teams'))).rows.length,2);
+      const supportView = await asUser(2,() => db.query('SELECT evaluator_id,evaluator_name FROM vw_monitorias_suporte'));
+      assert.equal(supportView.rows.length,1);
+      assert.equal(supportView.rows[0].evaluator_id,null);
+      assert.equal(supportView.rows[0].evaluator_name,null);
+      await assert.rejects(asUser(2,() => db.exec(`INSERT INTO monitorias(evaluated_id,score) VALUES ('${id(2)}',100)`)),/row-level security/);
+    });
+    await t.test('automation controls expose status to quality but only managers can change it', async () => {
+      await db.query('INSERT INTO positive_ai_config(id,enabled,auditor_id) VALUES (true,false,$1)',[id(1)]);
+      await db.query('INSERT INTO child_ai_config(id,enabled,auditor_id) VALUES (true,false,$1)',[id(1)]);
+      await assert.rejects(asUser(2,() => db.query('SELECT * FROM get_ai_automation_controls()')), /não autorizado/);
+      assert.equal((await asUser(4,() => db.query('SELECT * FROM get_ai_automation_controls()'))).rows.length,2);
+      await assert.rejects(asUser(4,() => db.query("SELECT set_ai_automation_enabled('positivas',true,false)")), /Apenas administradores/);
+      await assert.rejects(asUser(4,() => db.query('UPDATE positive_ai_config SET enabled=true')), /permission denied/);
+      assert.equal((await asUser(1,() => db.query("SELECT set_ai_automation_enabled('positivas',true,false) AS enabled"))).rows[0].enabled,true);
+      await assert.rejects(asUser(1,() => db.query("SELECT set_ai_automation_enabled('positivas',false,false)")), /estado mudou/);
+      assert.equal((await asUser(1,() => db.query("SELECT set_ai_automation_enabled('positivas',false,true) AS enabled"))).rows[0].enabled,false);
+      assert.equal((await db.query('SELECT changed_by FROM positive_ai_config WHERE id=true')).rows[0].changed_by,id(1));
+    });
+    await t.test('PJ evaluation belongs to the agent primary team despite the ticket group', async () => {
+      await db.exec(`INSERT INTO users(id,email,name,role,active) VALUES ('${id(6)}','manager-b@example.invalid','Manager B','gestor_suporte',true);
+        UPDATE teams SET zendesk_group_id=50800061906068 WHERE id='${id(11)}';
+        INSERT INTO user_teams(user_id,team_id) VALUES ('${id(6)}','${id(11)}'),('${id(2)}','${id(11)}');
+        UPDATE users SET primary_team_id='${id(10)}' WHERE id='${id(2)}';
+        INSERT INTO monitorias(id,form_id,evaluated_id,evaluator_id,team_id,score,question_observations,form_snapshot,applied_config)
+          VALUES ('${id(32)}','${id(20)}','${id(2)}','${id(4)}','${id(11)}',85,'{}','{}','{}');`);
+      const evaluation = (await db.query('SELECT team_id,team_name,ticket_group_team_id FROM monitorias WHERE id=$1',[id(32)])).rows[0];
+      assert.equal(evaluation.team_id,id(10));
+      assert.equal(evaluation.team_name,'Team A');
+      assert.equal(evaluation.ticket_group_team_id,id(11));
+      assert.equal((await asUser(3,() => db.query('SELECT id FROM monitorias WHERE id=$1',[id(32)]))).rows.length,1);
+      assert.equal((await asUser(6,() => db.query('SELECT id FROM monitorias WHERE id=$1',[id(32)]))).rows.length,0);
+      await db.query("SELECT set_config('request.jwt.claim.sub',$1,false)",[id(1)]);
+      await db.exec(`UPDATE users SET primary_team_id='${id(11)}' WHERE id='${id(2)}'`);
+      assert.equal((await asUser(3,() => db.query('SELECT id FROM monitorias WHERE id=$1',[id(32)]))).rows.length,0);
+      assert.equal((await asUser(6,() => db.query('SELECT id FROM monitorias WHERE id=$1',[id(32)]))).rows.length,1);
+    });
+    await t.test('converting a legacy Zendesk group transfers ownership and manager visibility', async () => {
+      await db.exec(`INSERT INTO teams(id,name) VALUES ('${id(12)}','Team C');`);
+      await db.query("SELECT set_config('request.jwt.claim.sub',$1,false)",[id(1)]);
+      await assert.rejects(db.query('SELECT convert_team_to_group($1,$2)',[id(11),id(12)]),/Defina a equipe principal/);
+      await db.exec(`INSERT INTO user_teams(user_id,team_id) VALUES
+        ('${id(2)}','${id(12)}'),('${id(5)}','${id(12)}'),('${id(6)}','${id(12)}');
+        UPDATE users SET primary_team_id='${id(12)}' WHERE id IN ('${id(2)}','${id(5)}');`);
+      await db.query('SELECT convert_team_to_group($1,$2)',[id(11),id(12)]);
+      const agent = (await db.query('SELECT primary_team_id FROM users WHERE id=$1',[id(2)])).rows[0];
+      assert.equal(agent.primary_team_id,id(12));
+      const oldLinks = (await db.query('SELECT count(*)::int AS count FROM user_teams WHERE team_id=$1',[id(11)])).rows[0];
+      assert.equal(oldLinks.count,0);
+      const managerLink = (await db.query('SELECT count(*)::int AS count FROM user_teams WHERE user_id=$1 AND team_id=$2',[id(6),id(12)])).rows[0];
+      assert.equal(managerLink.count,1);
+      const evaluation = (await db.query('SELECT team_id,ticket_group_team_id FROM monitorias WHERE id=$1',[id(32)])).rows[0];
+      assert.equal(evaluation.team_id,id(12));
+      assert.equal(evaluation.ticket_group_team_id,id(11));
+      assert.equal((await asUser(3,() => db.query('SELECT id FROM monitorias WHERE id=$1',[id(32)]))).rows.length,0);
+      assert.equal((await asUser(6,() => db.query('SELECT id FROM monitorias WHERE id=$1',[id(32)]))).rows.length,1);
+      await db.query('INSERT INTO team_groups(team_id,group_id) VALUES ($1,$2)',[id(10),id(11)]);
+      const links = (await db.query('SELECT team_id FROM team_groups WHERE group_id=$1',[id(11)])).rows;
+      assert.deepEqual(links.map(link => link.team_id).sort(),[id(10),id(12)]);
+      assert.equal((await asUser(3,() => db.query('SELECT id FROM teams WHERE id=$1',[id(11)]))).rows.length,1);
+      assert.equal((await asUser(3,() => db.query('SELECT id FROM monitorias WHERE id=$1',[id(32)]))).rows.length,0);
+      await db.query("SELECT set_config('request.jwt.claim.sub',$1,false)",[id(1)]);
+      await assert.rejects(db.query('INSERT INTO user_teams(user_id,team_id) VALUES ($1,$2)',[id(3),id(11)]),/Pessoas só podem/);
+    });
+    await t.test('AI draft keeps its original queue snapshot until a monitoria is saved', async () => {
+      const snapshot = { ticket_id: '12345', subject: 'Proactive ticket', csat_status: 'unrated', ticket_date: '2026-09-28', status: 'open' };
+      await db.query(`INSERT INTO public.queue_ticket_catalog(ticket_id,queue_type,ticket_snapshot)
+        VALUES ('12345','proativas',$1::jsonb)`, [JSON.stringify(snapshot)]);
+      await db.query(`INSERT INTO public.ai_evaluation_drafts(ticket_id,result,created_by,source_queue)
+        VALUES ('12345','{"summary":"Ready"}'::jsonb,$1,'proativas')`, [id(4)]);
+      const { rows } = await db.query(`SELECT source_queue,ticket_snapshot FROM public.ai_evaluation_drafts WHERE ticket_id='12345'`);
+      assert.equal(rows[0].source_queue, 'proativas');
+      assert.deepEqual(rows[0].ticket_snapshot, snapshot);
+      await db.query(`INSERT INTO public.monitorias(ticket_id,evaluator_id,evaluated_id,team_id,form_id,score)
+        VALUES ('12345',$1,$2,$3,$4,90)`, [id(4),id(2),id(10),id(20)]);
+      assert.equal((await db.query(`SELECT count(*)::int AS n FROM public.ai_evaluation_drafts WHERE ticket_id='12345'`)).rows[0].n, 0);
+    });
+    await t.test('AI audit summary counts unique evaluated tickets and real outcomes', async () => {
+      await db.exec(`INSERT INTO ai_evaluation_logs(ticket_id,evaluation_type,provider,model,status) VALUES
+        ('12345','atendimento','openrouter','model','success'),
+        ('12345','atendimento','openrouter','model','success'),
+        ('23456','atendimento','openrouter','model','success'),
+        ('34567','chamado_filho','openrouter','model','success'),
+        ('45678','atendimento','openrouter','model','success'),
+        ('88888','atendimento','openrouter','model','error'),
+        ('77777','atendimento','zendesk_webhook','webhook-trigger','success'),
+        ('99999','registro_auditor','zendesk_webhook','webhook','success');
+        INSERT INTO ai_evaluation_drafts(ticket_id,result,created_by,source_queue)
+          VALUES ('23456','{"summary":"Needs review"}'::jsonb,'${id(4)}','proativas');
+        INSERT INTO monitorias(ticket_id,evaluator_id,evaluated_id,team_id,form_id,score,status)
+          VALUES ('34567','${id(4)}','${id(2)}','${id(10)}','${id(20)}',100,'concluida');
+        INSERT INTO monitorias(ticket_id,evaluator_id,evaluated_id,team_id,form_id,score,status,form_snapshot,created_at)
+          VALUES ('45678','${id(4)}','${id(2)}','${id(10)}','${id(20)}',100,'concluida',
+            '{"automation":"positive_csat"}'::jsonb,now()-interval '1 day');`);
+      const summary = (await asUser(1,() => db.query('SELECT * FROM get_ai_audit_summary()'))).rows[0];
+      assert.deepEqual(Object.fromEntries(Object.entries(summary).map(([key,value]) => [key,Number(value)])), {
+        evaluated_tickets: 4, generated_monitorias: 2, concluded_monitorias: 2, awaiting_review: 1,
+      });
+      await assert.rejects(asUser(4,() => db.query('SELECT * FROM get_ai_audit_summary()')),/gestão da qualidade/);
+      await assert.rejects(asUser(2,() => db.query('SELECT * FROM get_ai_audit_summary()')),/gestão da qualidade/);
+      await db.exec('SET ROLE anon');
+      try { await assert.rejects(db.query('SELECT * FROM get_ai_audit_summary()'),/permission denied/); }
+      finally { await db.exec('RESET ROLE'); }
+    });
+    await t.test('anonymous and logged-in browsers cannot submit direct access requests or run scheduler', async () => {
+      for (const role of ['anon','authenticated']) {
+        await db.exec(`SET ROLE ${role}`);
+        try {
+          await assert.rejects(db.exec("INSERT INTO access_requests(name,email) VALUES ('Test','test@example.invalid')"),/permission denied/);
+          await assert.rejects(db.exec('SELECT process_action_deadline_timeouts()'),/permission denied/);
+          await assert.rejects(db.exec("SELECT consume_security_rate_limit('x',1,60)"),/permission denied/);
+        } finally { await db.exec('RESET ROLE'); }
+      }
+    });
+    await t.test('private Storage configured, member cannot read files, admin can upload', async () => {
+      const bucket = (await db.query("SELECT * FROM storage.buckets WHERE id='ai-guidelines'")).rows[0];
+      assert.equal(bucket.public,false);
+      assert.equal(Number(bucket.file_size_limit),10485760);
+      await asUser(1,() => db.exec("INSERT INTO storage.objects(bucket_id,name) VALUES ('ai-guidelines','test.pdf')"));
+      assert.equal((await asUser(2,() => db.query('SELECT * FROM storage.objects'))).rows.length,0);
+      assert.equal((await asUser(1,() => db.query('SELECT * FROM storage.objects'))).rows.length,1);
+    });
+    await t.test('scheduler finalizes once and calendar handles São Paulo weekends', async () => {
+      await db.exec(`UPDATE monitorias SET action_deadline_at=now()-interval '1 hour' WHERE id='${id(30)}';
+        SELECT process_action_deadline_timeouts(); SELECT process_action_deadline_timeouts();`);
+      const item = (await db.query(`SELECT status,score,jsonb_array_length(history) AS events FROM monitorias WHERE id='${id(30)}'`)).rows[0];
+      assert.equal(item.status,'concluida'); assert.equal(Number(item.score),80); assert.equal(item.events,1);
+      await assert.rejects(db.exec("SELECT calculate_action_deadline('2026-09-18T19:00:00Z',2)"),/calendar missing/);
+      await db.exec("INSERT INTO business_hours(day_of_week) SELECT generate_series(1,5)");
+      const deadline = (await db.query("SELECT calculate_action_deadline('2026-09-18T19:00:00Z',2) AS result")).rows[0].result;
+      assert.equal(new Date(deadline).toISOString(),'2026-09-21T12:00:00.000Z');
+      assert.ok((await db.query("SELECT * FROM pg_publication_tables WHERE pubname='supabase_realtime' AND tablename='monitorias'")).rows.length);
+    });
+    await t.test('only the service can deactivate a linked Zendesk agent and revoke sessions once', async () => {
+      await db.exec(`CREATE TABLE auth.sessions(id uuid PRIMARY KEY, user_id uuid NOT NULL);
+        INSERT INTO auth.sessions(id,user_id) VALUES ('${id(90)}','${id(2)}');
+        UPDATE public.users SET source_system='zendesk',external_id='123456' WHERE id='${id(2)}';`);
+      await assert.rejects(asUser(1,() => db.query("SELECT * FROM deactivate_zendesk_agent('event-1','123456')")), /permission denied/);
+      await db.exec('SET ROLE service_role');
+      let result;
+      try {
+        result = (await db.query("SELECT * FROM deactivate_zendesk_agent('event-1','123456')")).rows[0];
+        assert.equal(result.user_id,id(2));
+        assert.equal(result.deactivated,true);
+        assert.equal(Number(result.revoked_sessions),1);
+        const retry = (await db.query("SELECT * FROM deactivate_zendesk_agent('event-1','123456')")).rows[0];
+        assert.deepEqual(retry,result);
+      } finally { await db.exec('RESET ROLE'); }
+      assert.equal((await db.query('SELECT active FROM users WHERE id=$1',[id(2)])).rows[0].active,false);
+      assert.equal((await db.query('SELECT count(*)::int AS n FROM auth.sessions')).rows[0].n,0);
+      assert.equal((await db.query('SELECT count(*)::int AS n FROM zendesk_agent_role_events')).rows[0].n,1);
+      assert.deepEqual((await db.query('SELECT target_user_id,requested_by FROM session_control_commands WHERE target_user_id=$1',[id(2)])).rows,
+        [{ target_user_id: id(2), requested_by: null }]);
+    });
+  } finally { await db.close(); }
+});

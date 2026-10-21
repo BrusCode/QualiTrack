@@ -4,6 +4,18 @@
 
 O fluxo de monitoria é o core do QualiTrack. Cobre desde a criação até a conclusão, passando por contestações multi-nível, com prazos de ação automatizados.
 
+Nas equipes PJ, monitorias com nota igual ou superior a 75% são concluídas diretamente. Com nota inferior a 75%, o gestor PJ envia aprovação ou contestação com justificativa diretamente ao Gestor da Qualidade, responsável pela decisão final. A interface exibe as duas etapas e registra os pareceres no histórico. A rota é aplicada pelo banco, inclusive quando alguém chama a API diretamente. A etapa inicial do gestor PJ não é concluída pelo cron; depois que o gestor encaminha a monitoria à Gestão da Qualidade, o vencimento do prazo dessa etapa conclui automaticamente a monitoria com nota 100%.
+
+Na aprovação final pela Gestão da Qualidade, a tela mostra o veredito e o Registro do Auditor antes da confirmação. Depois de salvar a decisão, publica a macro correspondente no Zendesk e grava o recibo. Uma publicação anterior da mesma monitoria é reconhecida para evitar duplicidade. Se o Zendesk falhar, a monitoria permanece concluída e a Gestão da Qualidade recebe o erro e pode conferir o envio no detalhe da monitoria.
+
+### Chamados filhos
+
+O parecer da IA é uma sugestão. O monitor abre a ficha própria de chamado filho, responde os critérios e salva a monitoria no QWP. Se a nota final for de pelo menos 75% e o status for `concluida`, o QWP tenta enviar ao Zendesk uma macro interna de **chamado filho válido** com o Registro do Auditor salvo. O endpoint exige o ID da monitoria, confere que ela é a ficha ativa e mais recente do mesmo ticket, e evita repetir o comentário quando a macro já está presente. Se a nota for inferior a 75%, a monitoria entra na revisão normal sem publicar macro no ato do salvamento; assim que a revisão é concluída (por aceite, decisão final da Qualidade ou finalização automática por perda de prazo), a monitoria concluída é enfileirada em `child_auto_publications` e publica a macro correspondente no Zendesk (`[QualidadeWP · Chamado filho INVÁLIDO]` para nota final `< 75%` ou `[QualidadeWP · Chamado filho VÁLIDO]` se reavaliada para `>= 75%`), além de permitir reenvio pelo detalhe da monitoria.
+
+Se o Zendesk conservar uma macro antiga de filho inválido e a monitoria humana posterior concluir que ele é válido, a tentativa de envio publica uma nova nota interna de retificação vinculada ao ID da monitoria e atualiza os campos para o veredito válido. O comentário antigo permanece como histórico. Ao repetir a tentativa, o sistema identifica a nota desta monitoria e apenas completa campos ou tag que tenham ficado pendentes.
+
+Para recuperar um filho que tenha apenas parecer de IA, inclusive quando a tag de macro o retirou da fila, use **Nova Monitoria**, pesquise o ID e escolha **Recuperar chamado filho**. A ficha mostra o parecer persistido para conferência humana; não transforma os checks da IA em respostas humanas automaticamente.
+
 ## Fluxo Completo
 
 ```mermaid
@@ -48,7 +60,7 @@ Formulário em 4 etapas (stepper) no `MonitoriaForm.tsx`:
 | 1 | Dados do Ticket | Ticket ID, Canal, Formulário, Agente, Equipe |
 | 2 | Avaliação | Critérios por pilar (Sim/Não/N.A.) + Erros Críticos |
 | 3 | Resumo | Score calculado, breakdown por pilar, campos de insatisfação |
-| 4 | Confirmação | Salvar monitoria |
+| 4 | Confirmação | Revisar o Registro do Auditor, regenerá-lo por IA a partir das observações atuais quando necessário e salvar a monitoria |
 
 **Regras de Seleção Agente↔Equipe:**
 - Ao selecionar Agente, as opções de Equipe filtram para equipes do agente

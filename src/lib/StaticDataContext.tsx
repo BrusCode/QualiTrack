@@ -1,12 +1,16 @@
-import React, { createContext, useContext, useCallback, useMemo, ReactNode } from 'react';
+import { userCacheScope } from './pageCache';
+import { useBackgroundRefresh } from '../hooks/useBackgroundRefresh';
+import React, { createContext, useContext, useCallback, useMemo, useEffect, ReactNode } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { User, Team, EvaluationForm, DissatisfactionField, UserTeam, UserPreferences } from '../types';
+import { User, Team, TeamGroup, EvaluationForm, DissatisfactionField, UserTeam, UserPreferences } from '../types';
 import { supabase, mockDb, isMockMode } from './supabase';
 import { toast } from 'sonner';
 
 interface StaticDataContextType {
   users: User[];
   teams: Team[];
+  groups: Team[];
+  teamGroups: TeamGroup[];
   forms: EvaluationForm[];
   dissatisfactionFields: DissatisfactionField[];
   userTeams: UserTeam[];
@@ -25,20 +29,21 @@ function enrichUsersWithTeams(usersList: User[], userTeamDocs: UserTeam[], prefs
   });
   return usersList.map(u => ({
     ...u,
-    team_ids: u.team_ids?.length ? u.team_ids : (teamIdsByUser[u.id] || []),
+    team_ids: teamIdsByUser[u.id] || [],
     preferences: prefsMap[u.id] || u.preferences
   }));
 }
 
 async function fetchAllStaticData() {
   if (isMockMode) {
-    const [uRes, tRes, fRes, dfRes, utRes, upRes] = await Promise.all([
+    const [uRes, tRes, fRes, dfRes, utRes, upRes, tgRes] = await Promise.all([
       mockDb.get('users'),
       mockDb.get('teams'),
       mockDb.get('forms'),
       mockDb.get('dissatisfaction_fields'),
       mockDb.get('user_teams'),
-      mockDb.get('user_preferences')
+      mockDb.get('user_preferences'),
+      mockDb.get('team_groups')
     ]);
     const prefsMap: Record<string, UserPreferences> = {};
     (upRes.data || []).forEach((row: any) => {
@@ -53,7 +58,9 @@ async function fetchAllStaticData() {
     );
     return {
       users: enrichedUsers,
-      teams: (tRes.data || []) as Team[],
+      teams: ((tRes.data || []) as Team[]).filter(t => t.kind !== 'group'),
+      groups: ((tRes.data || []) as Team[]).filter(t => t.kind === 'group'),
+      teamGroups: (tgRes.data || []) as TeamGroup[],
       forms: (fRes.data || []) as EvaluationForm[],
       dissatisfactionFields: (dfRes.data || []) as DissatisfactionField[],
       userTeams: (utRes.data || []) as UserTeam[],
@@ -72,15 +79,23 @@ async function fetchAllStaticData() {
           sb.from('forms').select('*').abortSignal(controller.signal),
           sb.from('dissatisfaction_fields').select('*').abortSignal(controller.signal),
           sb.from('user_teams').select('*').abortSignal(controller.signal),
-          sb.from('user_preferences').select('*').abortSignal(controller.signal)
+          sb.from('user_preferences').select('*').abortSignal(controller.signal),
+          sb.from('team_groups').select('*').abortSignal(controller.signal)
         ]);
 
-        const timeoutPromise = new Promise((_, reject) => {
-          setTimeout(() => { controller.abort(); reject(new Error('timeout')); }, 15000);
+        let timeoutId: ReturnType<typeof setTimeout> | undefined;
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timeoutId = setTimeout(() => { controller.abort(); reject(new Error('timeout')); }, 15000);
         });
-
-        const results = await Promise.race([fetchPromise, timeoutPromise]) as any[];
-        const [uRes, tRes, fRes, dfRes, utRes, upRes] = results;
+        let results;
+        try {
+          results = await Promise.race([fetchPromise, timeoutPromise]);
+        } finally {
+          clearTimeout(timeoutId);
+        }
+        const failed = results.find(result => result.error);
+        if (failed?.error) throw failed.error;
+        const [uRes, tRes, fRes, dfRes, utRes, upRes, tgRes] = results;
 
         const prefsMap: Record<string, UserPreferences> = {};
         (upRes.data || []).forEach((row: any) => {
@@ -95,7 +110,9 @@ async function fetchAllStaticData() {
         );
         return {
           users: enrichedUsers,
-          teams: (tRes.data || []) as Team[],
+          teams: ((tRes.data || []) as Team[]).filter(t => t.kind !== 'group'),
+          groups: ((tRes.data || []) as Team[]).filter(t => t.kind === 'group'),
+          teamGroups: (tgRes.data || []) as TeamGroup[],
           forms: (fRes.data || []) as EvaluationForm[],
           dissatisfactionFields: (dfRes.data || []) as DissatisfactionField[],
           userTeams: (utRes.data || []) as UserTeam[],
@@ -114,16 +131,17 @@ async function fetchAllStaticData() {
   }
 }
 
-export function StaticDataProvider({ children }: { children: ReactNode }) {
+export function StaticDataProvider({ children, user }: { children: ReactNode; user?: User | null }) {
+  const scope = userCacheScope(user);
   const queryClient = useQueryClient();
 
   const { data, isLoading, isError, refetch } = useQuery({
-    queryKey: ['staticData'],
+    queryKey: ['staticData', scope],
     queryFn: fetchAllStaticData,
     staleTime: 10 * 60 * 1000, // 10 minutes
     gcTime: 30 * 60 * 1000, // 30 minutes
     retry: 2,
-    refetchOnWindowFocus: false,
+    refetchOnWindowFocus: true,
     refetchOnReconnect: false, // CORRECTION 5: custom qualitrack:reconnected event handles this
   });
 
@@ -131,9 +149,31 @@ export function StaticDataProvider({ children }: { children: ReactNode }) {
     queryClient.invalidateQueries({ queryKey: ['staticData'] });
   }, [queryClient]);
 
+  useBackgroundRefresh(() => refetch(), Boolean(user));
+  useEffect(() => {
+    window.addEventListener('qualitrack:reconnected', refreshAll);
+    if (!supabase) return () => window.removeEventListener('qualitrack:reconnected', refreshAll);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const channel = supabase.channel(`static-data-${scope}`);
+    for (const table of ['users', 'teams', 'forms', 'dissatisfaction_fields', 'user_teams', 'user_preferences', 'team_groups']) {
+      channel.on('postgres_changes', { event: '*', schema: 'public', table }, () => {
+        clearTimeout(timer);
+        timer = setTimeout(refreshAll, 500);
+      });
+    }
+    channel.subscribe();
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener('qualitrack:reconnected', refreshAll);
+      void supabase!.removeChannel(channel);
+    };
+  }, [scope, refreshAll]);
+
   const contextValue = useMemo(() => ({
     users: data?.users || [],
     teams: data?.teams || [],
+    groups: data?.groups || [],
+    teamGroups: data?.teamGroups || [],
     forms: data?.forms || [],
     dissatisfactionFields: data?.dissatisfactionFields || [],
     userTeams: data?.userTeams || [],

@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { supabase, mockDb } from '../../lib/supabase';
+import { createPortal } from 'react-dom';
+import { supabase, mockDb, requireAccessToken } from '../../lib/supabase';
 import { User, Team, AccessRequest } from '../../types';
 import { 
   RefreshCw, 
@@ -15,6 +16,7 @@ import Card from '../ui/Card';
 import Button from '../ui/Button';
 import Badge from '../ui/Badge';
 import CustomSelect from '../ui/CustomSelect';
+import { edgeFunctionErrorMessage } from '../../lib/edgeFunctionError';
 
 const getInitials = (name: string) => {
   const parts = name.trim().split(/\s+/);
@@ -43,6 +45,16 @@ export default function RequestsManagement({ requests: initialRequests, teams, l
   const [saving, setSaving] = useState(false);
   const [teamSearch, setTeamSearch] = useState('');
 
+  useEffect(() => {
+    const hasModal = isApproveModalOpen || isRejectModalOpen;
+    window.dispatchEvent(new CustomEvent('qualitrack:modal', { detail: { open: hasModal } }));
+    return () => {
+      if (hasModal) {
+        window.dispatchEvent(new CustomEvent('qualitrack:modal', { detail: { open: false } }));
+      }
+    };
+  }, [isApproveModalOpen, isRejectModalOpen]);
+
   useEffect(() => { setRequests(initialRequests); }, [initialRequests]);
 
   const handleRefresh = async () => {
@@ -62,16 +74,29 @@ export default function RequestsManagement({ requests: initialRequests, teams, l
           return;
         }
 
-        await supabase.auth.getSession();
+        // Falha cedo e com mensagem util se a sessao tiver expirado.
+        const accessToken = await requireAccessToken();
         const userPayload = { name: approveData.name, email: approveData.email.toLowerCase(), role: approveData.role, active: true };
 
         const operation = (async () => {
+          // Ordem importa: cria o usuário ANTES de marcar a solicitação como
+          // aprovada. Na ordem inversa, uma falha no convite deixava a
+          // solicitação como 'approved' sem usuário nenhum criado — ela sumia
+          // da fila de pendentes e a pessoa nunca conseguia entrar, sem sinal
+          // visível para o admin. Falhando agora, a solicitação permanece
+          // pendente e a aprovação pode ser repetida.
+          // A autorização continua sendo feita pela própria Edge Function
+          // (401 sem sessão, 403 se o papel não for admin/gestor), então esta
+          // reordenação não afeta segurança — só consistência.
+          const { data, error: funcError } = await supabase.functions.invoke('admin-invite-user', {
+            headers: { Authorization: `Bearer ${accessToken}` },
+            body: { ...userPayload, team_ids: approveData.team_ids || [] }
+          });
+          if (funcError) throw new Error(await edgeFunctionErrorMessage(funcError, 'Falha ao convidar usuário.'));
+          if (data?.success === false) throw new Error(data.error || 'Falha ao convidar usuário.');
+
           const { error: reqError } = await supabase.from('access_requests').update({ status: 'approved' }).eq('id', approvingReq.id);
           if (reqError) throw reqError;
-
-          const { data, error: funcError } = await supabase.functions.invoke('admin-invite-user', { body: { ...userPayload, team_ids: approveData.team_ids || [] } });
-          if (funcError) throw funcError;
-          if (data?.success === false) throw new Error(data.details?.message || 'Erro ao convidar usuário');
         })();
 
         const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 15000));
@@ -123,16 +148,14 @@ export default function RequestsManagement({ requests: initialRequests, teams, l
 
         const { error: emailError } = await supabase.functions.invoke('send-email', {
           body: {
-            email: rejectingReq.email,
-            name: rejectingReq.name,
             type: 'rejection',
-            token: rejectReason
+            request_id: rejectingReq.id
           }
         });
-        if (emailError) console.error('Failed to send rejection email:', emailError);
+        if (emailError) toast.warning('Solicitação rejeitada, mas o e-mail não foi enviado. Contate o administrador.');
       }
 
-      toast.success('Solicitação rejeitada e e-mail enviado.');
+      toast.success('Solicitação rejeitada.');
       setIsRejectModalOpen(false);
       await handleRefresh();
     } catch (e: any) {
@@ -231,10 +254,11 @@ export default function RequestsManagement({ requests: initialRequests, teams, l
         )}
       </div>
 
-      <AnimatePresence>
+      {createPortal(
+        <AnimatePresence>
         {isApproveModalOpen && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
-            <Card className="max-w-md w-full">
+          <div className="fixed inset-0 z-[9999] flex items-center justify-center p-2 sm:p-4 md:p-6 bg-black/75 backdrop-blur-xs animate-fade-in">
+            <Card className="max-w-md w-full max-h-[92vh] flex flex-col shadow-2xl overflow-y-auto no-scrollbar border border-surface-border">
               <header className="flex items-center justify-between mb-6">
                 <h3 className="text-xl font-black text-brand-primary tracking-tight uppercase">Aprovar Solicitação</h3>
                 <button onClick={() => setIsApproveModalOpen(false)} className="text-brand-muted hover:text-brand-primary"><X className="w-6 h-6" /></button>
@@ -309,10 +333,15 @@ export default function RequestsManagement({ requests: initialRequests, teams, l
             </Card>
           </div>
         )}
+        </AnimatePresence>,
+        document.body
+      )}
 
+      {createPortal(
+        <AnimatePresence>
         {isRejectModalOpen && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
-            <Card className="max-w-md w-full">
+          <div className="fixed inset-0 z-[9999] flex items-center justify-center p-2 sm:p-4 md:p-6 bg-black/75 backdrop-blur-xs animate-fade-in">
+            <Card className="max-w-md w-full max-h-[92vh] flex flex-col shadow-2xl overflow-y-auto no-scrollbar border border-surface-border">
               <header className="flex items-center justify-between mb-6">
                 <div className="flex items-center gap-2 text-error">
                   <AlertCircle className="w-5 h-5" />
@@ -349,7 +378,9 @@ export default function RequestsManagement({ requests: initialRequests, teams, l
             </Card>
           </div>
         )}
-      </AnimatePresence>
+        </AnimatePresence>,
+        document.body
+      )}
     </div>
   );
 }

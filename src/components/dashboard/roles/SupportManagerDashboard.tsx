@@ -1,30 +1,45 @@
+import { buildSupportRanking, compareSupportOffenders, selectRankingBaseline } from '../../../lib/supportRanking';
+import { aggregatedSupportRanking } from '../dashboardAggregates';
+import type { Monitoria } from '../../../types';
 import React, { useMemo, useState, useEffect } from 'react';
-import { useDashboard, usePresence } from '../DashboardContext';
+import { useDashboard } from '../DashboardContext';
+import { usePresence } from '../../../providers/PresenceProvider';
 import StatCard from '../widgets/StatCard';
 import TrendChart from '../widgets/TrendChart';
 import RankingWidget from '../widgets/RankingWidget';
 import DistributionChart from '../widgets/DistributionChart';
 import RecentAuditsTable from '../widgets/RecentAuditsTable';
+import ManagerDecisionHistoryTable from '../widgets/ManagerDecisionHistoryTable';
+import CriticalErrorsTable from '../widgets/CriticalErrorsTable';
+import AgentEvaluationVolumeTable from '../widgets/AgentEvaluationVolumeTable';
 import OfensoresChart from '../widgets/OfensoresChart';
 import Card from '../../ui/Card';
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from 'recharts';
-import { Target, Users, TrendingUp, AlertTriangle, CheckCircle2, XCircle, ClipboardCheck, Award, Clock, History, Activity } from 'lucide-react';
+import { Target, Users, TrendingUp, AlertTriangle, CheckCircle2, XCircle, ClipboardCheck, Award, Clock, History, Activity, ChevronRight } from 'lucide-react';
 import { m, AnimatePresence } from 'motion/react';
 import { toast } from 'sonner';
 
 import { useQualityConfig } from '../../../lib/useQualityConfig';
 import { isApprovalAction, isRejectionAction, isContestationAction } from '../../../lib/contestation';
 import { chartColorMap, chartColorArray, chartPalette } from '../chartColors';
+import { buildPerformanceTrend, selectTrendEvaluations } from '../../../lib/performanceTrend';
 import { getRemainingBusinessSeconds } from '../../../lib/businessHours';
+import NegativeCallsTrainingAlert from '../widgets/NegativeCallsTrainingAlert';
+import { computeSupportManagerIndicators } from '../../../lib/supportManagerIndicators';
+import SupportDrillDownModal from '../widgets/SupportDrillDownModal';
+import { useFeedbacks } from '../../../hooks/useFeedbacks';
+import FeedbacksWidget from '../../feedback/FeedbacksWidget';
+import { DashboardTile } from '../DashboardTileLayout';
+import { buildGroupDistribution } from '../../../lib/groupDistribution';
 
 // High-fidelity mock datasets for customization mode
 const mockTrendData = [
-  { name: '01/05', ScoreMedio: 82.3, MeuScore: 84.5, ScoreEquipe: 81.2, MediaEquipe: 81.5 },
-  { name: '05/05', ScoreMedio: 84.1, MeuScore: 83.2, ScoreEquipe: 82.5, MediaEquipe: 82.1 },
-  { name: '10/05', ScoreMedio: 83.8, MeuScore: 86.1, ScoreEquipe: 83.1, MediaEquipe: 82.8 },
-  { name: '15/05', ScoreMedio: 85.2, MeuScore: 87.4, ScoreEquipe: 84.8, MediaEquipe: 83.5 },
-  { name: '20/05', ScoreMedio: 86.5, MeuScore: 85.9, ScoreEquipe: 85.2, MediaEquipe: 84.2 },
-  { name: '25/05', ScoreMedio: 87.0, MeuScore: 88.2, ScoreEquipe: 86.1, MediaEquipe: 85.0 }
+  { name: 'abr/26', ScoreMedio: 82.3, MeuScore: 84.5, ScoreEquipe: 81.2, MediaEquipe: 81.5, Positivas: 86, Negativas: 59 },
+  { name: 'mai/26', ScoreMedio: 84.1, MeuScore: 83.2, ScoreEquipe: 82.5, MediaEquipe: 82.1, Positivas: 88, Negativas: 65 },
+  { name: 'jun/26', ScoreMedio: 83.8, MeuScore: 86.1, ScoreEquipe: 83.1, MediaEquipe: 82.8, Positivas: 89, Negativas: 61 },
+  { name: 'jul/26', ScoreMedio: 85.2, MeuScore: 87.4, ScoreEquipe: 84.8, MediaEquipe: 83.5, Positivas: 91, Negativas: 68 },
+  { name: 'ago/26', ScoreMedio: 86.5, MeuScore: 85.9, ScoreEquipe: 85.2, MediaEquipe: 84.2, Positivas: 92, Negativas: 70 },
+  { name: 'set/26', ScoreMedio: 87.0, MeuScore: 88.2, ScoreEquipe: 86.1, MediaEquipe: 85.0, Positivas: 93, Negativas: 66 }
 ];
 
 const mockDistributionData = [
@@ -151,7 +166,7 @@ interface SupportManagerDashboardProps {
 }
 
 // Inline Countdown Row for Ações Expirando
-function SlaCountdownItem({ monitoria, users }: { monitoria: any, users: any[] }) {
+function SlaCountdownItem({ monitoria, users, onClick }: { monitoria: any, users: any[], onClick?: () => void }) {
   const [secondsLeft, setSecondsLeft] = useState(() => {
     const deadline = new Date(monitoria.action_deadline_at);
     return getRemainingBusinessSeconds(new Date(), deadline);
@@ -197,11 +212,29 @@ function SlaCountdownItem({ monitoria, users }: { monitoria: any, users: any[] }
     badgeClass = 'animate-pulse bg-red-500/10 text-red-500 border border-red-500/20 font-black';
   }
 
+  const handleClick = () => {
+    if (onClick) {
+      onClick();
+    } else {
+      window.dispatchEvent(
+        new CustomEvent('qualitrack:focus_monitoria', {
+          detail: { monitoriaId: monitoria.id, ticketId: monitoria.ticket_id },
+        })
+      );
+    }
+  };
+
   return (
-    <div className="flex items-center justify-between p-3 rounded-2xl bg-surface-subtle/30 border border-surface-border/30 hover:border-surface-border transition-all duration-200">
+    <div
+      onClick={handleClick}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleClick(); }}
+      className="flex items-center justify-between p-3 rounded-2xl bg-surface-subtle/30 border border-surface-border/30 hover:border-brand-accent/50 hover:bg-surface-subtle/70 transition-all duration-200 cursor-pointer active:scale-[0.98] group"
+    >
       <div className="flex flex-col min-w-0 flex-1 mr-2">
         <div className="flex items-center gap-1.5 mb-1 min-w-0">
-          <span className="font-mono font-black text-xs text-brand-primary flex-shrink-0">
+          <span className="font-mono font-black text-xs text-brand-primary group-hover:text-brand-accent transition-colors flex-shrink-0">
             #{monitoria.ticket_id}
           </span>
           <span className="text-[10px] text-brand-muted font-bold truncate">
@@ -212,10 +245,11 @@ function SlaCountdownItem({ monitoria, users }: { monitoria: any, users: any[] }
           Etapa: {getStatusLabel(monitoria.status)}
         </span>
       </div>
-      <div className="flex-shrink-0">
+      <div className="flex-shrink-0 flex items-center gap-2">
         <span className={`inline-flex items-center px-2 py-0.5 rounded-lg text-[9px] font-black uppercase tracking-wider ${badgeClass}`}>
           {formatTimeLeft(secondsLeft)}
         </span>
+        <ChevronRight className="w-3.5 h-3.5 text-brand-muted group-hover:text-brand-accent group-hover:translate-x-0.5 transition-all" />
       </div>
     </div>
   );
@@ -229,6 +263,7 @@ export default function SupportManagerDashboard({
   let dashboardData: any = {
     user: null,
     monitorias: [],
+    allMonitorias: [],
     users: [],
     teams: [],
     forms: [],
@@ -248,17 +283,49 @@ export default function SupportManagerDashboard({
     // safe fallback
   }
 
-  const { user, monitorias, users, teams, forms, dissatisfactionFields, globalAvg } = dashboardData;
+  const { user, monitorias, allMonitorias, filters = { startDate: '', endDate: '' }, helpdeskSubmissions = [], users, teams, forms, dissatisfactionFields, globalAvg, aggregates } = dashboardData;
   const { config, saveConfig, getLevelForScore } = useQualityConfig();
+  const { feedbacks, createFeedback, acknowledgeFeedback, completeFeedback } = useFeedbacks(user);
 
   // Scoped Team IDs
   const myTeamIds = user?.team_ids || [];
+
+  const [drillDown, setDrillDown] = useState<{
+    title: string;
+    subtitle?: string;
+    monitorias: any[];
+  } | null>(null);
+
+  const indicators = useMemo(() => {
+    if (isCustomizing) {
+      return {
+        totalAvaliado: 15,
+        totalPositivo: 12,
+        totalNegativo: 3,
+        totalInvalidados: 2,
+        avaliadosList: [],
+        positivosList: [],
+        negativosList: [],
+        invalidadosList: [],
+      };
+    }
+    return computeSupportManagerIndicators(monitorias, myTeamIds, helpdeskSubmissions);
+  }, [isCustomizing, monitorias, myTeamIds, helpdeskSubmissions]);
 
   // Restrict everything to this manager's teams
   const myMonitorias = useMemo(() => {
     if (isCustomizing) return [];
     return monitorias.filter((m: any) => myTeamIds.includes(m.team_id));
   }, [isCustomizing, monitorias, myTeamIds]);
+
+  const groupDistribution = useMemo(() => isCustomizing
+    ? [
+        { name: 'Revenda - Retaguarda', value: 28, color: '#3B82F6' },
+        { name: 'Análise Técnica Revenda', value: 10, color: '#10B981' },
+        { name: 'Grupo não informado', value: 8, color: '#F59E0B' },
+      ]
+    : buildGroupDistribution(myMonitorias, teams, chartColorArray()),
+  [isCustomizing, myMonitorias, teams]);
 
   const scoredMonitorias = useMemo(() => {
     if (isCustomizing) return [];
@@ -270,10 +337,11 @@ export default function SupportManagerDashboard({
   // 1. Média Geral (Scoped average)
   const avgScore = useMemo(() => {
     if (isCustomizing) return 84.20;
+    if (aggregates) return Number(aggregates.average);
     return scoredMonitorias.length > 0
       ? scoredMonitorias.reduce((a: number, m: any) => a + (m.score || 0), 0) / scoredMonitorias.length
       : 0;
-  }, [isCustomizing, scoredMonitorias]);
+  }, [isCustomizing, scoredMonitorias, aggregates]);
 
   const scoreDiff = avgScore - config.targetScore;
   const diffSign = scoreDiff >= 0 ? '↑' : '↓';
@@ -282,13 +350,15 @@ export default function SupportManagerDashboard({
     : 'bg-red-50 text-red-700 dark:bg-red-950/50 dark:text-red-400';
 
   // 2. Índice de Excelência (Scoped excellence index matching Admin)
-  const excellentCount = useMemo(() => {
-    if (isCustomizing) return 35;
+  const excellentList = useMemo(() => {
+    if (isCustomizing) return [];
     return scoredMonitorias.filter((m: any) => {
       const lvl = getLevelForScore(m.score || 0);
       return lvl?.color.includes('excelente');
-    }).length;
+    });
   }, [isCustomizing, scoredMonitorias, getLevelForScore]);
+
+  const excellentCount = isCustomizing ? 35 : excellentList.length;
 
   const excellentPercent = useMemo(() => {
     if (isCustomizing) return 64.81;
@@ -323,23 +393,32 @@ export default function SupportManagerDashboard({
     : 'bg-red-50 text-red-700 dark:bg-red-950/50 dark:text-red-400';
 
   // Total volume
-  const totalMonitorias = isCustomizing ? 15 : myMonitorias.length;
+  const totalMonitorias = isCustomizing ? 15 : aggregates?.total ?? myMonitorias.length;
 
   // Total Pendentes (Unified agent acknowledgements + disputes + support manager actions)
-  const pendingTotal = isCustomizing ? 3 : myMonitorias.filter((m: any) =>
-    ['pendente_revisao', 'em_contestacao', 'aguardando_gestor_suporte'].includes(m.status)
-  ).length;
+  const pendingTotalList = useMemo(() => {
+    if (isCustomizing) return [];
+    return myMonitorias.filter((m: any) =>
+      ['pendente_revisao', 'em_contestacao', 'aguardando_gestor_suporte'].includes(m.status)
+    );
+  }, [isCustomizing, myMonitorias]);
+
+  const pendingTotal = isCustomizing ? 3 : pendingTotalList.length;
 
   // Minhas Ações (Awaiting gestor_suporte decision)
-  const pendingManager = isCustomizing ? 1 : myMonitorias.filter((m: any) => m.status === 'aguardando_gestor_suporte').length;
+  const pendingManagerList = useMemo(() => {
+    if (isCustomizing) return [];
+    return myMonitorias.filter((m: any) => m.status === 'aguardando_gestor_suporte');
+  }, [isCustomizing, myMonitorias]);
+
+  const pendingManager = isCustomizing ? 1 : pendingManagerList.length;
 
   // Online users scoped to manager's teams
   const teamOnlineUsers = useMemo(() => {
     if (isCustomizing) return onlineUsers;
     return onlineUsers.filter((ou: any) => {
       const fullUser = users.find((u: any) => u.id === ou.id);
-      const uTeamIds = fullUser?.team_ids || [];
-      return uTeamIds.some((tid: string) => myTeamIds.includes(tid));
+      return Boolean(fullUser?.primary_team_id && myTeamIds.includes(fullUser.primary_team_id));
     });
   }, [isCustomizing, onlineUsers, myTeamIds, users]);
 
@@ -350,10 +429,10 @@ export default function SupportManagerDashboard({
         <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
       </span>
       <span className="text-brand-muted text-xs font-semibold lowercase tracking-wider">
-        {isCustomizing ? '8 conectados' : (teamOnlineUsers.length === 1 ? '1 conectado' : `${teamOnlineUsers.length} conectados`)}
+        {teamOnlineUsers.length === 1 ? '1 conectado' : `${teamOnlineUsers.length} conectados`}
       </span>
     </div>
-  ), [isCustomizing, teamOnlineUsers]);
+  ), [teamOnlineUsers]);
 
   // Reevaluations
   const contestedMonitorias = useMemo(() => {
@@ -365,27 +444,31 @@ export default function SupportManagerDashboard({
 
   const totalContestations = isCustomizing ? 8 : contestedMonitorias.length;
 
-  const reavAccepted = useMemo(() => {
-    if (isCustomizing) return 1;
+  const reavAcceptedList = useMemo(() => {
+    if (isCustomizing) return [];
     return contestedMonitorias.filter((m: any) => {
       const resolutions = (m.history || []).filter((h: any) =>
         isApprovalAction(h.action) || isRejectionAction(h.action)
       );
       if (resolutions.length === 0) return false;
       return isApprovalAction(resolutions[resolutions.length - 1].action);
-    }).length;
+    });
   }, [isCustomizing, contestedMonitorias]);
 
-  const reavRejected = useMemo(() => {
-    if (isCustomizing) return 7;
+  const reavAccepted = isCustomizing ? 1 : reavAcceptedList.length;
+
+  const reavRejectedList = useMemo(() => {
+    if (isCustomizing) return [];
     return contestedMonitorias.filter((m: any) => {
       const resolutions = (m.history || []).filter((h: any) =>
         isApprovalAction(h.action) || isRejectionAction(h.action)
       );
       if (resolutions.length === 0) return false;
       return isRejectionAction(resolutions[resolutions.length - 1].action);
-    }).length;
+    });
   }, [isCustomizing, contestedMonitorias]);
+
+  const reavRejected = isCustomizing ? 7 : reavRejectedList.length;
 
   const reversalRate = useMemo(() => {
     if (isCustomizing) return 12.50;
@@ -405,23 +488,9 @@ export default function SupportManagerDashboard({
   // Performance Histórica (Trend chart)
   const trendData = useMemo(() => {
     if (isCustomizing) return mockTrendData;
-    const days: Record<string, { totalScore: number, count: number }> = {};
-    scoredMonitorias.forEach((m: any) => {
-      const date = new Date(m.created_at).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
-      if (!days[date]) days[date] = { totalScore: 0, count: 0 };
-      days[date].totalScore += m.score || 0;
-      days[date].count += 1;
-    });
-
-    return Object.entries(days).map(([name, data]) => ({
-      name,
-      ScoreEquipe: Math.round((data.totalScore / data.count) * 100) / 100
-    })).sort((a, b) => {
-      const [da, ma] = a.name.split('/').map(Number);
-      const [db, mb] = b.name.split('/').map(Number);
-      return ma !== mb ? ma - mb : da - db;
-    });
-  }, [isCustomizing, scoredMonitorias]);
+    const selected = selectTrendEvaluations(allMonitorias, filters, user?.role);
+    return buildPerformanceTrend(selected.evaluations, selected.granularity);
+  }, [isCustomizing, allMonitorias, filters, user?.role]);
 
   const trendPercentage = useMemo(() => {
     if (isCustomizing) return 1.85;
@@ -437,35 +506,22 @@ export default function SupportManagerDashboard({
   // Rankings
   const agentRanking = useMemo(() => {
     if (isCustomizing) return [];
-    const map: Record<string, { total: number; count: number }> = {};
-    scoredMonitorias.forEach((m: any) => {
-      const id = m.evaluated_id;
-      if (!map[id]) map[id] = { total: 0, count: 0 };
-      map[id].total += m.score || 0;
-      map[id].count++;
-    });
-    return Object.entries(map)
-      .map(([id, s]) => ({
-        id,
-        name: users.find((u: any) => u.id === id)?.name || id,
-        score: Math.round((s.total / s.count) * 100) / 100,
-        count: s.count
-      }))
-      .sort((a, b) => b.score - a.score);
-  }, [isCustomizing, scoredMonitorias, users]);
+    if (aggregates) return aggregatedSupportRanking(aggregates, scoredMonitorias, users);
+    return buildSupportRanking(scoredMonitorias, selectRankingBaseline(allMonitorias.filter((m: Monitoria) => myTeamIds.includes(m.team_id ?? '')), filters), users);
+  }, [isCustomizing, scoredMonitorias, allMonitorias, filters, users, myTeamIds, aggregates]);
 
   // Melhores Suporte
   const topAgents = useMemo(() => {
     if (isCustomizing) return mockTopAgents;
-    return agentRanking.filter(a => a.score >= config.targetScore).slice(0, 5);
+    return agentRanking.filter(a => a.rawScore >= config.targetScore).slice(0, 5);
   }, [isCustomizing, agentRanking, config.targetScore]);
 
   // Maiores Ofensores
   const bottomAgents = useMemo(() => {
     if (isCustomizing) return mockBottomAgents;
     return agentRanking
-      .filter(a => a.score < config.targetScore)
-      .sort((a, b) => a.score - b.score)
+      .filter(a => a.rawScore < config.targetScore)
+      .sort(compareSupportOffenders)
       .slice(0, 5);
   }, [isCustomizing, agentRanking, config.targetScore]);
 
@@ -509,21 +565,24 @@ export default function SupportManagerDashboard({
   // Reavaliações rankings
   const topApprovedAgents = useMemo(() => {
     if (isCustomizing) return mockContestationsApproved;
-    const map: Record<string, number> = {};
+    const map: Record<string, { count: number; monitorias: any[] }> = {};
     myMonitorias.forEach((m: any) => {
       const isAccepted = m.status === 'contestacao_aceita' || 
                         m.status === 'finalizada_alterada' ||
                         m.history?.some((h: any) => h.action.toLowerCase().includes('aceita') || h.action.toLowerCase().includes('procedente') || h.action.toLowerCase().includes('alterada'));
       
       if (isAccepted && m.evaluated_id) {
-        map[m.evaluated_id] = (map[m.evaluated_id] || 0) + 1;
+        if (!map[m.evaluated_id]) map[m.evaluated_id] = { count: 0, monitorias: [] };
+        map[m.evaluated_id].count++;
+        map[m.evaluated_id].monitorias.push(m);
       }
     });
     return Object.entries(map)
-      .map(([id, count]) => ({
+      .map(([id, s]) => ({
         id,
         name: users.find((u: any) => u.id === id)?.name || 'Agente Externo',
-        count
+        count: s.count,
+        monitorias: s.monitorias
       }))
       .sort((a, b) => b.count - a.count)
       .slice(0, 5);
@@ -531,20 +590,23 @@ export default function SupportManagerDashboard({
 
   const topRejectedAgents = useMemo(() => {
     if (isCustomizing) return mockContestationsRejected;
-    const map: Record<string, number> = {};
+    const map: Record<string, { count: number; monitorias: any[] }> = {};
     myMonitorias.forEach((m: any) => {
       const isRejected = m.status === 'contestacao_negada' || 
                         m.history?.some((h: any) => h.action.toLowerCase().includes('negada') || h.action.toLowerCase().includes('recusada') || h.action.includes('Improcedente') || h.action.includes('Mantida'));
       
       if (isRejected && m.evaluated_id) {
-        map[m.evaluated_id] = (map[m.evaluated_id] || 0) + 1;
+        if (!map[m.evaluated_id]) map[m.evaluated_id] = { count: 0, monitorias: [] };
+        map[m.evaluated_id].count++;
+        map[m.evaluated_id].monitorias.push(m);
       }
     });
     return Object.entries(map)
-      .map(([id, count]) => ({
+      .map(([id, s]) => ({
         id,
         name: users.find((u: any) => u.id === id)?.name || 'Agente Externo',
-        count
+        count: s.count,
+        monitorias: s.monitorias
       }))
       .sort((a, b) => b.count - a.count)
       .slice(0, 5);
@@ -573,6 +635,27 @@ export default function SupportManagerDashboard({
         <p className="mb-0.5">{d.name}</p>
         <p className="opacity-80">{d.value} ocorrências ({percent}%)</p>
       </div>
+    );
+  };
+
+  const renderDonutSliceLabel = ({ cx, cy, midAngle, innerRadius, outerRadius, percent }: any) => {
+    if (!percent || percent < 0.08) return null;
+    const RADIAN = Math.PI / 180;
+    const radius = innerRadius + (outerRadius - innerRadius) * 0.5;
+    const x = cx + radius * Math.cos(-midAngle * RADIAN);
+    const y = cy + radius * Math.sin(-midAngle * RADIAN);
+
+    return (
+      <text
+        x={x}
+        y={y}
+        fill="#ffffff"
+        textAnchor="middle"
+        dominantBaseline="central"
+        className="text-[9px] font-black drop-shadow-[0_1px_2px_rgba(0,0,0,0.8)] select-none pointer-events-none"
+      >
+        {`${(percent * 100).toFixed(0)}%`}
+      </text>
     );
   };
 
@@ -654,6 +737,11 @@ export default function SupportManagerDashboard({
             good={pendingManager === 0}
             icon={pendingManager === 0 ? <CheckCircle2 className="w-5 h-5" /> : <AlertTriangle className="w-5 h-5" />}
             accent={pendingManager === 0 ? 'text-functional-success' : 'text-functional-error'}
+            onClick={() => setDrillDown({
+              title: 'Minhas Ações Pendentes',
+              subtitle: 'Monitorias aguardando sua análise e deliberação como gestor',
+              monitorias: pendingManagerList,
+            })}
             badge={
               pendingManager > 0 ? (
                 <span className="relative flex h-2 w-2 self-center">
@@ -676,6 +764,11 @@ export default function SupportManagerDashboard({
             good={avgScore >= config.targetScore}
             icon={<Target className="w-5 h-5" />}
             accent="text-brand-accent"
+            onClick={() => setDrillDown({
+              title: 'Monitorias com Nota da Equipe',
+              subtitle: 'Atendimentos avaliados que compõem a média geral do time',
+              monitorias: scoredMonitorias,
+            })}
             badge={
               isCustomizing ? (
                 <span className={`inline-flex items-center justify-center gap-0.5 px-1.5 py-0.5 text-[10px] font-bold rounded-md self-center ${isCustomizing ? 'bg-green-50 text-green-700 dark:bg-green-950/30 dark:text-green-400' : diffColorClass}`}>
@@ -699,6 +792,11 @@ export default function SupportManagerDashboard({
             good={excellentPercent >= 50}
             icon={<Award className="w-5 h-5" />}
             accent="text-brand-accent"
+            onClick={() => setDrillDown({
+              title: 'Monitorias no Índice de Excelência',
+              subtitle: 'Atendimentos avaliados que atingiram nota na faixa Excelente',
+              monitorias: excellentList,
+            })}
             badge={
               <div className="flex items-center gap-1.5">
                 <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-black uppercase tracking-widest rounded-md ${
@@ -730,6 +828,11 @@ export default function SupportManagerDashboard({
           good={true}
           icon={<ClipboardCheck className="w-5 h-5" />}
           accent="text-brand-accent"
+          onClick={() => setDrillDown({
+            title: 'Total de Monitorias',
+            subtitle: 'Todas as monitorias da sua equipe no período selecionado',
+            monitorias: myMonitorias,
+          })}
           isCustomizing={isCustomizing}
           profile="gestor_suporte"
           activeEditingId={activeEditingId}
@@ -742,6 +845,11 @@ export default function SupportManagerDashboard({
           good={pendingTotal === 0}
           icon={pendingTotal === 0 ? <CheckCircle2 className="w-5 h-5" /> : <AlertTriangle className="w-5 h-5" />}
           accent={pendingTotal === 0 ? 'text-functional-success' : 'text-functional-error'}
+          onClick={() => setDrillDown({
+            title: 'Ações Pendentes na Equipe',
+            subtitle: 'Monitorias com revisão, contestação ou aprovação pendente',
+            monitorias: pendingTotalList,
+          })}
           isCustomizing={isCustomizing}
           profile="gestor_suporte"
           activeEditingId={activeEditingId}
@@ -754,6 +862,11 @@ export default function SupportManagerDashboard({
             good={reversalRate <= config.targetReversalRate}
             icon={<Target className="w-5 h-5" />}
             accent={reversalRate <= config.targetReversalRate ? 'text-functional-success' : 'text-functional-error'}
+            onClick={() => setDrillDown({
+              title: 'Monitorias Contestadas (Reversão)',
+              subtitle: 'Histórico de contestações das suas equipes',
+              monitorias: contestedMonitorias,
+            })}
             badge={
               isCustomizing ? (
                 <span className={`inline-flex items-center justify-center gap-0.5 px-1.5 py-0.5 text-[10px] font-bold rounded-md self-center ${isCustomizing ? 'bg-green-50 text-green-700 dark:bg-green-950/30 dark:text-green-400' : revColorClass}`}>
@@ -772,7 +885,7 @@ export default function SupportManagerDashboard({
           />
         <StatCard
           title="Usuários Online"
-          value={isCustomizing ? 8 : teamOnlineUsers.length}
+          value={teamOnlineUsers.length}
           sub={onlineSub}
           good={true}
           icon={<Activity className="w-5 h-5" />}
@@ -785,6 +898,71 @@ export default function SupportManagerDashboard({
         />
       </div>
 
+      {/* LINHA: Indicadores de Avaliação e Desfecho (WQ-21) */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+        <StatCard
+          title="Total Avaliado"
+          value={indicators.totalAvaliado}
+          sub="Monitorias avaliadas no período"
+          good={true}
+          icon={<ClipboardCheck className="w-5 h-5" />}
+          accent="text-brand-accent"
+          onClick={() => setDrillDown({
+            title: 'Total Avaliado',
+            subtitle: 'Todas as monitorias avaliadas das suas equipes no período selecionado',
+            monitorias: indicators.avaliadosList,
+          })}
+        />
+        <StatCard
+          title="Total Positivo"
+          value={indicators.totalPositivo}
+          sub="Tickets válidos (nota ≥ 75%)"
+          good={true}
+          icon={<CheckCircle2 className="w-5 h-5" />}
+          accent="text-functional-success"
+          onClick={() => setDrillDown({
+            title: 'Total Positivo (Nota ≥ 75%)',
+            subtitle: 'Atendimentos que atingiram o limiar de conformidade da qualidade',
+            monitorias: indicators.positivosList,
+          })}
+        />
+        <StatCard
+          title="Total Negativo"
+          value={indicators.totalNegativo}
+          sub="Tickets com desvio (nota < 75%)"
+          good={indicators.totalNegativo === 0}
+          icon={<AlertTriangle className="w-5 h-5" />}
+          accent={indicators.totalNegativo === 0 ? 'text-functional-success' : 'text-functional-warning'}
+          onClick={() => setDrillDown({
+            title: 'Total Negativo (Nota < 75%)',
+            subtitle: 'Atendimentos abaixo do limiar de conformidade da qualidade',
+            monitorias: indicators.negativosList,
+          })}
+        />
+        <StatCard
+          title="Tickets Invalidados"
+          value={indicators.totalInvalidados}
+          sub="Publicados no Zendesk como negativos"
+          good={indicators.totalInvalidados === 0}
+          icon={<XCircle className="w-5 h-5" />}
+          accent={indicators.totalInvalidados === 0 ? 'text-functional-success' : 'text-functional-error'}
+          onClick={() => setDrillDown({
+            title: 'Tickets Invalidados no Zendesk',
+            subtitle: 'Chamados cujo último envio publicado ao Zendesk teve desfecho negativo',
+            monitorias: indicators.invalidadosList,
+          })}
+        />
+      </div>
+
+      <DashboardTile type="NegativeCallsTrainingAlert" title="Necessidade de treinamento">
+      <NegativeCallsTrainingAlert
+        monitorias={isCustomizing ? [] : allMonitorias}
+        users={users}
+        teamIds={myTeamIds}
+        isCustomizing={isCustomizing}
+      />
+      </DashboardTile>
+
       {/* LINHA 3 (Métricas de Reavaliação - lg:grid-cols-4 gap-6) */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
         <StatCard
@@ -794,6 +972,11 @@ export default function SupportManagerDashboard({
           good={true}
           icon={<History className="w-5 h-5" />}
           accent="text-slate-500"
+          onClick={() => setDrillDown({
+            title: 'Total de Reavaliações Solicitadas',
+            subtitle: 'Todas as contestações abertas pelos agentes da sua equipe',
+            monitorias: contestedMonitorias,
+          })}
           isCustomizing={isCustomizing}
           profile="gestor_suporte"
           activeEditingId={activeEditingId}
@@ -806,6 +989,11 @@ export default function SupportManagerDashboard({
           good={true}
           icon={<CheckCircle2 className="w-5 h-5" />}
           accent="text-functional-success"
+          onClick={() => setDrillDown({
+            title: 'Reavaliações Aprovadas (Procedentes)',
+            subtitle: 'Contestações acolhidas com alteração de nota',
+            monitorias: reavAcceptedList,
+          })}
           isCustomizing={isCustomizing}
           profile="gestor_suporte"
           activeEditingId={activeEditingId}
@@ -818,6 +1006,11 @@ export default function SupportManagerDashboard({
           good={true}
           icon={<XCircle className="w-5 h-5" />}
           accent="text-functional-error"
+          onClick={() => setDrillDown({
+            title: 'Reavaliações Recusadas (Improcedentes)',
+            subtitle: 'Contestações indeferidas mantendo a nota original',
+            monitorias: reavRejectedList,
+          })}
           isCustomizing={isCustomizing}
           profile="gestor_suporte"
           activeEditingId={activeEditingId}
@@ -830,6 +1023,11 @@ export default function SupportManagerDashboard({
           good={trendPercentage >= 0}
           icon={<TrendingUp className="w-5 h-5" />}
           accent="text-functional-success"
+          onClick={() => setDrillDown({
+            title: 'Monitorias Avaliadas (Tendência)',
+            subtitle: 'Atendimentos que compõem a curva de evolução da equipe',
+            monitorias: scoredMonitorias,
+          })}
           isCustomizing={isCustomizing}
           profile="gestor_suporte"
           activeEditingId={activeEditingId}
@@ -860,7 +1058,11 @@ export default function SupportManagerDashboard({
             title="Performance Histórica"
             subtitle="Nota média agregada das suas equipes"
             data={trendData}
-            dataKeys={[{ key: 'ScoreEquipe', name: 'Média Geral', color: chartPalette().excelente }]}
+            dataKeys={[
+              { key: 'ScoreEquipe', name: 'Média Global', color: chartPalette().excelente },
+              { key: 'Positivas', name: 'Positivas', color: chartPalette().aceitavel },
+              { key: 'Negativas', name: 'Negativas', color: chartPalette().ruim },
+            ]}
             isCustomizing={isCustomizing}
             profile="gestor_suporte"
             activeEditingId={activeEditingId}
@@ -869,9 +1071,20 @@ export default function SupportManagerDashboard({
         </div>
       </div>
 
-      {/* LINHA 6 (Distribuição e Alertas - lg:grid-cols-2 gap-6) */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      {/* LINHA 6 (Distribuição e Alertas) */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="h-[380px]">
+          <DistributionChart
+            title="Distribuição por Grupo"
+            data={groupDistribution}
+            isCustomizing={isCustomizing}
+            profile="gestor_suporte"
+            activeEditingId={activeEditingId}
+            setActiveEditingId={setActiveEditingId}
+          />
+        </div>
         {/* Bloco: Curva de Qualidade / Distribuição por Nível */}
+        <DashboardTile type="CustomChart" title="Curva de Qualidade" profile="gestor_suporte">
         <div className="h-[380px]">
           {isEditingCurva ? (
             <Card padding="md" className="h-full flex flex-col justify-between border-brand-accent/50 bg-surface-card shadow-lg relative z-50">
@@ -909,7 +1122,7 @@ export default function SupportManagerDashboard({
               </div>
             </Card>
           ) : (
-            <Card padding="md" className="h-full flex flex-col overflow-visible">
+            <Card padding="md" className="@container h-full min-h-0 flex flex-col overflow-visible">
               <div className="flex items-center gap-3 mb-3 min-w-0">
                 <div 
                   className={`relative w-8 h-8 rounded-xl bg-icon-accent flex items-center justify-center flex-shrink-0 text-brand-accent transition-all ${
@@ -935,26 +1148,28 @@ export default function SupportManagerDashboard({
                     )}
                   </AnimatePresence>
                 </div>
-                <h3 className="text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 leading-tight whitespace-normal flex-1">
+                <h3 className="text-[11px] font-bold uppercase tracking-wider text-black dark:text-slate-200 leading-tight whitespace-normal flex-1">
                   Curva de Qualidade (Distribuição por Nível)
                 </h3>
               </div>
               
               <div className="flex-1 flex flex-col min-h-0">
                 {gradeDistribution.length > 0 ? (
-                  <div className="flex-1 flex flex-col justify-between min-h-0">
-                    <div className="flex-1 min-h-[140px] relative">
+                  <div className="flex-1 min-h-0 flex flex-row items-center justify-between gap-2">
+                    <div className="w-[120px] @min-[380px]:w-[140px] h-[160px] shrink-0 relative flex items-center justify-center">
                       <ResponsiveContainer width="100%" height="100%">
                         <PieChart>
-                          <Tooltip content={<CustomTooltipCurva />} />
+                          <Tooltip content={<CustomTooltipCurva />} wrapperStyle={{ zIndex: 30 }} />
                           <Pie
                             data={gradeDistribution}
                             cx="50%"
                             cy="50%"
-                            innerRadius={55}
- outerRadius={75}
+                            innerRadius={34}
+                            outerRadius={52}
                             paddingAngle={3}
                             dataKey="value"
+                            label={renderDonutSliceLabel}
+                            labelLine={false}
                           >
                             {gradeDistribution.map((entry: any, index: number) => (
                               <Cell key={`cell-${index}`} fill={entry.color} />
@@ -962,16 +1177,38 @@ export default function SupportManagerDashboard({
                           </Pie>
                         </PieChart>
                       </ResponsiveContainer>
+                      {/* Totalizador Central */}
+                      <div className="absolute inset-0 z-0 flex flex-col items-center justify-center pointer-events-none select-none">
+                        <span className="text-base font-black text-brand-primary leading-none tracking-tight">
+                          {gradeDistribution.reduce((acc: number, item: any) => acc + item.value, 0)}
+                        </span>
+                        <span className="text-[8px] font-black uppercase tracking-widest text-brand-muted mt-0.5">
+                          Total
+                        </span>
+                      </div>
                     </div>
-                    {/* Compact Legend */}
-                    <div className="max-h-[85px] overflow-y-auto pr-1 no-scrollbar flex flex-wrap justify-center gap-x-3 gap-y-1.5 mt-2 pt-2 border-t border-surface-border/40">
+                    {/* Lateral Legend with % and progress bars */}
+                    <div className="min-w-0 max-h-[220px] flex-1 overflow-y-auto no-scrollbar pr-1 flex flex-col justify-start gap-2 pl-2 border-l border-surface-border/40">
                       {gradeDistribution.map((entry: any, index: number) => {
                         const totalVal = gradeDistribution.reduce((acc: number, item: any) => acc + item.value, 0);
                         const percent = totalVal > 0 ? ((entry.value / totalVal) * 100).toFixed(1) : '0';
                         return (
-                          <div key={index} className="flex items-center gap-1.5 text-[9px] text-brand-muted font-black uppercase tracking-tight">
-                            <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: entry.color }} />
-                            {entry.name.split(' (')[0]}: {entry.value} ({percent}%)
+                          <div key={index} className="flex flex-col gap-1 text-[9px] text-brand-muted font-bold tracking-tight">
+                            <div className="flex flex-wrap items-start justify-between gap-1.5">
+                              <div className="flex items-start gap-1.5 min-w-[80px] flex-1">
+                                <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: entry.color }} />
+                                <span className="min-w-0 break-words uppercase font-black leading-tight" title={entry.name}>{entry.name.split(' (')[0]}</span>
+                              </div>
+                              <span className="text-brand-primary whitespace-nowrap font-black shrink-0">
+                                {entry.value} ({percent}%)
+                              </span>
+                            </div>
+                            <div className="w-full h-1 bg-surface-subtle rounded-full overflow-hidden">
+                              <div
+                                className="h-full rounded-full transition-all duration-300"
+                                style={{ width: `${percent}%`, backgroundColor: entry.color }}
+                              />
+                            </div>
                           </div>
                         );
                       })}
@@ -986,8 +1223,10 @@ export default function SupportManagerDashboard({
             </Card>
           )}
         </div>
+        </DashboardTile>
 
         {/* Bloco 3: Ações Expirando list */}
+        <DashboardTile type="CustomChart" title="Ações Expirando" profile="gestor_suporte">
         <div className="h-[380px]">
           <Card padding="md" className="h-full flex flex-col overflow-visible">
             <div className="flex items-center gap-3 mb-3 flex-shrink-0">
@@ -995,7 +1234,7 @@ export default function SupportManagerDashboard({
                 <Clock className="w-4 h-4 fill-current fill-opacity-15" strokeWidth={2} fill="currentColor" fillOpacity={0.15} />
               </div>
               <div>
-                <h3 className="text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 leading-tight">
+                <h3 className="text-[11px] font-bold uppercase tracking-wider text-black dark:text-slate-200 leading-tight">
                   Ações Expirando
                 </h3>
               </div>
@@ -1016,25 +1255,31 @@ export default function SupportManagerDashboard({
             )}
           </Card>
         </div>
+        </DashboardTile>
       </div>
 
       {/* LINHA 7 (O Cockpit de 4 Rankings - lg:grid-cols-4 gap-6) */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
-        <div className="h-[380px]">
+        <div className="min-h-[420px] h-full">
           <RankingWidget
             title="Melhores Suporte"
-            subtitle={`Agentes acima da meta (${config.targetScore}%)`}
+            subtitle={`Média ≥ ${config.targetScore}% · ordem ponderada`}
             data={topAgents}
             isCustomizing={isCustomizing}
             profile="gestor_suporte"
             activeEditingId={activeEditingId}
             setActiveEditingId={setActiveEditingId}
+            onItemClick={(item) => setDrillDown({
+              title: `Melhores Suporte · ${item.name}`,
+              subtitle: `Monitorias avaliadas do atendente no período selecionado (Média: ${(item.rawScore ?? item.score ?? 0).toFixed(1)}%)`,
+              monitorias: item.monitorias || myMonitorias.filter((m: any) => m.evaluated_id === item.id),
+            })}
           />
         </div>
-        <div className="h-[380px]">
+        <div className="min-h-[420px] h-full">
           <RankingWidget
             title="Maiores Ofensores"
-            subtitle={`Agentes abaixo da meta (${config.targetScore}%)`}
+            subtitle={`Média < ${config.targetScore}% · perdas ponderadas`}
             data={bottomAgents}
             icon={<Target className="w-5 h-5" />}
             accent="text-functional-warning"
@@ -1042,9 +1287,14 @@ export default function SupportManagerDashboard({
             profile="gestor_suporte"
             activeEditingId={activeEditingId}
             setActiveEditingId={setActiveEditingId}
+            onItemClick={(item) => setDrillDown({
+              title: `Maiores Ofensores · ${item.name}`,
+              subtitle: `Monitorias com oportunidades de melhoria do atendente no período (Média: ${(item.rawScore ?? item.score ?? 0).toFixed(1)}%)`,
+              monitorias: item.monitorias || myMonitorias.filter((m: any) => m.evaluated_id === item.id),
+            })}
           />
         </div>
-        <div className="h-[380px]">
+        <div className="min-h-[420px] h-full">
           <RankingWidget
             title="Top Reav. Aceitas"
             subtitle="Agentes com mais notas alteradas"
@@ -1054,9 +1304,14 @@ export default function SupportManagerDashboard({
             profile="gestor_suporte"
             activeEditingId={activeEditingId}
             setActiveEditingId={setActiveEditingId}
+            onItemClick={(item) => setDrillDown({
+              title: `Reavaliações Aceitas · ${item.name}`,
+              subtitle: `Monitorias do atendente com reavaliação deferida/aceita no período (${item.count} procedentes)`,
+              monitorias: item.monitorias || [],
+            })}
           />
         </div>
-        <div className="h-[380px]">
+        <div className="min-h-[420px] h-full">
           <RankingWidget
             title="Top Reav. Recusadas"
             subtitle="Agentes com mais notas mantidas"
@@ -1068,6 +1323,11 @@ export default function SupportManagerDashboard({
             profile="gestor_suporte"
             activeEditingId={activeEditingId}
             setActiveEditingId={setActiveEditingId}
+            onItemClick={(item) => setDrillDown({
+              title: `Reavaliações Recusadas · ${item.name}`,
+              subtitle: `Monitorias do atendente com reavaliação indeferida ou mantida no período (${item.count} improcedentes)`,
+              monitorias: item.monitorias || [],
+            })}
           />
         </div>
       </div>
@@ -1123,10 +1383,35 @@ export default function SupportManagerDashboard({
         );
       })()}
 
+      <DashboardTile type="FeedbacksWidget" title="Feedbacks & Gestão de 1:1">
+      <FeedbacksWidget
+        feedbacks={feedbacks}
+        currentUser={user}
+        users={users}
+        teams={teams}
+        monitorias={myMonitorias}
+        onCreateFeedback={createFeedback}
+        onAcknowledgeFeedback={acknowledgeFeedback}
+        onCompleteFeedback={completeFeedback}
+      />
+      </DashboardTile>
+
       <RecentAuditsTable
         monitorias={isCustomizing ? mockRecentMonitorias : myMonitorias}
         users={users}
       />
+      <ManagerDecisionHistoryTable monitorias={myMonitorias} users={users} profile="gestor_suporte" allowedTeamIds={myTeamIds} isCustomizing={isCustomizing} />
+      <CriticalErrorsTable monitorias={myMonitorias} forms={forms} users={users} profile="gestor_suporte" isCustomizing={isCustomizing} />
+      <AgentEvaluationVolumeTable monitorias={myMonitorias} users={users} profile="gestor_suporte" isCustomizing={isCustomizing} />
+
+      {drillDown && (
+        <SupportDrillDownModal
+          title={drillDown.title}
+          subtitle={drillDown.subtitle}
+          monitorias={drillDown.monitorias}
+          onClose={() => setDrillDown(null)}
+        />
+      )}
     </div>
   );
 }

@@ -1,28 +1,19 @@
 import React from 'react';
 import { User } from '../../types';
 import { DashboardProvider, useDashboard } from './DashboardContext';
+import { PageSkeleton } from '../ui/PageSkeleton';
+import { userCacheScope } from '../../lib/pageCache';
 import FilterBar from './FilterBar';
+import { DashboardTileLayout } from './DashboardTileLayout';
 
-// We will import the specific role dashboards here
-import AgentDashboard from './roles/AgentDashboard';
-import QualityDashboard from './roles/QualityDashboard';
-import SupportManagerDashboard from './roles/SupportManagerDashboard';
-import QualityManagerDashboard from './roles/QualityManagerDashboard';
-import AdminDashboard from './roles/AdminDashboard';
+const AgentDashboard = React.lazy(() => import('./roles/AgentDashboard'));
+const QualityDashboard = React.lazy(() => import('./roles/QualityDashboard'));
+const SupportManagerDashboard = React.lazy(() => import('./roles/SupportManagerDashboard'));
+const QualityManagerDashboard = React.lazy(() => import('./roles/QualityManagerDashboard'));
+const AdminDashboard = React.lazy(() => import('./roles/AdminDashboard'));
 
 function DashboardRouter() {
-  const { user, dashboardRole, loading } = useDashboard();
-
-  if (loading) {
-    return (
-      <div className="space-y-6">
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-          {[1,2,3,4].map(i => <div key={i} className="h-28 bg-white rounded-3xl border border-surface-border animate-pulse" />)}
-        </div>
-        <div className="h-72 bg-white rounded-3xl border border-surface-border animate-pulse" />
-      </div>
-    );
-  }
+  const { user, dashboardRole } = useDashboard();
 
   if (!user) return null;
 
@@ -47,6 +38,17 @@ function DashboardRouter() {
   }
 }
 
+function DashboardContent() {
+  const { user, loading } = useDashboard();
+  if (loading) return <PageSkeleton dashboard />;
+  return <React.Suspense fallback={<PageSkeleton dashboard />}>
+    <div className="space-y-6">
+      <FilterBar />
+      <DashboardTileLayout role={user!.role}><DashboardRouter /></DashboardTileLayout>
+    </div>
+  </React.Suspense>;
+}
+
 export default function DashboardMain({ 
   user, 
   activeTab
@@ -57,11 +59,8 @@ export default function DashboardMain({
   if (!user) return null;
 
   return (
-    <DashboardProvider user={user} activeTab={activeTab}>
-      <div className="space-y-6">
-        <FilterBar />
-        <DashboardRouter />
-      </div>
+    <DashboardProvider key={userCacheScope(user)} user={user} activeTab={activeTab}>
+      <DashboardContent />
     </DashboardProvider>
   );
 }

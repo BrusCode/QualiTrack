@@ -35,6 +35,12 @@ export const STATUS_CONFIGS: Record<MonitoriaStatus | 'expiradas_prazo', StatusC
     variant: 'info',
     icon: Shield
   },
+  aguardando_revisao_pj: {
+    label: 'Etapa antiga de revisão PJ',
+    shortLabel: 'Etapa antiga',
+    variant: 'warning',
+    icon: Clock
+  },
   aguardando_gestor_qualidade: {
     label: 'Aguardando Qualidade',
     shortLabel: 'Gestão Qual.',
@@ -77,6 +83,48 @@ export const STATUS_CONFIGS: Record<MonitoriaStatus | 'expiradas_prazo', StatusC
     variant: 'error',
     icon: Clock
   }
+};
+
+/**
+ * Cor e ícone de cada evento da linha do tempo.
+ *
+ * O texto do evento vem de actionDescriptions (useMonitoriaActions) e de
+ * useMonitoriaSave, além de registros antigos com outras redações. Casar
+ * por string exata quebraria a cada texto novo, então classificamos por
+ * palavra-chave — a ordem importa: "Contestação Aceita" contém tanto
+ * "contesta" quanto "aceita", e deve sair como aceite.
+ */
+export function getHistoryEventConfig(action: string): { variant: StatusConfig['variant']; icon: LucideIcon } {
+  const a = (action || '').toLowerCase();
+
+  if (/negad|removid|recusad|reprovad|reprovou|improcedente/.test(a)) {
+    return { variant: 'error', icon: XCircle };
+  }
+  if (/aceit|aprovad|aprovou|procedente|conclu/.test(a)) {
+    return { variant: 'success', icon: CheckCircle2 };
+  }
+  if (/contesta|escalad|devolvid|solicitad|mantid|reabert|reavalia/.test(a)) {
+    return { variant: 'warning', icon: AlertTriangle };
+  }
+  return { variant: 'info', icon: Clock };
+}
+
+/** Classe de cor de texto por variant. Centralizado para a linha do tempo. */
+export const VARIANT_TEXT_CLASS: Record<StatusConfig['variant'], string> = {
+  warning: 'text-warning',
+  error: 'text-error',
+  info: 'text-info',
+  success: 'text-success',
+  neutral: 'text-brand-muted'
+};
+
+/** Estilo de container (fundo, texto e borda) por variant para badges de status */
+export const VARIANT_ICON_CONTAINER: Record<StatusConfig['variant'], string> = {
+  warning: 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/25',
+  error: 'bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/25',
+  info: 'bg-sky-500/10 text-sky-600 dark:text-sky-400 border border-sky-500/25',
+  success: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/25',
+  neutral: 'bg-surface-subtle text-brand-muted border border-surface-border/60'
 };
 
 export function getStatusConfig(status: MonitoriaStatus | 'expiradas_prazo' | string): StatusConfig {

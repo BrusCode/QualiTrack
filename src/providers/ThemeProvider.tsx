@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useEffect, useState, useCallback, useMemo } from 'react';
 
 export type Theme = 'light' | 'dark' | 'system';
 
@@ -38,51 +38,24 @@ interface ThemeProviderProps {
 }
 
 export function ThemeProvider({ children }: ThemeProviderProps) {
-  const [theme, setTheme] = useState<Theme>(() => {
-    const saved = localStorage.getItem('qualitrack_theme');
-    if (saved === 'light' || saved === 'dark' || saved === 'system') return saved;
-    return 'system';
-  });
+  const theme: Theme = 'system';
+  const [resolvedTheme, setResolvedTheme] = useState(resolveSystemTheme);
+  // Compatibility for session restoration: old saved choices cannot override the OS.
+  const setTheme = useCallback<React.Dispatch<React.SetStateAction<Theme>>>(() => {
+    setResolvedTheme(resolveSystemTheme());
+  }, []);
 
-  const resolvedTheme = useMemo(() => {
-    if (theme === 'system') {
-      return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-    }
-    return theme;
-  }, [theme]);
+  useEffect(() => { applyThemeToDOM(resolvedTheme); }, [resolvedTheme]);
 
   useEffect(() => {
-    const root = document.documentElement;
-    if (resolvedTheme === 'dark') {
-      root.classList.add('dark');
-      root.style.colorScheme = 'dark';
-    } else {
-      root.classList.remove('dark');
-      root.style.colorScheme = 'light';
-    }
-  }, [resolvedTheme]);
-
-  // Listener para mudança de tema do OS
-  useEffect(() => {
-    if (theme !== 'system') return;
     const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
-    const listener = () => {
-      // Força um re-render para que `resolvedTheme` seja recalculado
-      setTheme('system');
-    };
+    const listener = () => setResolvedTheme(mediaQuery.matches ? 'dark' : 'light');
+    listener();
     mediaQuery.addEventListener('change', listener);
     return () => mediaQuery.removeEventListener('change', listener);
-  }, [theme]);
+  }, []);
 
-  // Salva no localStorage (apenas quando logado)
-  useEffect(() => {
-    if (localStorage.getItem('qualitrack_session') || localStorage.getItem('sb-amyfyngzkqqzixmreeih-auth-token')) {
-      // Save the literal theme (including 'system'), not resolvedTheme
-      localStorage.setItem('qualitrack_theme', theme);
-    }
-  }, [theme]);
-
-  const value = { theme, setTheme, resolvedTheme };
-
+  useEffect(() => { localStorage.setItem('qualitrack_theme', 'system'); }, []);
+  const value = useMemo(() => ({ theme, setTheme, resolvedTheme }), [setTheme, resolvedTheme]);
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
 }

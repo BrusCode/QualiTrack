@@ -1,0 +1,380 @@
+import { publicApiKey, secretApiKey } from '../_shared/keys.ts';
+import { guardedExternalFetch, isProductionProject } from '../_shared/external-environment.ts';
+import { corsFor, rejectRequest, configuredOrigin } from '../_shared/http.ts';
+// Orquestra a publicação de uma avaliação de qualidade no helpdesk:
+// autentica o chamador, busca a monitoria, monta o HTML do comentário
+// (sempre no servidor — o frontend pode enviar texto simples editado,
+// nunca HTML), escolhe o provider e registra o resultado.
+//
+// Trocar de helpdesk = trocar o `switch` abaixo por outra implementação de
+// HelpdeskProvider (ver types.ts). Nada de Zendesk deve aparecer aqui além
+// da escolha do provider.
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.108.2';
+import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts";
+
+import type { HelpdeskProvider, PublishResult } from './types.ts';
+import { buildEditedCommentHtml, buildEvaluationHtml } from './template.ts';
+import { ZendeskProvider } from './zendesk.ts';
+import { publicationAccess } from './access.ts';
+import { canPublishMonitoriaStatus } from './publication-status.ts';
+import { processPositiveAutoPublication } from './positive-auto-publication.ts';
+
+const corsHeaders = corsFor(Deno.env.get('FRONTEND_URL'));
+const productionProject = isProductionProject(Deno.env.get('SUPABASE_URL'));
+const zendeskFetch = guardedExternalFetch(globalThis.fetch.bind(globalThis), Deno.env.get('SUPABASE_URL'));
+
+
+const PublishSchema = z.object({
+  monitoria_id: z.string().uuid(),
+  outcome: z.enum(['positiva', 'negativa']).optional(),
+  dry_run: z.boolean().optional(),
+  force: z.boolean().optional(),
+  comment_text: z.string().trim().min(1).max(12000).optional(),
+});
+
+function jsonResponse(body: PublishResult, status: number): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  });
+}
+
+function failure(error: string, stage: 'auth' | 'not_found' | 'provider' | 'validation', status: number): Response {
+  return jsonResponse({ success: false, error, stage }, status);
+}
+
+/**
+ * Escolhe a implementação de HelpdeskProvider a partir de
+ * HELPDESK_PROVIDER. Um switch simples basta: não há necessidade de um
+ * sistema de registro de plugins para uma única variável de ambiente.
+ */
+function resolveProvider(): HelpdeskProvider {
+  const providerName = Deno.env.get('HELPDESK_PROVIDER') ?? 'zendesk';
+
+  switch (providerName) {
+    case 'zendesk': {
+      const subdomain = Deno.env.get('ZENDESK_SUBDOMAIN');
+      const email = Deno.env.get('ZENDESK_EMAIL');
+      const apiToken = Deno.env.get('ZENDESK_API_TOKEN');
+
+      if (!subdomain || !email || !apiToken) {
+        throw new Error(
+          'ZENDESK_SUBDOMAIN, ZENDESK_EMAIL e ZENDESK_API_TOKEN não configurados. Defina via: supabase secrets set ...',
+        );
+      }
+
+      return new ZendeskProvider({ subdomain, email, apiToken }, zendeskFetch);
+    }
+    default:
+      throw new Error(`HELPDESK_PROVIDER desconhecido: ${providerName}`);
+  }
+}
+
+serve(async (req: Request) => {
+  const rejected = rejectRequest(req, corsHeaders);
+  if (rejected) return rejected;
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: corsHeaders });
+  }
+
+  try {
+    if (req.method === 'POST' && req.headers.get('apikey') === secretApiKey()) {
+      const workerBody = await req.clone().json().catch(() => null);
+      if (workerBody?.action === 'process_positive_auto_publication') {
+        if (!productionProject) return new Response(JSON.stringify({ enabled: false, simulated: true, processed: 0 }), {
+          status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+        const workerClient = createClient(Deno.env.get('SUPABASE_URL') ?? '', secretApiKey());
+        const result = await processPositiveAutoPublication(workerClient, resolveProvider());
+        return new Response(JSON.stringify(result), {
+          status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+    }
+    // 1. Validar JWT; resolver o usuário chamador.
+    const authHeader = req.headers.get('Authorization');
+    if (!authHeader) {
+      return failure('Cabeçalho Authorization ausente', 'auth', 401);
+    }
+
+    const supabaseClient = createClient(
+      Deno.env.get('SUPABASE_URL') ?? '',
+      publicApiKey(),
+      { global: { headers: { Authorization: authHeader } } },
+    );
+
+    const { data: { user }, error: userError } = await supabaseClient.auth.getUser(authHeader.replace(/^Bearer\s+/i, ''));
+
+    if (userError || !user) {
+      return failure('Usuário não autenticado', 'auth', 401);
+    }
+
+    const raw = await req.text();
+    if (new TextEncoder().encode(raw).length > 16384) return failure('Requisição muito grande', 'validation', 413);
+    const body = JSON.parse(raw);
+    const parsed = PublishSchema.safeParse(body);
+
+    if (!parsed.success) {
+      return failure(
+        `Payload inválido: ${parsed.error.errors.map((e) => e.message).join(', ')}`,
+        'validation',
+        400,
+      );
+    }
+
+    const { monitoria_id, outcome, dry_run, force, comment_text } = parsed.data;
+    const simulated = !productionProject && !dry_run;
+
+    // Client com service role: a busca/gravação da monitoria e do envio
+    // acontece independentemente das políticas de RLS do usuário chamador
+    // — a Edge Function é a fronteira de autorização aqui, não o RLS.
+    const supabaseAdmin = createClient(
+      Deno.env.get('SUPABASE_URL') ?? '',
+      secretApiKey(),
+    );
+
+    // 2. Buscar a monitoria por monitoria_id. 404 se não existir.
+    const { data: monitoria, error: monitoriaError } = await supabaseAdmin
+      .from('monitorias')
+      .select('id, active, ticket_id, evaluator_id, evaluated_id, team_id, evaluator_note, satisfaction_result, satisfaction_has_record, satisfaction_record_text, selected_critical_errors, status, score, form_id, form_snapshot, history')
+      .eq('id', monitoria_id)
+      .maybeSingle();
+
+    if (monitoriaError) {
+      console.error('[helpdesk-publish-evaluation] Erro ao buscar monitoria:', monitoriaError);
+      return failure('Erro ao buscar a monitoria', 'not_found', 500);
+    }
+
+    if (!monitoria) {
+      return failure('Monitoria não encontrada', 'not_found', 404);
+    }
+    if (!monitoria.active) return failure('Monitoria inativa não pode ser publicada.', 'validation', 409);
+    const childFormIds = new Set([
+      '6c7d1e88-841b-4da9-9a66-9f1464ce896f',
+      '6c7d1e88-841b-4da9-9a66-9f1464ce8970',
+      '6c7d1e88-841b-4da9-9a66-9f1464ce8971',
+      '6c7d1e88-841b-4da9-9a66-9f1464ce8972',
+      '6c7d1e88-841b-4da9-9a66-9f1464ce8973',
+    ]);
+    if (childFormIds.has(monitoria.form_id)
+      || monitoria.form_snapshot?.ticket_kind === 'chamado_filho'
+      || monitoria.form_snapshot?.automation === 'child_ticket'
+      || ['valido', 'invalido'].includes(monitoria.form_snapshot?.child_verdict)) {
+      return failure('Tickets filhos usam a macro própria da fila Chamados Filhos.', 'validation', 409);
+    }
+
+    // 2b. AUTORIZAR o chamador.
+    //
+    // Duas permissões distintas, de propósito: ver o preview (dry_run) é
+    // inofensivo — não escreve em lugar nenhum — mas PUBLICAR assina um
+    // comentário como Qualidade WP num ticket real. Por isso:
+    //
+    //   - Visualizar o preview: gestão da qualidade, o auditor da monitoria,
+    //     o agente avaliado e o gestor de suporte da equipe dele. É natural
+    //     que o agente veja a avaliação que recebeu antes dela ir ao cliente.
+    //   - Publicar de fato: só quem decide o veredito de qualidade — admin,
+    //     gestor_qualidade, ou o auditor que avaliou esta monitoria
+    //     especificamente. Nunca o agente avaliado nem o gestor de suporte:
+    //     senão o próprio avaliado poderia validar a si mesmo no ticket do
+    //     cliente, assinando como Qualidade WP.
+    const { data: caller, error: callerError } = await supabaseAdmin
+      .from('users')
+      .select('id, role, active')
+      .eq('id', user.id)
+      .maybeSingle();
+
+    if (callerError || !caller || !caller.active) {
+      return failure('Usuário sem cadastro ativo no sistema', 'auth', 403);
+    }
+
+    let teamIds: string[] = [];
+    if (caller.role === 'gestor_suporte') {
+      const { data: teams, error: teamError } = await supabaseAdmin.from('user_teams').select('team_id').eq('user_id', user.id);
+      if (teamError) return failure('Não foi possível verificar sua equipe', 'auth', 503);
+      teamIds = (teams ?? []).map((team: { team_id: string }) => team.team_id);
+    }
+    const { preview: podeVisualizar, publish: podePublicar } = publicationAccess(caller, monitoria, teamIds);
+
+    if (!dry_run && !podePublicar) {
+      return failure('Você não tem permissão para publicar esta avaliação no helpdesk', 'auth', 403);
+    }
+
+    if (!podeVisualizar) {
+      return failure('Você não tem permissão para ver esta avaliação', 'auth', 403);
+    }
+    const { data: allowed, error: limitError } = await supabaseAdmin.rpc('consume_security_rate_limit', {
+      bucket_key: `helpdesk-publish:${dry_run ? 'preview' : 'send'}:${user.id}`,
+      max_requests: dry_run ? 60 : 5, window_seconds: 60,
+    });
+    if (limitError || !allowed) return failure('Aguarde um minuto antes de tentar novamente.', 'validation', 429);
+
+    // 3. Validar que ticket_id está preenchido e é numérico (para Zendesk).
+    const ticketId: string | null = monitoria.ticket_id;
+    if (!ticketId || !/^\d+$/.test(ticketId.trim())) {
+      return failure(
+        'O número do ticket desta monitoria não está preenchido ou não é numérico — obrigatório para publicar no Zendesk',
+        'validation',
+        400,
+      );
+    }
+    const normalizedTicketId = ticketId.trim();
+
+    // 3b. Determinar desfecho (outcome) com base nas regras de domínio estritas (WQ-22)
+    // score >= 75: positiva (Ticket Válido), score < 75: negativa (Ticket Invalidado)
+    const rawScore = monitoria.score !== null && monitoria.score !== undefined ? Number(monitoria.score) : NaN;
+    if (!Number.isFinite(rawScore) || rawScore<0 || rawScore>100) {
+      return failure('A monitoria não possui nota válida para definir o resultado da macro.', 'validation', 400);
+    }
+    if (!canPublishMonitoriaStatus(monitoria.status,{satisfaction_result:monitoria.satisfaction_result,score:rawScore})) {
+      return failure(monitoria.satisfaction_result==='Positiva' && rawScore<75
+        ? 'Pesquisa positiva com nota abaixo de 75%: aguarde a conclusão das revisões e contestações antes de invalidar no Zendesk.'
+        : 'A monitoria está em contestação ou decisão de gestor. Aguarde a próxima versão da avaliação antes de publicar no Zendesk.', 'validation',409);
+    }
+    if (!dry_run && !['concluida','finalizada_alterada'].includes(monitoria.status)) {
+      return failure('Aguarde a decisão final antes de publicar no Zendesk.', 'validation', 409);
+    }
+    if (!dry_run) {
+      const latest = await supabaseAdmin.from('monitorias').select('id')
+        .eq('ticket_id', normalizedTicketId).eq('active', true)
+        .order('created_at', { ascending: false }).limit(1).maybeSingle();
+      if (latest.error) return failure('Não foi possível conferir a versão atual da monitoria.', 'provider', 503);
+      if (latest.data?.id !== monitoria_id) return failure('Existe monitoria ativa mais recente para este ticket.', 'validation', 409);
+    }
+    const domainOutcome: 'positiva' | 'negativa' = (!isNaN(rawScore) && rawScore >= 75) ? 'positiva' : 'negativa';
+
+    if (outcome && outcome !== domainOutcome) {
+      return failure(
+        `Desfecho '${outcome}' incompatível com a nota da avaliação (${monitoria.score}%). Regra de domínio: notas >= 75% devem ser 'positiva' e notas < 75% devem ser 'negativa'.`,
+        'validation',
+        400,
+      );
+    }
+
+    const resolvedOutcome: 'positiva' | 'negativa' = domainOutcome;
+
+    // 3c. Proteção contra duplicidade de postagem no Zendesk (se já enviado e não forçado)
+    let correctedOutcome = false;
+    if (!dry_run && !force && !simulated) {
+      const { data: existing } = await supabaseAdmin
+        .from('helpdesk_submissions')
+        .select('id, external_comment_id, outcome')
+        .eq('monitoria_id', monitoria_id)
+        .eq('status', 'sent')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (existing?.outcome === resolvedOutcome) {
+        return jsonResponse(
+          {
+            success: true,
+            preview_html: '',
+            ticket_id: normalizedTicketId,
+            external_comment_id: existing.external_comment_id ?? undefined,
+          },
+          200,
+        );
+      }
+      correctedOutcome = !!existing && existing.outcome !== resolvedOutcome;
+    }
+
+    // 4. Montar o HTML a partir do template + campos.
+    const finalDecision = monitoria.status === 'concluida'
+      && monitoria.satisfaction_result === 'Positiva' && rawScore >= 75
+      && Array.isArray(monitoria.history)
+      && monitoria.history.some((entry: { action?: string }) =>
+        /Monitoria Reavaliada|Monitoria aprovada pelo Gestor/i.test(entry?.action || ''));
+    const generatedHtml = buildEvaluationHtml({
+      outcome: resolvedOutcome,
+      evaluatorNote: finalDecision
+        ? `Após reavaliação, a monitoria foi concluída com nota ${rawScore.toFixed(2).replace('.', ',')}%. O ticket foi validado; esta decisão substitui o apontamento anterior.`
+        : monitoria.evaluator_note ?? null,
+      satisfactionRecordText: monitoria.satisfaction_has_record
+        ? monitoria.satisfaction_record_text ?? null
+        : null,
+    });
+    const previewHtml = comment_text === undefined ? generatedHtml : buildEditedCommentHtml(comment_text);
+
+    // 5. Se dry_run, devolver o HTML e parar — nenhuma escrita.
+    if (dry_run || simulated) {
+      return jsonResponse(
+        { success: true, preview_html: previewHtml, ticket_id: normalizedTicketId,
+          ...(simulated ? { simulated: true } : {}) },
+        200,
+      );
+    }
+
+    // 6. Chamar o provider (Zendesk hoje).
+    let provider: HelpdeskProvider;
+    try {
+      provider = resolveProvider();
+    } catch (err: any) {
+      console.error('[helpdesk-publish-evaluation] Provider não configurado:', err);
+      return failure('Integração de helpdesk indisponível.', 'provider', 503);
+    }
+
+    try {
+      const eligibility = await provider.checkPublicationEligibility(normalizedTicketId);
+      if (!eligibility.eligible) {
+        return failure(eligibility.reason || 'Este ticket não aceita publicações.', 'validation', 409);
+      }
+    } catch (error) {
+      console.error('[helpdesk-publish-evaluation] Falha ao conferir status do ticket:', error);
+      return failure('Não foi possível conferir o estado do ticket no helpdesk. Tente novamente mais tarde.', 'provider', 502);
+    }
+
+    const { data: claimId, error: claimError } = await supabaseAdmin.rpc('claim_helpdesk_publication', {
+      p_monitoria: monitoria_id, p_caller: user.id, p_force: (force ?? false) || correctedOutcome,
+    });
+    if (claimError) return failure('Envio em andamento ou pendente de conferência. Atualize e confira o ticket antes de reenviar.', 'provider', 409);
+    if (!claimId) return jsonResponse({ success: true, preview_html: previewHtml, ticket_id: normalizedTicketId }, 200);
+    try {
+      const { externalCommentId } = await provider.publishEvaluation({
+        ticketId: normalizedTicketId,
+        outcome: resolvedOutcome,
+        htmlBody: previewHtml,
+        clearPreviousInvalid: finalDecision || correctedOutcome,
+      });
+
+      // 7. Registrar o sucesso em helpdesk_submissions.
+      const { error: insertError } = await supabaseAdmin.rpc('finish_helpdesk_publication', {
+        p_monitoria: monitoria_id, p_claim: claimId, p_provider: provider.name,
+        p_ticket: normalizedTicketId, p_outcome: resolvedOutcome, p_comment: externalCommentId, p_success: true,
+      });
+
+      if (insertError) {
+        console.error('[helpdesk-publish-evaluation] Falha ao gravar helpdesk_submissions (sucesso):', insertError);
+        return failure('O helpdesk recebeu a atualização, mas o recibo não foi salvo. Não reenvie; solicite conferência.', 'provider', 503);
+      }
+
+      return jsonResponse(
+        {
+          success: true,
+          preview_html: previewHtml,
+          ticket_id: normalizedTicketId,
+          external_comment_id: externalCommentId,
+        },
+        200,
+      );
+    } catch (err: any) {
+      const errorMessage = 'O comentário pode ter sido enviado, mas os campos da macro não foram confirmados. Confira o ticket no Zendesk; não reenvie antes da conferência.';
+      console.error('[helpdesk-publish-evaluation] Falha ao publicar no provider:', err);
+
+      const { error: insertError } = await supabaseAdmin.rpc('finish_helpdesk_publication', {
+        p_monitoria: monitoria_id, p_claim: claimId, p_provider: provider.name,
+        p_ticket: normalizedTicketId, p_outcome: resolvedOutcome, p_comment: null, p_success: false,
+      });
+
+      if (insertError) {
+        console.error('[helpdesk-publish-evaluation] Falha ao gravar helpdesk_submissions (falha):', insertError);
+      }
+
+      return failure(errorMessage, 'provider', 502);
+    }
+  } catch (error: any) {
+    console.error('[helpdesk-publish-evaluation] Erro inesperado:', error);
+    return failure('Não foi possível processar a solicitação.', 'validation', error instanceof SyntaxError ? 400 : 500);
+  }
+});

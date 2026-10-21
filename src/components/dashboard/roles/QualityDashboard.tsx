@@ -3,9 +3,14 @@ import { useDashboard } from '../DashboardContext';
 import StatCard from '../widgets/StatCard';
 import DistributionChart from '../widgets/DistributionChart';
 import RecentAuditsTable from '../widgets/RecentAuditsTable';
+import ManagerDecisionHistoryTable from '../widgets/ManagerDecisionHistoryTable';
+import CriticalErrorsTable from '../widgets/CriticalErrorsTable';
+import AgentEvaluationVolumeTable from '../widgets/AgentEvaluationVolumeTable';
+import AuditorEvaluationVolumeTable from '../widgets/AuditorEvaluationVolumeTable';
 import ActionDeadlineWidget from '../widgets/ActionDeadlineWidget';
 import ComparativeBarChart from '../widgets/ComparativeBarChart';
 import OfensoresChart from '../widgets/OfensoresChart';
+import SupportDrillDownModal from '../widgets/SupportDrillDownModal';
 import { 
   ClipboardCheck, 
   Target, 
@@ -20,8 +25,10 @@ import {
   Award
 } from 'lucide-react';
 import { useQualityConfig } from '../../../lib/useQualityConfig';
-import { isApprovalAction, isRejectionAction, isContestationAction } from '../../../lib/contestation';
+import { isContestationAction, getContestationOutcome } from '../../../lib/contestation';
 import { chartColorMap, chartPalette, chartColorArray } from '../chartColors';
+import type { Monitoria } from '../../../types';
+import { buildGroupDistribution } from '../../../lib/groupDistribution';
 
 // High-fidelity mock datasets for fallback and customization mode
 const mockTrendData = [
@@ -193,6 +200,11 @@ export default function QualityDashboard({
   const { user, monitorias, allMonitorias, users, teams, forms, dissatisfactionFields, globalAvg } = dashboardData;
   const { config, getLevelForScore, isAboveTarget } = useQualityConfig();
   const [comparativeData, setComparativeData] = useState<any[]>([]);
+  const [drillDown, setDrillDown] = useState<{
+    title: string;
+    subtitle?: string;
+    monitorias: any[];
+  } | null>(null);
 
   // Dados do RBAC para ESTE perfil (sem filtros de UI) — usado para fallback e contadores globais
   const myAllMonitorias = useMemo(() => {
@@ -234,28 +246,20 @@ export default function QualityDashboard({
   }, [useFallback, myMonitorias]);
 
   // Reavaliações Aprovadas (Nota alterada — conta apenas pelo ÚLTIMO desfecho)
-  const reavAccepted = useMemo(() => {
-    if (useFallback) return 3;
-    return contestedMyMonitorias.filter((m: any) => {
-      const resolutions = (m.history || []).filter((h: any) =>
-        isApprovalAction(h.action) || isRejectionAction(h.action)
-      );
-      if (resolutions.length === 0) return false;
-      return isApprovalAction(resolutions[resolutions.length - 1].action);
-    }).length;
+  const reavAcceptedList = useMemo(() => {
+    if (useFallback) return [];
+    return contestedMyMonitorias.filter((m: Monitoria) => getContestationOutcome(m) === 'approved');
   }, [useFallback, contestedMyMonitorias]);
 
+  const reavAccepted = useFallback ? 3 : reavAcceptedList.length;
+
   // Reavaliações Recusadas (Nota mantida — conta apenas pelo ÚLTIMO desfecho)
-  const reavRejected = useMemo(() => {
-    if (useFallback) return 5;
-    return contestedMyMonitorias.filter((m: any) => {
-      const resolutions = (m.history || []).filter((h: any) =>
-        isApprovalAction(h.action) || isRejectionAction(h.action)
-      );
-      if (resolutions.length === 0) return false;
-      return isRejectionAction(resolutions[resolutions.length - 1].action);
-    }).length;
+  const reavRejectedList = useMemo(() => {
+    if (useFallback) return [];
+    return contestedMyMonitorias.filter((m: Monitoria) => getContestationOutcome(m) === 'rejected');
   }, [useFallback, contestedMyMonitorias]);
+
+  const reavRejected = useFallback ? 5 : reavRejectedList.length;
 
   // Taxa de Reversão Individual
   const reversionRate = (reavAccepted + reavRejected) === 0 ? 0 : (reavAccepted / (reavAccepted + reavRejected)) * 100;
@@ -302,28 +306,14 @@ export default function QualityDashboard({
 
   const resolvedComparativeData = useFallback ? mockComparativeData : comparativeData;
 
-  // Distribuição por Equipes (INJETAR: Gráfico de rosca exibindo proporcionalidade de monitorias realizadas por ele)
-  const teamsDistribution = useMemo(() => {
+  // Grupos de origem dos tickets nas monitorias deste avaliador.
+  const groupsDistribution = useMemo(() => {
     if (useFallback) return [
-      { name: 'Equipe Alpha', value: 25, color: '#3B82F6' },
-      { name: 'Equipe Beta', value: 15, color: '#10B981' },
-      { name: 'Equipe Gamma', value: 8, color: '#F59E0B' }
+      { name: 'Revenda - Retaguarda', value: 25, color: '#3B82F6' },
+      { name: 'Revenda - PDV | PAY', value: 15, color: '#10B981' },
+      { name: 'Grupo não informado', value: 8, color: '#F59E0B' }
     ];
-    const teamCounts: Record<string, number> = {};
-    myMonitorias.forEach((m: any) => {
-      if (m.team_id) {
-        teamCounts[m.team_id] = (teamCounts[m.team_id] || 0) + 1;
-      }
-    });
-    const COLORS = chartColorArray();
-    return Object.entries(teamCounts).map(([teamId, count], index) => {
-      const teamObj = teams?.find((t: any) => t.id === teamId);
-      return {
-        name: teamObj?.name || `Equipe ${teamId.substring(0, 4)}`,
-        value: count,
-        color: COLORS[index % COLORS.length]
-      };
-    }).filter(d => d.value > 0);
+    return buildGroupDistribution(myMonitorias, teams, chartColorArray());
   }, [useFallback, myMonitorias, teams]);
 
   // Minha Curva de Qualidade (Distribuição por Nível)
@@ -401,10 +391,12 @@ export default function QualityDashboard({
   }, [useFallback, myMonitorias, dissatisfactionFields]);
 
   // SLA e Volume calculations
-  const pendingActions = useMemo(() => {
-    if (useFallback) return 2;
-    return myMonitorias.filter((m: any) => m.status === 'em_contestacao').length;
+  const pendingActionsList = useMemo(() => {
+    if (useFallback) return [];
+    return myMonitorias.filter((m: any) => m.status === 'em_contestacao');
   }, [useFallback, myMonitorias]);
+
+  const pendingActions = useFallback ? 2 : pendingActionsList.length;
 
   const myMonitoriasCount = useMemo(() => {
     if (useFallback) return 48;
@@ -479,6 +471,11 @@ export default function QualityDashboard({
           good={pendingActions === 0}
           icon={pendingActions === 0 ? <CheckCircle2 className="w-5 h-5" /> : <AlertTriangle className="w-5 h-5" />}
           accent={pendingActions === 0 ? 'text-functional-success' : 'text-functional-error'}
+          onClick={() => setDrillDown({
+            title: 'Minhas Pendências de Reanálise',
+            subtitle: 'Monitorias em contestação aguardando sua reavaliação',
+            monitorias: pendingActionsList,
+          })}
           isCustomizing={isCustomizing}
           profile="qualidade"
           activeEditingId={activeEditingId}
@@ -491,6 +488,11 @@ export default function QualityDashboard({
           good={volDiff >= 0}
           icon={<ClipboardCheck className="w-5 h-5" />}
           accent={volDiff >= 0 ? 'text-functional-success' : 'text-functional-error'}
+          onClick={() => setDrillDown({
+            title: 'Meu Volume de Avaliações',
+            subtitle: 'Todas as monitorias realizadas por você no período selecionado',
+            monitorias: myMonitorias,
+          })}
           badge={
             myMonitoriasCount > 0 ? (
               <span className={`inline-flex items-center justify-center gap-0.5 px-1.5 py-0.5 text-[10px] font-bold rounded-md self-center ${volColorClass}`}>
@@ -514,6 +516,11 @@ export default function QualityDashboard({
           good={isAboveTarget(avgScore)}
           icon={<Target className="w-5 h-5" />}
           accent="text-slate-500"
+          onClick={() => setDrillDown({
+            title: 'Minhas Avaliações com Nota',
+            subtitle: 'Monitorias consideradas na sua nota média individual',
+            monitorias: scoredMonitorias,
+          })}
           badge={
             isCustomizing ? (
               <span className={`inline-flex items-center justify-center gap-0.5 px-1.5 py-0.5 text-[10px] font-bold rounded-md self-center ${isCustomizing ? 'bg-green-50 text-green-700 dark:bg-green-950/30 dark:text-green-400' : diffColorClass}`}>
@@ -537,6 +544,11 @@ export default function QualityDashboard({
           good={isAboveTarget(globalAvgScore)}
           icon={<Award className="w-5 h-5" />}
           accent="text-slate-500"
+          onClick={() => setDrillDown({
+            title: 'Monitorias da Média Geral',
+            subtitle: 'Todas as monitorias avaliadas no período que compõem a régua comparativa global',
+            monitorias: monitorias.filter((m: any) => m.score !== undefined && m.score !== null),
+          })}
           badge={
             isCustomizing ? (
               <span className="inline-flex items-center justify-center gap-0.5 px-1.5 py-0.5 text-[10px] font-bold rounded-md self-center bg-green-50 text-green-700 dark:bg-green-950/30 dark:text-green-400">
@@ -559,11 +571,16 @@ export default function QualityDashboard({
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
         <StatCard
           title="Total Reav. Recebidas"
-          value={reavAccepted + reavRejected}
+          value={useFallback ? 8 : contestedMyMonitorias.length}
           sub="Volume de contestações"
           good={true}
           icon={<History className="w-5 h-5" />}
           accent="text-slate-500"
+          onClick={() => setDrillDown({
+            title: 'Total de Reavaliações Recebidas',
+            subtitle: 'Monitorias avaliadas por você que foram contestadas pela operação',
+            monitorias: contestedMyMonitorias,
+          })}
           isCustomizing={isCustomizing}
           profile="qualidade"
           activeEditingId={activeEditingId}
@@ -576,6 +593,11 @@ export default function QualityDashboard({
           good={true}
           icon={<CheckCircle2 className="w-5 h-5" />}
           accent="text-functional-success"
+          onClick={() => setDrillDown({
+            title: 'Reavaliações Aprovadas (Procedentes)',
+            subtitle: 'Contestações deferidas com alteração de pontuação',
+            monitorias: reavAcceptedList,
+          })}
           isCustomizing={isCustomizing}
           profile="qualidade"
           activeEditingId={activeEditingId}
@@ -588,6 +610,11 @@ export default function QualityDashboard({
           good={true}
           icon={<XCircle className="w-5 h-5" />}
           accent="text-functional-error"
+          onClick={() => setDrillDown({
+            title: 'Reavaliações Recusadas (Improcedentes)',
+            subtitle: 'Contestações indeferidas com manutenção da pontuação original',
+            monitorias: reavRejectedList,
+          })}
           isCustomizing={isCustomizing}
           profile="qualidade"
           activeEditingId={activeEditingId}
@@ -600,6 +627,11 @@ export default function QualityDashboard({
           good={reversionRate <= config.targetReversalRate}
           icon={<Target className="w-5 h-5" />}
           accent={reversionRate <= config.targetReversalRate ? 'text-functional-success' : 'text-functional-error'}
+          onClick={() => setDrillDown({
+            title: 'Base da Taxa de Reversão',
+            subtitle: 'Contestações decididas que compõem o percentual de reversão',
+            monitorias: [...reavAcceptedList, ...reavRejectedList],
+          })}
           badge={
             isCustomizing ? (
               <span className={`inline-flex items-center justify-center gap-0.5 px-1.5 py-0.5 text-[10px] font-bold rounded-md self-center ${isCustomizing ? 'bg-green-50 text-green-700 dark:bg-green-950/30 dark:text-green-400' : revColorClass}`}>
@@ -683,8 +715,8 @@ export default function QualityDashboard({
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="h-[380px]">
           <DistributionChart 
-            title="Distribuição por Equipes" 
-            data={teamsDistribution} 
+            title="Distribuição por Grupo"
+            data={groupsDistribution}
             isCustomizing={isCustomizing}
             profile="qualidade"
             activeEditingId={activeEditingId}
@@ -741,6 +773,10 @@ export default function QualityDashboard({
       </div>
 
       {/* LINHA 8 (Tabela Base - grid-cols-1) */}
+      <ManagerDecisionHistoryTable monitorias={monitorias} users={users} profile="qualidade" isCustomizing={isCustomizing} />
+      <CriticalErrorsTable monitorias={monitorias} forms={forms} users={users} profile="qualidade" isCustomizing={isCustomizing} />
+      <AgentEvaluationVolumeTable monitorias={myMonitorias} users={users} profile="qualidade" isCustomizing={isCustomizing} />
+      <AuditorEvaluationVolumeTable monitorias={myMonitorias} users={users} profile="qualidade" isCustomizing={isCustomizing} />
       <div className="overflow-hidden">
         <RecentAuditsTable 
           monitorias={useFallback ? mockRecentMonitorias : myMonitorias} 
@@ -749,6 +785,15 @@ export default function QualityDashboard({
           isCustomizing={isCustomizing}
         />
       </div>
+
+      {drillDown && (
+        <SupportDrillDownModal
+          title={drillDown.title}
+          subtitle={drillDown.subtitle}
+          monitorias={drillDown.monitorias}
+          onClose={() => setDrillDown(null)}
+        />
+      )}
     </div>
   );
 }

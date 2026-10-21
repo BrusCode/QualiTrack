@@ -1,6 +1,7 @@
 import { useState, useEffect, createContext, useContext, useCallback, useRef, type ReactNode } from 'react';
 import { supabase, mockDb } from './supabase';
 import { getRemainingBusinessSeconds, addBusinessHours } from './businessHours';
+import type { DashboardLayouts, DashboardRole } from './dashboardLayout';
 
 export interface QualityLevel {
   label: string;
@@ -8,6 +9,21 @@ export interface QualityLevel {
   maxScore: number;
   color: string;
   bgColor: string;
+}
+
+export interface EmailReportConfig {
+  enabled: boolean;
+  senderName: string;
+  senderEmail: string;
+  subjectTemplate: string;
+  autoDispatchEnabled: boolean;
+  frequency: 'weekly' | 'monthly';
+  dayOfWeek: number; // 1 = Segunda, 2 = Terça, 3 = Quarta, 4 = Quinta, 5 = Sexta
+  dayOfMonth: number; // 1 a 28
+  dispatchTime: string; // "08:00"
+  targetRoleRecipients: ('gestor_suporte' | 'gestor_qualidade' | 'admin')[];
+  extraRecipients: string[];
+  lastAutoDispatchAt?: string;
 }
 
 export interface QualityConfig {
@@ -29,6 +45,9 @@ export interface QualityConfig {
   };
   statCardExplanations?: Record<string, string>;
   dashboardWidgetTitles?: Record<string, string>;
+  dashboardLayouts?: DashboardLayouts;
+  dashboardHiddenActions?: Partial<Record<DashboardRole, string[]>>;
+  emailReportConfig?: EmailReportConfig;
 }
 
 const DEFAULT_CONFIG: QualityConfig = {
@@ -54,7 +73,22 @@ const DEFAULT_CONFIG: QualityConfig = {
     holidays: ['01/01', '21/04', '01/05', '07/09', '12/10', '02/11', '15/11', '25/12']
   },
   statCardExplanations: {},
-  dashboardWidgetTitles: {}
+  dashboardWidgetTitles: {},
+  dashboardLayouts: {},
+  dashboardHiddenActions: {},
+  emailReportConfig: {
+    enabled: true,
+    senderName: 'QualiTrack - Gestão da Qualidade',
+    senderEmail: '',
+    subjectTemplate: '[QualiTrack] Relatório Executivo de Qualidade · {{team}} ({{period}})',
+    autoDispatchEnabled: false,
+    frequency: 'weekly',
+    dayOfWeek: 1,
+    dayOfMonth: 1,
+    dispatchTime: '08:00',
+    targetRoleRecipients: ['gestor_suporte', 'gestor_qualidade'],
+    extraRecipients: [],
+  }
 };
 
 const STORAGE_KEY = 'qualitrack_quality_config';
@@ -109,6 +143,12 @@ function normalizeConfig(cfg: any): QualityConfig {
   if (!migrated.dashboardWidgetTitles) {
     migrated.dashboardWidgetTitles = {};
   }
+  if (!migrated.dashboardLayouts || typeof migrated.dashboardLayouts !== 'object') {
+    migrated.dashboardLayouts = {};
+  }
+  if (!migrated.dashboardHiddenActions || typeof migrated.dashboardHiddenActions !== 'object') {
+    migrated.dashboardHiddenActions = {};
+  }
   // Programmatic migration of configurations that do not have exactly 4 levels
   if (!migrated.levels || !Array.isArray(migrated.levels) || migrated.levels.length !== 4) {
     migrated.levels = [
@@ -117,6 +157,20 @@ function normalizeConfig(cfg: any): QualityConfig {
       { label: 'Atenção', minScore: 60, maxScore: 79, color: 'text-level-atencao', bgColor: 'bg-level-atencao' },
       { label: 'Ruim', minScore: 0, maxScore: 59, color: 'text-level-ruim', bgColor: 'bg-level-ruim' }
     ];
+  }
+  if (!migrated.emailReportConfig) {
+    migrated.emailReportConfig = { ...DEFAULT_CONFIG.emailReportConfig };
+  } else {
+    migrated.emailReportConfig = {
+      ...DEFAULT_CONFIG.emailReportConfig,
+      ...migrated.emailReportConfig,
+      extraRecipients: Array.isArray(migrated.emailReportConfig.extraRecipients)
+        ? migrated.emailReportConfig.extraRecipients
+        : [],
+      targetRoleRecipients: Array.isArray(migrated.emailReportConfig.targetRoleRecipients)
+        ? migrated.emailReportConfig.targetRoleRecipients
+        : ['gestor_suporte', 'gestor_qualidade']
+    };
   }
   return migrated as QualityConfig;
 }
@@ -146,6 +200,7 @@ const QualityConfigContext = createContext<QualityConfigContextValue | null>(nul
 export function QualityConfigProvider({ children }: { children: ReactNode }) {
   const [config, setConfig] = useState<QualityConfig>(loadFromStorage);
   const [oldConfig, setOldConfig] = useState<QualityConfig>(config);
+  const savedConfigRef = useRef(config);
   const fetchedRef = useRef(false);
 
   useEffect(() => {
@@ -159,6 +214,7 @@ export function QualityConfigProvider({ children }: { children: ReactNode }) {
           const cfg = normalizeConfig(data.config);
           setConfig(cfg);
           setOldConfig(cfg);
+          savedConfigRef.current = cfg;
           localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
         }
       } else {
@@ -167,6 +223,7 @@ export function QualityConfigProvider({ children }: { children: ReactNode }) {
           const cfg = normalizeConfig(data[0].config);
           setConfig(cfg);
           setOldConfig(cfg);
+          savedConfigRef.current = cfg;
           localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
         }
       }
@@ -175,25 +232,37 @@ export function QualityConfigProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const saveConfig = useCallback(async (newConfig: QualityConfig) => {
+    const previousConfig = savedConfigRef.current;
     setConfig(newConfig);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(newConfig));
 
-    if (supabase) {
-      const { data: existing } = await supabase.from('quality_configs').select('id').maybeSingle();
-      if (existing) {
-        await supabase.from('quality_configs').update({ config: newConfig }).eq('id', existing.id);
+    try {
+      if (supabase) {
+        // supabase-js devolve { error } em vez de lançar. Sem checar, uma falha
+        // aqui passava despercebida: a config seguia salva no localStorage e a
+        // tela parecia correta, mas nada era gravado no banco — e a próxima
+        // máquina (ou aba limpa) voltaria à configuração antiga.
+        const { data: existing, error: selError } = await supabase.from('quality_configs').select('id').maybeSingle();
+        if (selError) throw selError;
+        const { error } = existing
+          ? await supabase.from('quality_configs').update({ config: newConfig }).eq('id', existing.id)
+          : await supabase.from('quality_configs').insert({ config: newConfig });
+        if (error) throw error;
       } else {
-        await supabase.from('quality_configs').insert({ config: newConfig });
+        const { data: existing } = await mockDb.get('quality_configs');
+        if (existing && existing.length > 0) {
+          await mockDb.update('quality_configs', existing[0].id, { config: newConfig });
+        } else {
+          await mockDb.insert('quality_configs', { config: newConfig });
+        }
       }
-    } else {
-      const { data: existing } = await mockDb.get('quality_configs');
-      if (existing && existing.length > 0) {
-        await mockDb.update('quality_configs', existing[0].id, { config: newConfig });
-      } else {
-        await mockDb.insert('quality_configs', { config: newConfig });
-      }
+      setOldConfig(newConfig);
+      savedConfigRef.current = newConfig;
+    } catch (error) {
+      setConfig(current => current === newConfig ? previousConfig : current);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(previousConfig));
+      throw error;
     }
-    setOldConfig(newConfig);
   }, []);
 
   const getLevelForScore = useCallback((score: number, type: 'goal' | 'status' = 'status'): QualityLevel => {
@@ -222,7 +291,7 @@ export function QualityConfigProvider({ children }: { children: ReactNode }) {
       let activeDocs: any[] = [];
       if (supabase) {
         const { data } = await supabase.from('monitorias')
-          .select('id, updated_at, action_deadline_at')
+          .select('id, updated_at, action_deadline_at, form_snapshot')
           .eq('active', true)
           .not('action_deadline_at', 'is', null)
           .not('status', 'in', '(concluida,finalizada_alterada)');
@@ -238,7 +307,11 @@ export function QualityConfigProvider({ children }: { children: ReactNode }) {
         if (!m.action_deadline_at || !m.updated_at) return null;
 
         const remainingSeconds = getRemainingBusinessSeconds(new Date(m.updated_at), new Date(m.action_deadline_at), previousConfig.businessHours);
-        const newDeadline = addBusinessHours(new Date(m.updated_at), remainingSeconds / 3600, newConfig.businessHours).toISOString();
+        const recalculated = addBusinessHours(new Date(m.updated_at), remainingSeconds / 3600, newConfig.businessHours);
+        const zendeskCap = m.form_snapshot?.zendesk_closure_window?.deadline_at;
+        const newDeadline = typeof zendeskCap === 'string' && Number.isFinite(Date.parse(zendeskCap))
+          ? new Date(Math.min(recalculated.getTime(), Date.parse(zendeskCap))).toISOString()
+          : recalculated.toISOString();
 
         return { id: m.id, action_deadline_at: newDeadline };
       }).filter(Boolean);

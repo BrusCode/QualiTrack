@@ -1,10 +1,15 @@
+import { clearPageCache } from '../lib/pageCache';
+import { readCaptchaToken } from '../components/ui/ProtectedAuthForm';
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { supabase, mockDb, upsertUserPreferences, isMockMode, assertSupabase, initialUrlHash, initialUrlSearch } from '../lib/supabase';
 import { User, UserRole, ROLE_LABELS, UserPreferences } from '../types';
 import { useTheme, resolveSystemTheme, applyThemeToDOM } from './ThemeProvider';
 import { useSessionManager, lastDbThemeRef, ABSOLUTE_TIMEOUT_MS, IDLE_TIMEOUT_MS, MOCK_SESSION_KEY, LAST_ACTIVITY_KEY } from '../hooks/useSessionManager';
-import { isDarkColor } from '../hooks/useSidebarManager';
+import { sessionStartedAt, clearPrivateDrafts } from '../lib/sessionSecurity';
+import { queryClient } from '../lib/queryClient';
 import { toast } from 'sonner';
+import { endCurrentPresenceSession } from '../lib/presence';
+import { AGENT_ACCESS_PAUSED_MESSAGE, canAccessApp } from '../lib/accessPolicy';
 
 export type AuthView = 'login' | 'request-access' | 'pending' | 'change-password' | 'forgot-password' | 'setup-password';
 
@@ -27,8 +32,6 @@ interface AuthContextType {
   setResetEmail: React.Dispatch<React.SetStateAction<string>>;
   isExistingRequest: boolean;
   setIsExistingRequest: React.Dispatch<React.SetStateAction<boolean>>;
-  prefetchedSidebarColor: string;
-  setPrefetchedSidebarColor: React.Dispatch<React.SetStateAction<string>>;
   activeTab: 'dashboard' | 'monitorias' | 'admin' | 'custom_dashboard';
   setActiveTab: React.Dispatch<React.SetStateAction<'dashboard' | 'monitorias' | 'admin' | 'custom_dashboard'>>;
   handleLogin: (e: React.FormEvent) => Promise<void>;
@@ -47,14 +50,10 @@ interface AuthContextType {
   setIsFormOpen: React.Dispatch<React.SetStateAction<boolean>>;
   isSidebarOpen: boolean;
   setIsSidebarOpen: React.Dispatch<React.SetStateAction<boolean>>;
-  sidebarColor: string;
-  setSidebarColor: React.Dispatch<React.SetStateAction<string>>;
-  sidebarContrastClass: string;
-  sidebarContrastSubtle: string;
-  sidebarIsDark: boolean;
   theme: ReturnType<typeof useTheme>['theme'];
   setTheme: ReturnType<typeof useTheme>['setTheme'];
   loadingPreferences: boolean;
+  maintenanceNotice: { active: boolean; expectedReturnAt: string | null; adminNotice?: boolean } | null | undefined;
 }
 
 const AuthContext = React.createContext<AuthContextType | undefined>(undefined);
@@ -81,7 +80,7 @@ const enrichUserWithTeamIds = async (dbUser: any): Promise<any> => {
 };
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const { theme, setTheme, resolvedTheme } = useTheme();
+  const { theme, setTheme } = useTheme();
   const [currentUser, setCurrentUser] = useState<any>(null);
   const [userData, setUserData] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
@@ -93,7 +92,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const currentUserRef = useRef<any>(null);
   const appReadyRef = useRef(false);
   
-  const [prefetchedSidebarColor, setPrefetchedSidebarColor] = useState('');
 
   // Keep refs in sync with state for use in callbacks without re-subscriptions
   useEffect(() => { currentUserRef.current = currentUser; }, [currentUser]);
@@ -126,6 +124,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const isPasswordRecoveryRef = useRef(false);
   const isCleaningSessionRef = useRef(false);
   const isInviteFlowRef = useRef(false);
+  const pendingLoginRef = useRef(false);
   const pkceFlowRef = useRef(false);
   const pkceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -136,19 +135,45 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [isSystemOnline, setIsSystemOnline] = useState(true);
   const [isReconnecting, setIsReconnecting] = useState(false);
 
-  const [sidebarColor, setSidebarColor] = useState('');
-  const [sidebarContrastClass, setSidebarContrastClass] = useState('');
-  const [sidebarContrastSubtle, setSidebarContrastSubtle] = useState('');
-  const [sidebarIsDark, setSidebarIsDark] = useState(false);
   const [loadingPreferences, setLoadingPreferences] = useState(false);
+  const [maintenanceNotice, setMaintenanceNotice] = useState<{ active: boolean; expectedReturnAt: string | null; adminNotice?: boolean } | null | undefined>(undefined);
 
-  // --- Update sidebar contrast derived values when color or theme changes ---
+  const refreshMaintenanceNotice = useCallback(async (role?: UserRole) => {
+    if (!role) { setMaintenanceNotice(null); return; }
+    try {
+      let row: { enabled?: boolean; blocked_roles?: string[]; expected_return_at?: string | null } | null = null;
+      if (isMockMode) {
+        const { data } = await mockDb.get('system_maintenance');
+        row = data?.[0] ?? null;
+      } else {
+        const sb = supabase ?? assertSupabase();
+        const { data, error } = await sb.from('system_maintenance').select('enabled, blocked_roles, expected_return_at').eq('id', 1).maybeSingle();
+        if (error) throw error;
+        row = data;
+      }
+      const isActive = Boolean(row?.enabled
+        && (!row.expected_return_at || new Date(row.expected_return_at).getTime() > Date.now()));
+      if (isActive && role === 'admin') {
+        setMaintenanceNotice({ active: false, adminNotice: true, expectedReturnAt: row?.expected_return_at ?? null });
+      } else if (isActive && row?.blocked_roles?.includes(role)) {
+        setMaintenanceNotice({ active: true, expectedReturnAt: row?.expected_return_at ?? null });
+      } else {
+        setMaintenanceNotice(null);
+      }
+    } catch (error) {
+      // Falha de leitura não deve impedir autenticação; a política no banco continua protegida.
+      console.warn('[Auth] Não foi possível consultar o modo de manutenção.');
+      setMaintenanceNotice(null);
+    }
+  }, []);
+
   useEffect(() => {
-    const isDark = isDarkColor(sidebarColor, resolvedTheme);
-    setSidebarIsDark(isDark);
-    setSidebarContrastClass(isDark ? 'text-white' : 'text-slate-900');
-    setSidebarContrastSubtle(isDark ? 'text-white/40' : 'text-slate-700/60');
-  }, [sidebarColor, resolvedTheme]);
+    if (!userData) { setMaintenanceNotice(null); return; }
+    setMaintenanceNotice(undefined);
+    void refreshMaintenanceNotice(userData.role);
+    const timer = window.setInterval(() => void refreshMaintenanceNotice(userData.role), 30_000);
+    return () => window.clearInterval(timer);
+  }, [userData?.id, userData?.role, refreshMaintenanceNotice]);
 
   // --- Sync activeTab with localStorage and URL hash ---
   useEffect(() => {
@@ -183,36 +208,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
     setLoadingPreferences(true);
     try {
-      let themeValue: 'light' | 'dark' | 'system' = 'system';
-      let resolvedSidebarColor = '';
-
-      if (isMockMode) {
-        const { data: prefRows } = await mockDb.get('user_preferences');
-        const myPref = (prefRows || []).find((r: any) => r.user_id === user.id);
-        themeValue = (myPref?.preferences?.theme as 'light' | 'dark' | 'system') || 'system';
-        resolvedSidebarColor = myPref?.preferences?.sidebar_color || '';
-      } else {
-        const sb = supabase ?? assertSupabase();
-        const { data: prefData } = await sb
-          .from('user_preferences')
-          .select('preferences')
-          .eq('user_id', user.id)
-          .single();
-        themeValue = (prefData?.preferences?.theme as 'light' | 'dark' | 'system') || 'system';
-        resolvedSidebarColor = prefData?.preferences?.sidebar_color || '';
-      }
-
-      // Save literal theme (including 'system') to localStorage
-      localStorage.setItem('qualitrack_theme', themeValue);
-      // Pass the literal theme to setTheme - ThemeProvider will resolve 'system' for DOM
-      setTheme(themeValue);
-      // Apply resolved theme to DOM immediately
-      const resolved = themeValue === 'system' ? resolveSystemTheme() : themeValue;
-      applyThemeToDOM(resolved);
-      setPrefetchedSidebarColor(resolvedSidebarColor);
-      if (user.email) {
-        localStorage.setItem(`qualitrack_sidebar_color_${user.email}`, resolvedSidebarColor);
-      }
+      setTheme('system');
+      applyThemeToDOM(resolveSystemTheme());
       setAppReady(true);
 
       // Minimum loading time to avoid flash (500ms)
@@ -222,9 +219,35 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         const { data } = await mockDb.get('users');
         const dbUser = (data || []).find((u: any) => u.email === user.email && u.active);
         if (dbUser) {
+          if (!canAccessApp(dbUser.role)) {
+            setAppReady(false);
+            setCurrentUser(null);
+            setUserData(null);
+            setAuthView('login');
+            localStorage.removeItem(MOCK_SESSION_KEY);
+            localStorage.removeItem(LAST_ACTIVITY_KEY);
+            toast.error(AGENT_ACCESS_PAUSED_MESSAGE);
+            return;
+          }
           const enriched = await enrichUserWithTeamIds(dbUser);
+
+          // must_change_password: manda para a tela ja existente de definir
+          // nova senha, SEM liberar o dashboard. setCurrentUser fica de fora
+          // de proposito — App.tsx usa !currentUser para decidir entre telas
+          // de auth e o dashboard, entao ficar sem ele mantem a pessoa presa
+          // na troca de senha mesmo com sessao valida.
+          if (enriched.must_change_password) {
+            // setLoading/setLoadingPreferences ficam a cargo do finally desta
+            // função — ele roda mesmo após este return.
+            setUserData(enriched);
+            setAuthView('change-password');
+            toast.info('Defina uma nova senha para continuar.');
+            return;
+          }
+
           setUserData(enriched);
           setCurrentUser(user);
+          if (pendingLoginRef.current) toast.success('Login realizado com sucesso!', { duration: 1500 });
           const savedTab = window.location.hash.replace('#', '') || localStorage.getItem('qualitrack_active_tab') || 'dashboard';
           if (savedTab === 'dashboard' || savedTab === 'monitorias' || savedTab === 'admin' || savedTab === 'custom_dashboard') {
             setActiveTab(savedTab as any);
@@ -241,11 +264,37 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
       } else {
         const sb = supabase ?? assertSupabase();
-        const { data, error } = await sb.from('users').select('*').eq('email', user.email).single();
+        const { data, error } = await sb.from('users').select('*').eq('email', user.email).maybeSingle();
         if (data && data.active) {
+          if (!canAccessApp(data.role)) {
+            setAppReady(false);
+            setCurrentUser(null);
+            setUserData(null);
+            setAuthView('login');
+            localStorage.removeItem(LAST_ACTIVITY_KEY);
+            await sb.auth.signOut({ scope: 'local' });
+            toast.error(AGENT_ACCESS_PAUSED_MESSAGE);
+            return;
+          }
           const enriched = await enrichUserWithTeamIds(data);
+
+          // must_change_password: mesma logica do branch mock acima. A
+          // sessao do Supabase permanece ativa (nao chamamos signOut aqui) —
+          // handleUpdatePassword usa sb.auth.updateUser(), que exige sessao
+          // valida. Sem setCurrentUser, App.tsx mantem a pessoa nas telas de
+          // auth em vez do dashboard, mesmo autenticada no Supabase.
+          if (enriched.must_change_password) {
+            // setLoading/setLoadingPreferences ficam a cargo do finally desta
+            // função — ele roda mesmo após este return.
+            setUserData(enriched);
+            setAuthView('change-password');
+            toast.info('Defina uma nova senha para continuar.');
+            return;
+          }
+
           setUserData(enriched);
           setCurrentUser(user);
+          if (pendingLoginRef.current) toast.success('Login realizado com sucesso!', { duration: 1500 });
           const savedTab = window.location.hash.replace('#', '') || localStorage.getItem('qualitrack_active_tab') || 'dashboard';
           if (savedTab === 'dashboard' || savedTab === 'monitorias' || savedTab === 'admin' || savedTab === 'custom_dashboard') {
             setActiveTab(savedTab as any);
@@ -254,15 +303,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           }
           if (!sessionStartTimeRef.current) sessionStartTimeRef.current = Date.now();
           localStorage.setItem(LAST_ACTIVITY_KEY, String(Date.now()));
-        } else if (error && error.code === 'PGRST116') {
-          setAppReady(false);
-          await sb.auth.signOut();
-          setAuthView('login');
         } else if (error) {
           console.error('[AuthProvider] Erro crítico em handleUserSession:', error);
           toast.error('Erro de conexão ao carregar seu perfil. O sistema está tentando reconectar.');
         } else {
           setAppReady(false);
+          setCurrentUser(null);
+          setUserData(null);
           setAuthView('request-access');
           setRequestData({ name: user.name || '', email: user.email });
         }
@@ -270,6 +317,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } catch (e) {
       console.error(e);
     } finally {
+      pendingLoginRef.current = false;
       setLoading(false);
       // Small additional delay so loading screen is visible
       await new Promise(r => setTimeout(r, 100));
@@ -306,6 +354,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
               mockDb.get('users').then(async ({ data }) => {
                 const dbUser = (data || []).find((u: any) => u.id === parsed.userId && u.active);
                 if (dbUser) {
+                  if (!canAccessApp(dbUser.role)) {
+                    localStorage.removeItem(MOCK_SESSION_KEY);
+                    localStorage.removeItem(LAST_ACTIVITY_KEY);
+                    toast.error(AGENT_ACCESS_PAUSED_MESSAGE);
+                    return;
+                  }
                   const enriched = await enrichUserWithTeamIds(dbUser);
                   setCurrentUser(enriched);
                   setUserData(enriched);
@@ -374,6 +428,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     const sb = supabase ?? assertSupabase();
     const { data: { subscription } } = sb.auth.onAuthStateChange((event, session) => {
+      if (session) sessionStartTimeRef.current = sessionStartedAt(session);
       if (event === 'PASSWORD_RECOVERY') {
         if (pkceFlowRef.current && pkceTimerRef.current) {
           clearTimeout(pkceTimerRef.current);
@@ -423,20 +478,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             console.log('[Auth] SIGNED_IN: User already loaded, skipping handleUserSession');
             return;
           }
-          sessionStartTimeRef.current = Date.now();
+          sessionStartTimeRef.current = sessionStartedAt(session);
           setTimeout(() => {
             handleUserSessionRef.current?.(session.user);
           }, 0);
           return;
         }
       } else if (event === 'SIGNED_OUT') {
+        clearPageCache();
+        queryClient.clear();
         if (isCleaningSessionRef.current) {
           isCleaningSessionRef.current = false;
           setLoading(false);
           clearTimeout(initializationTimeout);
           return;
         }
-        // Don't reset theme/sidebar_color preferences on logout
+        // Theme preference remains stored per user.
         // They are per-user preferences and should persist across sessions
         setAppReady(false);
         setCurrentUser(null);
@@ -482,9 +539,43 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // --- handleLogin ---
   const handleLogin = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
+
+    const emailLower = credentials.email.toLowerCase();
+    let captchaToken: string | undefined;
+    if (!isMockMode) {
+      try { captchaToken = readCaptchaToken(e); }
+      catch { toast.error('Confirme a verificação de segurança antes de entrar.'); return; }
+    }
+
+    // ATENCAO — esta trava e uma barreira de USABILIDADE, nao um controle de
+    // seguranca. Ela roda no navegador, entao um atacante que chame
+    // /auth/v1/token diretamente (curl, script) a ignora por completo.
+    // A protecao real contra forca bruta e server-side e precisa ser
+    // configurada no painel do Supabase:
+    //   Authentication > Rate Limits  (limite de tentativas de sign in)
+    //   Authentication > Attack Protection > CAPTCHA (hCaptcha/Turnstile)
+    // Verificado neste projeto: 10 tentativas seguidas com senha errada via
+    // API retornaram 400, sem nenhum 429 — sem essa configuracao, nao ha
+    // limite efetivo.
+    const lockKey = `qualitrack_login_attempts_${emailLower}`;
+    const MAX_TENTATIVAS = 5;
+    const BLOQUEIO_MS = 5 * 60 * 1000;
+    let tentativas = 0;
+    try {
+      const raw = localStorage.getItem(lockKey);
+      if (raw) {
+        const parsed = JSON.parse(raw) as { count: number; until?: number };
+        if (parsed.until && Date.now() < parsed.until) {
+          const restam = Math.ceil((parsed.until - Date.now()) / 60000);
+          toast.error(`Muitas tentativas. Tente novamente em ${restam} min ou use "Esqueci a senha".`);
+          return;
+        }
+        tentativas = parsed.until && Date.now() >= parsed.until ? 0 : (parsed.count || 0);
+      }
+    } catch { /* localStorage indisponivel: segue sem a trava */ }
+
     setLoading(true);
     try {
-      const emailLower = credentials.email.toLowerCase();
       if (isMockMode) {
         const { data: users } = await mockDb.get('users');
         const user = (users || []).find((u: any) =>
@@ -496,17 +587,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             setLoading(false);
             toast.error('Esta conta está desativada.'); return;
           }
+          if (!canAccessApp(user.role)) {
+            setLoading(false);
+            toast.error(AGENT_ACCESS_PAUSED_MESSAGE);
+            return;
+          }
 
-          const { data: prefRows } = await mockDb.get('user_preferences');
-          const myPref = (prefRows || []).find((r: any) => r.user_id === user.id);
-          const themeValue: 'light' | 'dark' | 'system' = (myPref?.preferences?.theme as 'light' | 'dark' | 'system') || 'system';
-          const resolvedSidebarColor: string = myPref?.preferences?.sidebar_color || '';
-          localStorage.setItem('qualitrack_theme', themeValue);
-          setTheme(themeValue);
-          const resolved = themeValue === 'system' ? resolveSystemTheme() : themeValue;
-          applyThemeToDOM(resolved);
-          setPrefetchedSidebarColor(resolvedSidebarColor);
-          localStorage.setItem(`qualitrack_sidebar_color_${user.email}`, resolvedSidebarColor);
+          setTheme('system');
+          applyThemeToDOM(resolveSystemTheme());
           setAppReady(true);
 
           const enriched = await enrichUserWithTeamIds(user);
@@ -523,36 +611,71 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             sessionExpiresAt: sessionStartTimeRef.current + ABSOLUTE_TIMEOUT_MS,
           }));
           localStorage.setItem(LAST_ACTIVITY_KEY, String(Date.now()));
-          toast.success(`Bem-vindo, ${user.name}!`);
+          try { localStorage.removeItem(lockKey); } catch { /* ignora */ }
+          toast.success(`Bem-vindo, ${user.name}!`, { duration: 1500 });
         } else {
-          toast.error('E-mail ou senha incorretos. Tente novamente.');
+          // Mesma contagem do fluxo Supabase, para o comportamento nao divergir
+          // entre os modos.
+          const n = tentativas + 1;
+          try {
+            localStorage.setItem(lockKey, n >= MAX_TENTATIVAS
+              ? JSON.stringify({ count: 0, until: Date.now() + BLOQUEIO_MS })
+              : JSON.stringify({ count: n }));
+          } catch { /* ignora */ }
+          toast.error(n >= MAX_TENTATIVAS
+            ? 'Muitas tentativas. Aguarde 5 minutos ou use "Esqueci a senha".'
+            : 'E-mail ou senha incorretos. Tente novamente.');
         }
         setLoading(false);
       } else {
         const sb = supabase ?? assertSupabase();
+        pendingLoginRef.current = true;
         const { error } = await sb.auth.signInWithPassword({
           email: emailLower,
-          password: credentials.password
+          password: credentials.password,
+          options: { captchaToken }
         });
         if (error) throw error;
-        toast.success('Login realizado com sucesso!');
+        try { localStorage.removeItem(lockKey); } catch { /* ignora */ }
       }
     } catch (e: any) {
-      toast.error('As credenciais informadas estão incorretas ou são inválidas.');
+      pendingLoginRef.current = false;
+      const novasTentativas = tentativas + 1;
+      try {
+        if (novasTentativas >= MAX_TENTATIVAS) {
+          localStorage.setItem(lockKey, JSON.stringify({ count: 0, until: Date.now() + BLOQUEIO_MS }));
+        } else {
+          localStorage.setItem(lockKey, JSON.stringify({ count: novasTentativas }));
+        }
+      } catch { /* ignora */ }
+
+      const restantes = MAX_TENTATIVAS - novasTentativas;
+      if (novasTentativas >= MAX_TENTATIVAS) {
+        toast.error('Muitas tentativas. Aguarde 5 minutos ou use "Esqueci a senha".');
+      } else {
+        toast.error(
+          restantes <= 2
+            ? `Credenciais incorretas. ${restantes} tentativa(s) antes do bloqueio temporário.`
+            : 'As credenciais informadas estão incorretas ou são inválidas.'
+        );
+      }
       setLoading(false);
     }
   }, [credentials, setTheme]);
 
   // --- handleLogout ---
   const handleLogout = useCallback(async (options?: { silent?: boolean; message?: string }) => {
-    // Don't reset theme/sidebar_color preferences on logout
-    // They are per-user preferences and should persist across sessions
-    // Only save current preferences to DB before logout if needed
-    if (userData?.id) {
-      // Preferences are already saved immediately on change via useSidebarManager
-      // No need to save again here
+    clearPrivateDrafts(userData?.id);
+    clearPageCache();
+    queryClient.clear();
+    if (!isMockMode) {
+      try {
+        await endCurrentPresenceSession();
+      } catch (error) {
+        console.warn('[Auth] Não foi possível encerrar o heartbeat antes do logout:', error);
+      }
+      await (supabase ?? assertSupabase()).auth.signOut({ scope: 'local' }).catch(console.error);
     }
-    
     setAppReady(false);
     setCurrentUser(null);
     setUserData(null);
@@ -560,7 +683,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     localStorage.removeItem('qualitrack_active_tab');
     window.location.hash = 'dashboard';
     setAuthView('login');
-    setPrefetchedSidebarColor('');
     setCredentials({ email: '', password: '' });
     setShowIdleWarning(false);
     sessionStartTimeRef.current = null;
@@ -568,9 +690,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     localStorage.removeItem(MOCK_SESSION_KEY);
     // Don't reset qualitrack_theme - keep user's preference
     lastDbThemeRef.current = null;
-    if (!isMockMode) {
-      (supabase ?? assertSupabase()).auth.signOut().catch(console.error);
-    }
     if (!options?.silent) {
       toast.success(options?.message || 'Você saiu do sistema com sucesso.');
     }
@@ -585,15 +704,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         toast.success('Funcionalidade simulada no modo Mock.');
       } else {
         const sb = supabase ?? assertSupabase();
-        const { error } = await sb.auth.resetPasswordForEmail(resetEmail.toLowerCase(), {
-          redirectTo: window.location.origin,
+        const { error } = await sb.functions.invoke('public-access', {
+          body: { action: 'recover', email: resetEmail.trim().toLowerCase(), captchaToken: readCaptchaToken(e) },
         });
         if (error) throw error;
-        toast.success('E-mail de recuperação enviado! Verifique sua caixa de entrada.');
+        toast.success('Se houver uma conta elegível, você receberá as instruções de recuperação.');
         setAuthView('login');
       }
     } catch (e: any) {
-      toast.error('Não foi possível enviar o e-mail de recuperação. Verifique o e-mail digitado.');
+      toast.error('Não foi possível processar a solicitação. Confirme a verificação de segurança e tente novamente mais tarde.');
     } finally {
       setLoading(false);
     }
@@ -618,10 +737,41 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         const { error } = await sb.auth.updateUser({ password: newPassword });
         if (error) throw error;
-        await sb.from('users').update({ must_change_password: false }).eq('email', user.email);
+
+        // A partir daqui a senha JÁ mudou no Auth — sucesso ou falha do que
+        // vem a seguir não desfaz isso. Limpeza da URL (token de
+        // recovery/invite) e dos refs de fluxo não dependem da RPC abaixo,
+        // então rodam incondicionalmente, evitando deixar token na barra de
+        // endereço mesmo se a RPC falhar.
         window.history.replaceState({}, document.title, window.location.pathname);
         isPasswordRecoveryRef.current = false;
         isInviteFlowRef.current = false;
+
+        // Escrita direta em users.must_change_password sempre falhou aqui:
+        // users_admin_write nunca autorizou usuário comum a mexer na própria
+        // linha, e o erro (0 linhas afetadas por RLS) era descartado — a
+        // senha do Auth mudava, mas a flag continuava true, prendendo a
+        // pessoa num loop de "trocar senha" a cada login. A função
+        // clear_own_must_change_password (SECURITY DEFINER) zera só essa
+        // flag, só na própria linha, sem alargar a policy de escrita da
+        // tabela — o que reabriria o auto-escalonamento de role que foi
+        // fechado antes.
+        //
+        // Erro tratado aqui dentro, SEM `throw`: se a RPC falhar depois que
+        // updateUser já teve sucesso, o catch genérico do fim da função
+        // mostraria "Não foi possível atualizar sua senha" — mascarando que
+        // a senha JÁ mudou. A pessoa tentaria de novo com a senha antiga,
+        // levaria "credenciais inválidas", e se descobrisse a senha nova
+        // cairia de novo no loop de troca obrigatória (flag nunca foi
+        // zerada). Mensagem específica evita isso.
+        const { error: clearError } = await sb.rpc('clear_own_must_change_password');
+        if (clearError) {
+          console.error('[handleUpdatePassword] Senha trocada no Auth, mas clear_own_must_change_password falhou:', clearError);
+          handleLogout({ silent: true });
+          toast.error('Sua senha foi alterada com sucesso, mas não foi possível concluir a liberação do acesso. Entre em contato com o suporte antes de tentar entrar novamente — use a senha nova que você acabou de definir.');
+          return;
+        }
+
         handleLogout({ silent: true });
         toast.success('Sua nova senha foi definida com sucesso! Faça login com suas novas credenciais.');
       }
@@ -644,9 +794,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setAuthView('pending');
       } else {
         const sb = supabase ?? assertSupabase();
-        const { error } = await sb.from('access_requests').insert([
-          { name: requestData.name, email: requestData.email.toLowerCase(), status: 'pending' }
-        ]);
+        const { error } = await sb.functions.invoke('public-access', {
+          body: { action: 'request-access', name: requestData.name, email: requestData.email.trim().toLowerCase(), captchaToken: readCaptchaToken(e) },
+        });
         if (error) throw error;
         setAuthView('pending');
       }
@@ -677,8 +827,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setResetEmail,
       isExistingRequest,
       setIsExistingRequest,
-      prefetchedSidebarColor,
-      setPrefetchedSidebarColor,
       activeTab,
       setActiveTab,
       handleLogin,
@@ -697,14 +845,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setIsFormOpen,
       isSidebarOpen,
       setIsSidebarOpen,
-      sidebarColor,
-      setSidebarColor,
-      sidebarContrastClass,
-      sidebarContrastSubtle,
-      sidebarIsDark,
       theme,
       setTheme,
       loadingPreferences,
+      maintenanceNotice,
     }}>
       {children}
     </AuthContext.Provider>

@@ -1,21 +1,99 @@
+import { usePageCache } from '../../hooks/usePageCache';
+import { useBackgroundRefresh } from '../../hooks/useBackgroundRefresh';
+import { userCacheScope } from '../../lib/pageCache';
+import { matchesTicketGroup } from '../../lib/dashboardGroupFilter';
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef, useMemo, ReactNode } from 'react';
-import { Monitoria, User, Team, EvaluationForm, DissatisfactionField } from '../../types';
+import { Monitoria, User, Team, EvaluationForm, DissatisfactionField, HelpdeskSubmission } from '../../types';
 import { supabase, mockDb, isMockMode } from '../../lib/supabase';
 import { useStaticData } from '../../lib/StaticDataContext';
 import { toast } from 'sonner';
 import { useQualityConfig } from '../../lib/useQualityConfig';
 import { getRemainingBusinessSeconds } from '../../lib/businessHours';
+import { getPresetDateRange } from '../../lib/dashboardDatePresets';
+import { getTrendWindowStart } from '../../lib/performanceTrend';
+import { QUALITY_MANAGER_ACTION_STATUSES, selectQualityManagerActions } from '../../lib/qualityManagerQueue';
 
 export interface DashboardFilters {
   startDate: string;
   endDate: string;
   teamId: string;
+  groupId?: string;
   agentId: string;
   auditorId: string;
   formId: string;
   status: string;
   channel: string;
 }
+
+export interface DashboardAggregateGroup {
+  id: string | null;
+  count: number;
+}
+
+export interface DashboardAggregateRanking extends DashboardAggregateGroup {
+  id: string;
+  average: number;
+  score?: number;
+  badness?: number;
+}
+
+export interface DashboardAggregatePeriod {
+  period: string;
+  count: number;
+  average: number;
+}
+
+export interface DashboardAggregates {
+  total: number;
+  scored: number;
+  average: number;
+  ranking_baseline: number;
+  agents: DashboardAggregateRanking[];
+  auditors: DashboardAggregateRanking[];
+  teams: DashboardAggregateGroup[];
+  groups: DashboardAggregateGroup[];
+  statuses: DashboardAggregateGroup[];
+  days: DashboardAggregatePeriod[];
+  months: DashboardAggregatePeriod[];
+  years: DashboardAggregatePeriod[];
+}
+
+// Dashboard widgets use these fields for their visible rows and drilldowns.
+// Keep the projection explicit so new large columns are never fetched by default.
+const DASHBOARD_MONITORIA_COLUMNS = [
+  'id', 'form_id', 'child_verdict', 'evaluator_id', 'evaluated_id', 'evaluator_name',
+  'evaluated_name', 'team_id', 'team_name', 'ticket_group_team_id',
+  'form_name', 'ticket_id', 'channel', 'ticket_date', 'analysis_date',
+  'satisfaction_result', 'satisfaction_has_record', 'satisfaction_record_text',
+  'answers', 'score', 'status', 'resolution_type', 'contestation_result',
+  'action_deadline_at', 'active', 'history', 'dissatisfaction_answers',
+  'created_at', 'updated_at', 'evaluator_note', 'question_observations',
+  'critical_error_observations', 'selected_critical_errors',
+  'client_contact_log', 'client_contact_success', 'client_contact_channel',
+  'form_snapshot', 'contestation_reason', 'corrective_action',
+  'action_attachments', 'pj_reviewer_id', 'pj_review_kind',
+  'pj_review_decision', 'pj_review_note', 'pj_reviewed_at',
+  'pj_review_required',
+].join(',');
+
+// Trends and pending actions span the whole history, but need only small fields.
+const DASHBOARD_SUMMARY_COLUMNS = [
+  'id', 'form_id', 'child_verdict', 'evaluator_id', 'evaluated_id', 'evaluator_name',
+  'evaluated_name', 'team_id', 'team_name', 'ticket_group_team_id',
+  'form_name', 'ticket_id', 'channel', 'ticket_date', 'analysis_date',
+  'satisfaction_result', 'score', 'status', 'resolution_type',
+  'contestation_result', 'action_deadline_at', 'active', 'created_at',
+  'updated_at', 'pj_reviewer_id', 'pj_review_kind', 'pj_review_decision',
+  'pj_reviewed_at', 'pj_review_required',
+].join(',');
+
+// Admin and quality dashboards use history for trends, rankings, average and
+// SLA alerts. Their period drilldowns come from the separate detail query.
+const DASHBOARD_METRICS_COLUMNS = [
+  'id', 'form_id', 'child_verdict', 'evaluator_id', 'evaluated_id', 'team_id',
+  'ticket_group_team_id', 'channel', 'score', 'status',
+  'action_deadline_at', 'active', 'created_at',
+].join(',');
 
 export interface DashboardState {
   user: User | null;
@@ -25,11 +103,15 @@ export interface DashboardState {
   filters: DashboardFilters;
   monitorias: Monitoria[];
   allMonitorias: Monitoria[];
+  qualityManagerQueue: Monitoria[];
+  helpdeskSubmissions: HelpdeskSubmission[];
   users: User[];
   teams: Team[];
   forms: EvaluationForm[];
   loading: boolean;
+  refreshing?: boolean;
   globalAvg: number;
+  aggregates?: DashboardAggregates | null;
   dissatisfactionFields: DissatisfactionField[];
   // CORRECTION 8: Cooldown for manual refresh button
   refreshCooldownEnd: number | null;
@@ -50,188 +132,6 @@ export const EditingContext = createContext<EditingContextType | undefined>(unde
 
 export const DashboardStateContext = createContext<DashboardState | undefined>(undefined);
 export const DashboardDispatchContext = createContext<DashboardDispatch | undefined>(undefined);
-
-export interface PresenceContextType {
-  onlineUsers: User[];
-}
-
-export const PresenceContext = createContext<PresenceContextType | undefined>(undefined);
-
-export function PresenceProvider({ user, children }: { user: User | null; children: ReactNode }) {
-  const [onlineUsers, setOnlineUsers] = useState<User[]>([]);
-
-  useEffect(() => {
-    if (!user) {
-      setOnlineUsers([]);
-      return;
-    }
-
-    const HEARTBEAT_INTERVAL = 10000;
-    const SESSION_TIMEOUT = 25000;
-
-    const performLocalHeartbeat = () => {
-      try {
-        const storedStr = localStorage.getItem('qualitrack_active_sessions');
-        let sessions = [];
-        if (storedStr) {
-          try {
-            sessions = JSON.parse(decodeURIComponent(atob(storedStr)));
-          } catch {
-            sessions = JSON.parse(storedStr);
-          }
-        }
-        if (!Array.isArray(sessions)) sessions = [];
-
-        const now = Date.now();
-        sessions = sessions.filter((s: any) =>
-          s && s.id && s.lastActive && (now - s.lastActive < SESSION_TIMEOUT) && s.id !== user.id
-        );
-
-        sessions.push({
-          id: user.id,
-          name: user.name,
-          role: user.role,
-          email: user.email,
-          active: true,
-          lastActive: now
-        });
-
-        localStorage.setItem('qualitrack_active_sessions', btoa(encodeURIComponent(JSON.stringify(sessions))));
-        return sessions.map((s: any) => ({
-          id: s.id,
-          name: s.name,
-          role: s.role,
-          email: s.email,
-          active: true,
-          created_at: s.created_at || new Date().toISOString()
-        })) as User[];
-      } catch (e) {
-        console.error('[Presence] Error updating local heartbeat:', e);
-        return [];
-      }
-    };
-
-    let localSessions = performLocalHeartbeat();
-    let presenceSessions: User[] = [];
-    let channel: any = null;
-
-    const updateCombinedOnlineUsers = (local: User[], remote: User[]) => {
-      const userMap = new Map<string, User>();
-      local.forEach(u => userMap.set(u.id, u));
-      remote.forEach(u => userMap.set(u.id, u));
-      const merged = Array.from(userMap.values());
-      setOnlineUsers(merged);
-    };
-
-    updateCombinedOnlineUsers(localSessions, presenceSessions);
-
-    if (supabase) {
-      const existingChannel = supabase.getChannels().find(
-        (c: any) => c.name === 'online-presence' || c.topic === 'realtime:online-presence'
-      );
-      if (existingChannel) {
-        supabase.removeChannel(existingChannel);
-      }
-
-      channel = supabase.channel('online-presence', {
-        config: {
-          presence: {
-            key: user.id,
-          },
-        },
-      });
-
-      channel
-        .on('presence', { event: 'sync' }, () => {
-          try {
-            const presenceState = channel.presenceState();
-            const remote = Object.values(presenceState)
-              .flatMap((presences: any) => presences || [])
-              .filter((p: any) => p && p.user_id)
-              .map((p: any) => ({
-                id: p.user_id,
-                name: p.name,
-                role: p.role,
-                email: p.email,
-                active: true,
-                created_at: p.created_at || new Date().toISOString()
-              }));
-
-            presenceSessions = remote;
-            updateCombinedOnlineUsers(performLocalHeartbeat(), presenceSessions);
-          } catch (e) {
-            console.error('[Presence] Sync event error:', e);
-          }
-        })
-        .subscribe(async (status: string) => {
-          if (status === 'SUBSCRIBED') {
-            try {
-              await channel.track({
-                user_id: user.id,
-                name: user.name,
-                role: user.role,
-                email: user.email,
-                online_at: new Date().toISOString()
-              });
-            } catch (e) {
-              console.error('[Presence] Track error:', e);
-            }
-          }
-        });
-    }
-
-    const timer = setInterval(() => {
-      const activeLocal = performLocalHeartbeat();
-      updateCombinedOnlineUsers(activeLocal, presenceSessions);
-    }, HEARTBEAT_INTERVAL);
-
-    const handleUnload = () => {
-      try {
-        const storedStr = localStorage.getItem('qualitrack_active_sessions');
-        if (storedStr) {
-          let sessions = [];
-          try {
-            sessions = JSON.parse(decodeURIComponent(atob(storedStr)));
-          } catch {
-            sessions = JSON.parse(storedStr);
-          }
-          if (Array.isArray(sessions)) {
-            sessions = sessions.filter((s: any) => s && s.id !== user.id);
-            localStorage.setItem('qualitrack_active_sessions', btoa(encodeURIComponent(JSON.stringify(sessions))));
-          }
-        }
-        if (channel) {
-          channel.unsubscribe();
-        }
-      } catch (e) {}
-    };
-
-    window.addEventListener('beforeunload', handleUnload);
-
-    return () => {
-      clearInterval(timer);
-      window.removeEventListener('beforeunload', handleUnload);
-      handleUnload();
-      if (channel && supabase) {
-        supabase.removeChannel(channel);
-      }
-    };
-  }, [user]);
-
-  return (
-    <PresenceContext value={{ onlineUsers }}>
-      {children}
-    </PresenceContext>
-  );
-}
-
-export function usePresence() {
-  const context = React.use(PresenceContext);
-  if (context === undefined) {
-    throw new Error('usePresence must be used within a PresenceProvider');
-  }
-  return context;
-}
 
 export function useDashboardState() {
   const context = React.use(DashboardStateContext);
@@ -272,28 +172,50 @@ export function DashboardProvider({
   const isSimulated = false;
   const user = loggedInUser;
 
-  const [filters, setFilters] = useState<DashboardFilters>({
-    startDate: new Date(Date.now() - 30 * 24 * 3600000).toISOString().split('T')[0],
-    endDate: new Date().toISOString().split('T')[0],
+  const cache = usePageCache<{
+    filters: DashboardFilters; monitorias: Monitoria[]; allMonitorias: Monitoria[];
+    detailMonitorias?: Monitoria[];
+    helpdeskSubmissions: HelpdeskSubmission[]; globalAvg: number;
+  }>(userCacheScope(user), 'dashboard');
+  const cached = cache.initial;
+  const successfulLoad = useRef(Boolean(cached));
+
+  const [filters, setFilters] = useState<DashboardFilters>(() => cached?.filters ?? ({
+    ...getPresetDateRange('mes'),
     teamId: '',
+    groupId: '',
     agentId: '',
     auditorId: '',
     formId: '',
     status: '',
     channel: ''
-  });
+  }));
 
-  const [monitorias, setMonitorias] = useState<Monitoria[]>([]);
-  const [allMonitorias, setAllMonitorias] = useState<Monitoria[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [globalAvg, setGlobalAvg] = useState(0);
+  const [monitorias, setMonitorias] = useState<Monitoria[]>(cached?.monitorias ?? []);
+  const [allMonitorias, setAllMonitorias] = useState<Monitoria[]>(cached?.allMonitorias ?? []);
+  const [detailMonitorias, setDetailMonitorias] = useState<Monitoria[]>(cached?.detailMonitorias ?? cached?.allMonitorias ?? cached?.monitorias ?? []);
+  const [helpdeskSubmissions, setHelpdeskSubmissions] = useState<HelpdeskSubmission[]>(cached?.helpdeskSubmissions ?? []);
+  const [loading, setLoading] = useState(!cached);
+  const [refreshing, setRefreshing] = useState(false);
+  const [globalAvg, setGlobalAvg] = useState(cached?.globalAvg ?? 0);
+  const [aggregates, setAggregates] = useState<DashboardAggregates | null>(null);
+  const [deadlineMonitorias, setDeadlineMonitorias] = useState<Monitoria[]>([]);
+  const [qualityManagerQueue, setQualityManagerQueue] = useState<Monitoria[]>([]);
+  const [deadlineReady, setDeadlineReady] = useState(!['admin', 'qualidade', 'gestor_qualidade'].includes(dashboardRole));
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [activeEditingId, setActiveEditingId] = useState<string | null>(null);
   // CORRECTION 8: Cooldown for manual refresh button
   const [refreshCooldownEnd, setRefreshCooldownEnd] = useState<number | null>(null);
   const [refreshCooldownRemaining, setRefreshCooldownRemaining] = useState<string>('');
-  const hasLoadedOnce = useRef(false);
+  const hasLoadedOnce = useRef(Boolean(cached));
+  const loadedRangeRef = useRef(cached ? `${cached.filters.startDate}|${cached.filters.endDate}` : '');
+  const summaryDocsRef = useRef<Monitoria[] | null>(cached?.allMonitorias ?? null);
+  const summaryCoverageRef = useRef(cached ? {
+    startDate: ['admin', 'gestor_qualidade'].includes(dashboardRole) ? getTrendWindowStart(cached.filters) : '',
+    endDate: ['admin', 'gestor_qualidade'].includes(dashboardRole) ? cached.filters.endDate : '',
+  } : null);
   const fetchingRef = useRef(false);
+  const queuedRef = useRef(false);
   const filtersRef = useRef(filters);
   filtersRef.current = filters;
   const userRef = useRef(user);
@@ -301,99 +223,159 @@ export function DashboardProvider({
   const staticDataRef = useRef(staticData);
   staticDataRef.current = staticData;
 
-  const loadData = useCallback(async () => {
+  const loadData = useCallback(async (reuseSummary = false) => {
     const currentUser = userRef.current;
     if (!currentUser) return;
+    const requestedRange = `${filtersRef.current.startDate}|${filtersRef.current.endDate}`;
     if (fetchingRef.current) {
-      console.log('[Dashboard] Fetch já em andamento, ignorando...');
+      queuedRef.current = true;
       return;
     }
     fetchingRef.current = true;
+    setRefreshing(true);
     if (!hasLoadedOnce.current) {
       setLoading(true);
     }
     try {
       let docs: Monitoria[] = [];
+      let summaryDocs: Monitoria[] = [];
+      let loadedSubmissions: HelpdeskSubmission[] = [];
       let scoreDocs: any[] = [];
-      const currentFilters = filtersRef.current;
       const currentStaticData = staticDataRef.current;
 
       if (!supabase) {
         const { data } = await mockDb.get('monitorias');
         docs = data || [];
-        scoreDocs = docs;
+        summaryDocs = docs;
+        scoreDocs = summaryDocs;
+        const { data: subData } = await mockDb.get('helpdesk_submissions');
+        if (!cache.isCurrent()) return;
+        loadedSubmissions = (subData as HelpdeskSubmission[]) || [];
       } else {
         const sb = supabase!; // TypeScript narrowing after guard
-        const executeWithRetry = async (retryCount = 0): Promise<any[]> => {
+        const executeWithRetry = async (columns: string, period: DashboardFilters, retryCount = 0): Promise<Monitoria[]> => {
           try {
             console.log(`[Dashboard] Carregando monitorias (Tentativa ${retryCount + 1})...`);
-            const controller = new AbortController();
-
-            // CORRECTION 4: Single query - select('*') contains all needed fields
+            // Fetch every page; the default Supabase row cap would distort the
+            // General ranking once the history grows beyond one page.
             // Use anonymized view for suporte to hide evaluator identity
             const isSuporte = currentUser.role === 'suporte';
             const source = isSuporte ? 'vw_monitorias_suporte' : 'monitorias';
-            let monitoriasQuery = sb.from(source).select('*').order('created_at', { ascending: false });
-
             const myTeamIds = currentUser.team_ids || [];
-
-            if (currentUser.role === 'suporte') {
-              if (myTeamIds.length > 0) {
-                const rbacFilter = `evaluated_id.eq.${currentUser.id},team_id.in.(${myTeamIds.map(id => `"${id}"`).join(',')})`;
-                monitoriasQuery = monitoriasQuery.or(rbacFilter);
-              } else {
-                monitoriasQuery = monitoriasQuery.eq('evaluated_id', currentUser.id);
+            const pageSize = 500;
+            const rows: Monitoria[] = [];
+            for (let offset = 0; ; offset += pageSize) {
+              let query = sb.from(source).select(columns)
+                .eq('active', true)
+                .order('created_at', { ascending: false })
+                .order('id', { ascending: false })
+                .range(offset, offset + pageSize - 1);
+              if (period.startDate) query = query.gte('created_at', new Date(`${period.startDate}T00:00:00`).toISOString());
+              if (period.endDate) query = query.lte('created_at', new Date(`${period.endDate}T23:59:59`).toISOString());
+              if (currentUser.role === 'suporte') {
+                if (myTeamIds.length > 0) {
+                  const rbacFilter = `evaluated_id.eq.${currentUser.id},team_id.in.(${myTeamIds.map(id => `"${id}"`).join(',')})`;
+                  query = query.or(rbacFilter);
+                } else {
+                  query = query.eq('evaluated_id', currentUser.id);
+                }
+              } else if (currentUser.role === 'gestor_suporte') {
+                query = myTeamIds.length > 0
+                  ? query.in('team_id', myTeamIds)
+                  : query.eq('team_id', '00000000-0000-0000-0000-000000000000');
               }
-            } else if (currentUser.role === 'qualidade') {
-              monitoriasQuery = monitoriasQuery.eq('evaluator_id', currentUser.id);
-            } else if (currentUser.role === 'gestor_suporte') {
-              if (myTeamIds.length > 0) {
-                monitoriasQuery = monitoriasQuery.in('team_id', myTeamIds);
-              } else {
-                monitoriasQuery = monitoriasQuery.eq('team_id', '00000000-0000-0000-0000-000000000000');
+              const controller = new AbortController();
+              let timeoutId: ReturnType<typeof setTimeout> | undefined;
+              const timeoutPromise = new Promise<never>((_, reject) => {
+                timeoutId = setTimeout(() => { controller.abort(); reject(new Error('timeout')); }, 30000);
+              });
+              let result;
+              try {
+                result = await Promise.race([query.abortSignal(controller.signal), timeoutPromise]);
+              } finally {
+                if (timeoutId) clearTimeout(timeoutId);
               }
+              if (result.error) throw result.error;
+              const page = (result.data ?? []) as unknown as Monitoria[];
+              rows.push(...page);
+              if (page.length < pageSize) break;
             }
-
-            const fetchPromise = Promise.all([
-              monitoriasQuery.abortSignal(controller.signal),
-            ]);
-
-            const timeoutPromise = new Promise((_, reject) => setTimeout(() => { controller.abort(); reject(new Error('timeout')); }, 15000));
-
-            const results = await Promise.race([fetchPromise, timeoutPromise]) as any[];
-
-            const errorRes = results.find((r: any) => r.error);
-            if (errorRes) throw errorRes.error;
-
-            return results;
+            return rows;
           } catch (err: any) {
           console.error(`[Dashboard] Erro na tentativa ${retryCount + 1}:`, err);
           if (retryCount < 4) {
             const waitTime = Math.min(1000 * Math.pow(1.5, retryCount) + 1000 * retryCount, 10000);
-            toast.loading(`Recuperando dashboard... (${retryCount + 1}/5)`, { id: 'dash-retry' });
-            await sb.auth.getSession();
+            if (!hasLoadedOnce.current) {
+              toast.loading(`Recuperando dashboard... (${retryCount + 1}/5)`, { id: 'dash-retry' });
+            }
             await new Promise(res => setTimeout(res, waitTime));
-            return executeWithRetry(retryCount + 1);
+            return executeWithRetry(columns, period, retryCount + 1);
           }
           toast.dismiss('dash-retry');
-          toast.error('Não foi possível conectar ao servidor. Verifique sua internet.');
+          toast.error(hasLoadedOnce.current
+            ? 'Não foi possível atualizar o dashboard. Os dados anteriores continuam visíveis.'
+            : 'O servidor de dados não respondeu. Tente novamente em instantes.');
           throw err;
         }
       };
 
-        const [mRes] = await executeWithRetry();
-
-        if (mRes.data) {
-          docs = mRes.data as Monitoria[];
-          // CORRECTION 4: Derive scoreDocs from the full query result (same data, just filtered)
-          scoreDocs = mRes.data as any[];
+        const period = filtersRef.current;
+        const boundedHistory = ['admin', 'gestor_qualidade'].includes(currentUser.role);
+        const historyStart = boundedHistory ? getTrendWindowStart(period) : '';
+        const historyEnd = boundedHistory ? period.endDate : '';
+        const coverage = summaryCoverageRef.current;
+        const summaryIsCovered = coverage && (!coverage.startDate || (historyStart && coverage.startDate <= historyStart))
+          && (!coverage.endDate || (historyEnd && coverage.endDate >= historyEnd));
+        const summaryColumns = ['admin', 'qualidade', 'gestor_qualidade'].includes(currentUser.role)
+          ? DASHBOARD_METRICS_COLUMNS : DASHBOARD_SUMMARY_COLUMNS;
+        if (currentUser.role === 'qualidade') {
+          docs = await executeWithRetry(DASHBOARD_MONITORIA_COLUMNS, period);
+          summaryDocs = docs;
+        } else {
+          [summaryDocs, docs] = await Promise.all([
+            reuseSummary && summaryDocsRef.current && summaryIsCovered
+              ? Promise.resolve(summaryDocsRef.current)
+              : executeWithRetry(summaryColumns, { ...period, startDate: historyStart, endDate: historyEnd }),
+            executeWithRetry(DASHBOARD_MONITORIA_COLUMNS, period),
+          ]);
+          if (!reuseSummary || !summaryDocsRef.current || !summaryIsCovered) {
+            summaryDocsRef.current = summaryDocs;
+            summaryCoverageRef.current = { startDate: historyStart, endDate: historyEnd };
+          }
         }
+        scoreDocs = ['admin', 'qualidade', 'gestor_qualidade'].includes(currentUser.role) ? docs : summaryDocs;
 
-      } // Close try block for loadData
+        if (currentUser.role === 'gestor_suporte' && docs.length > 0) {
+          const docIds = docs.map(d => d.id);
+          const idBatches = Array.from({ length: Math.ceil(docIds.length / 150) }, (_, index) =>
+            docIds.slice(index * 150, (index + 1) * 150));
+          const submissionBatches = await Promise.all(idBatches.map(async ids => {
+            const { data: subData, error: subError } = await sb
+              .from('helpdesk_submissions')
+              .select('*')
+              .in('monitoria_id', ids)
+              .eq('status', 'sent')
+              .order('created_at', { ascending: false });
+            if (subError) throw subError;
+            return (subData as HelpdeskSubmission[]) || [];
+          }));
+          if (!cache.isCurrent()) return;
+          loadedSubmissions = submissionBatches.flat();
+        } else {
+          if (!cache.isCurrent()) return;
+          loadedSubmissions = [];
+        }
+      }
 
+      if (requestedRange !== `${filtersRef.current.startDate}|${filtersRef.current.endDate}`) {
+        queuedRef.current = true;
+        return;
+      }
+      const currentFilters = filtersRef.current;
       const userDocs = currentStaticData.users;
 
       docs = docs.filter(m => m.active !== false);
+      summaryDocs = summaryDocs.filter(m => m.active !== false);
 
     const globalFiltered = scoreDocs.filter(m => {
       if (m.active === false) return false;
@@ -408,6 +390,7 @@ export function DashboardProvider({
       if (currentFilters.channel) pass = pass && m.channel === currentFilters.channel;
       if (currentFilters.formId) pass = pass && m.form_id === currentFilters.formId;
       if (currentFilters.teamId && 'team_id' in m) pass = pass && m.team_id === currentFilters.teamId;
+      pass = pass && matchesTicketGroup(m, currentFilters.groupId);
       if (currentFilters.agentId && currentUser.role !== 'suporte' && 'evaluated_id' in m) pass = pass && m.evaluated_id === currentFilters.agentId;
       if (currentFilters.auditorId && 'evaluator_id' in m) pass = pass && m.evaluator_id === currentFilters.auditorId;
       return pass;
@@ -419,20 +402,29 @@ export function DashboardProvider({
         let myTeamIds = myUser?.team_ids || currentUser.team_ids || [];
 
         if (myTeamIds.length === 0) {
-          const fromRecords = docs.filter(m => m.evaluated_id === currentUser.id && m.team_id).map(m => m.team_id!);
+          const fromRecords = summaryDocs.filter(m => m.evaluated_id === currentUser.id && m.team_id).map(m => m.team_id!);
           myTeamIds = Array.from(new Set(fromRecords));
         }
 
         docs = docs.filter(m => m.evaluated_id === currentUser.id || (m.team_id && myTeamIds.includes(m.team_id)));
-      } else if (currentUser.role === 'qualidade') {
-        docs = docs.filter(m => m.evaluator_id === currentUser.id);
+        summaryDocs = summaryDocs.filter(m => m.evaluated_id === currentUser.id || (m.team_id && myTeamIds.includes(m.team_id)));
       } else if (currentUser.role === 'gestor_suporte') {
         const myTeamIds = currentUser.team_ids || [];
         docs = docs.filter(m => m.team_id && myTeamIds.includes(m.team_id));
+        summaryDocs = summaryDocs.filter(m => m.team_id && myTeamIds.includes(m.team_id));
       } else if (currentUser.role === 'gestor_qualidade') {
       }
 
-      setAllMonitorias(docs);
+      if (currentUser.role === 'suporte' || currentUser.role === 'gestor_suporte') {
+        scoreDocs = summaryDocs;
+      }
+
+      if (!cache.isCurrent()) return;
+      successfulLoad.current = true;
+      loadedRangeRef.current = requestedRange;
+      setHelpdeskSubmissions(loadedSubmissions);
+      setAllMonitorias(summaryDocs);
+      setDetailMonitorias(docs);
 
       let filtered = docs.filter(m => {
         const targetDate = m.created_at;
@@ -444,6 +436,7 @@ export function DashboardProvider({
       });
 
       if (currentFilters.teamId) filtered = filtered.filter(m => m.team_id === currentFilters.teamId);
+      filtered = filtered.filter(m => matchesTicketGroup(m, currentFilters.groupId));
       if (currentFilters.agentId && currentUser.role !== 'suporte') filtered = filtered.filter(m => m.evaluated_id === currentFilters.agentId);
       if (currentFilters.auditorId) filtered = filtered.filter(m => m.evaluator_id === currentFilters.auditorId);
       if (currentFilters.formId) filtered = filtered.filter(m => m.form_id === currentFilters.formId);
@@ -460,55 +453,147 @@ export function DashboardProvider({
         });
       }
     } finally {
-      setLoading(false);
-      hasLoadedOnce.current = true;
+      if (cache.isCurrent() && !queuedRef.current) { setLoading(false); setRefreshing(false); }
+      hasLoadedOnce.current = successfulLoad.current;
       fetchingRef.current = false;
+      toast.dismiss('dash-retry');
+      if (queuedRef.current) {
+        queuedRef.current = false;
+        setTimeout(() => loadData(), 0);
+      }
     }
-  }, [refreshTrigger]);
+  }, [refreshTrigger, cache]);
 
   useEffect(() => {
     if (!user) return;
+    if (loadedRangeRef.current !== `${filters.startDate}|${filters.endDate}`) setLoading(true);
+    const changingPeriod = hasLoadedOnce.current && loadedRangeRef.current !== `${filters.startDate}|${filters.endDate}`;
     const timer = setTimeout(() => {
-      loadData();
-    }, 300);
+      loadData(changingPeriod);
+    }, hasLoadedOnce.current ? 300 : 0);
     return () => clearTimeout(timer);
-  }, [user, loadData]);
+  }, [user, loadData, filters.startDate, filters.endDate]);
 
+  // Historic SLA alerts must remain visible even when chart history is bounded.
   useEffect(() => {
-    if (activeTab === 'dashboard' && user) {
-      if (hasLoadedOnce.current) {
-        loadData();
-      }
+    if (!supabase || !user || loading || !['admin', 'qualidade', 'gestor_qualidade'].includes(user.role)) return;
+    if (sessionStorage.getItem(`qualitrack_sla_notified_${user.id}`)) return;
+    let cancelled = false;
+    let query = supabase.from('monitorias')
+      .select('id,evaluator_id,evaluated_id,team_id,status,action_deadline_at,created_at')
+      .eq('active', true)
+      .gte('action_deadline_at', new Date().toISOString())
+      .in('status', ['pendente_revisao', 'contestacao_negada', 'em_contestacao', 'aguardando_gestor_suporte', 'aguardando_gestor_qualidade']);
+    if (user.role === 'qualidade') query = query.eq('evaluator_id', user.id);
+    void query.then(({ data, error }) => {
+      if (cancelled) return;
+      if (error) console.error('[Dashboard] Falha ao carregar alertas de prazo:', error);
+      setDeadlineMonitorias((data ?? []) as Monitoria[]);
+      setDeadlineReady(true);
+    });
+    return () => { cancelled = true; };
+  }, [user, loading]);
+
+  // The quality manager's decision queue must not depend on the dashboard date range.
+  useEffect(() => {
+    if (!user || user.role !== 'gestor_qualidade') {
+      setQualityManagerQueue([]);
+      return;
     }
-  }, [activeTab, user, loadData]);
+    setQualityManagerQueue([]);
+    let cancelled = false;
+    const applyRows = (rows: Monitoria[]) => {
+      if (!cancelled) setQualityManagerQueue(selectQualityManagerActions(rows));
+    };
+    if (isMockMode || !supabase) {
+      void mockDb.get('monitorias').then(({ data }) => applyRows((data || []) as Monitoria[]));
+    } else {
+      void supabase.from('monitorias').select(DASHBOARD_MONITORIA_COLUMNS)
+        .eq('active', true).in('status', [...QUALITY_MANAGER_ACTION_STATUSES])
+        .order('created_at', { ascending: false })
+        .then(({ data, error }) => {
+          if (error) {
+            console.error('[Dashboard] Falha ao carregar fila da Gestão da Qualidade:', error);
+            return;
+          }
+          applyRows((data || []) as unknown as Monitoria[]);
+        });
+    }
+    return () => { cancelled = true; };
+  }, [user, refreshTrigger]);
+
+  // Metrics and rankings are computed over the filtered, authorized set in
+  // PostgreSQL. Keep MockDb's local calculations for offline development.
+  useEffect(() => {
+    if (!supabase || !user || activeTab !== 'dashboard') return;
+    const sb = supabase;
+    let cancelled = false;
+    setAggregates(null);
+    const timer = setTimeout(async () => {
+      const { data, error } = await sb.rpc('dashboard_aggregates', {
+        p_start_date: filters.startDate || null,
+        p_end_date: filters.endDate || null,
+        p_team_id: filters.teamId || null,
+        p_group_id: filters.groupId || null,
+        p_agent_id: filters.agentId || null,
+        p_auditor_id: filters.auditorId || null,
+        p_form_id: filters.formId || null,
+        p_status: filters.status || null,
+        p_channel: filters.channel || null,
+      });
+      if (cancelled) return;
+      if (error) {
+        console.error('[Dashboard] Falha ao carregar indicadores agregados:', error);
+        return;
+      }
+      setAggregates(data as unknown as DashboardAggregates);
+    }, 300);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [user, activeTab, filters, refreshTrigger]);
 
   const loadDataRef = useRef(loadData);
   loadDataRef.current = loadData;
 
+  // Refiltra localmente os detalhes do período; o histórico leve alimenta tendências.
+  useEffect(() => {
+    if (!hasLoadedOnce.current) return;
+    if (loadedRangeRef.current !== `${filters.startDate}|${filters.endDate}`) return;
+    const currentUser = userRef.current;
+    if (!currentUser) return;
+
+    let filtered = detailMonitorias.filter(m => {
+      const targetDate = m.created_at;
+      if (!targetDate) return true;
+      const d = new Date(targetDate).getTime();
+      const startD = filters.startDate ? new Date(filters.startDate).getTime() : 0;
+      const endD = filters.endDate ? new Date(filters.endDate + 'T23:59:59').getTime() : Infinity;
+      return d >= startD && d <= endD;
+    });
+
+    if (filters.teamId) filtered = filtered.filter(m => m.team_id === filters.teamId);
+    filtered = filtered.filter(m => matchesTicketGroup(m, filters.groupId));
+    if (filters.agentId && currentUser.role !== 'suporte') filtered = filtered.filter(m => m.evaluated_id === filters.agentId);
+    if (filters.auditorId) filtered = filtered.filter(m => m.evaluator_id === filters.auditorId);
+    if (filters.formId) filtered = filtered.filter(m => m.form_id === filters.formId);
+    if (filters.status) filtered = filtered.filter(m => m.status === filters.status);
+    if (filters.channel) filtered = filtered.filter(m => m.channel === filters.channel);
+
+    const scored = filtered.filter(m => m.score !== undefined && m.score !== null);
+    const gAvg = scored.length > 0 ? scored.reduce((acc, m) => acc + (m.score || 0), 0) / scored.length : 0;
+
+    setMonitorias(filtered);
+    setGlobalAvg(gAvg);
+  }, [detailMonitorias, filters]);
+
   useEffect(() => {
     const handleReconnect = () => {
       console.log('[Dashboard] Reconexão detectada. Recarregando monitorias...');
-      hasLoadedOnce.current = false;
       loadDataRef.current();
     };
     window.addEventListener('qualitrack:reconnected', handleReconnect);
     return () => {
       window.removeEventListener('qualitrack:reconnected', handleReconnect);
     };
-  }, []);
-
-  // CORRECTION 7: Throttle reloads after realtime reconnection
-  const lastTabVisibleRef = useRef(0);
-
-  // Track tab visibility for realtime throttle
-  useEffect(() => {
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        lastTabVisibleRef.current = Date.now();
-      }
-    };
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
   }, []);
 
   useEffect(() => {
@@ -524,15 +609,14 @@ export function DashboardProvider({
       .channel(channelName)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'monitorias' }, () => {
         if (!mounted) return;
-        // CORRECTION 7: Ignore reloads in first 2s after tab becomes visible (reconnection sync)
-        if (Date.now() - lastTabVisibleRef.current < 2000) {
-          console.log('[Realtime] Ignorando reload - aba recém-ativa (sync de reconexão)');
-          return;
-        }
         if (debounceTimer) clearTimeout(debounceTimer);
         debounceTimer = setTimeout(() => {
           loadDataRef.current();
         }, 300);
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'helpdesk_submissions' }, () => {
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => loadDataRef.current(), 300);
       })
       .subscribe((status: string) => {
         if (status === 'SUBSCRIBED') {
@@ -553,11 +637,19 @@ export function DashboardProvider({
     };
   }, [user]);
 
+  useBackgroundRefresh(loadData, Boolean(user));
+
+  useEffect(() => {
+    if (!loading && successfulLoad.current) {
+      cache.write({ filters, monitorias, allMonitorias, detailMonitorias, helpdeskSubmissions, globalAvg });
+    }
+  }, [cache, filters, monitorias, allMonitorias, detailMonitorias, helpdeskSubmissions, globalAvg, loading]);
+
   // SLA Notification Hook pós-login
   const { config: qualityConfig } = useQualityConfig();
 
   useEffect(() => {
-    if (loading || !user || allMonitorias.length === 0) return;
+    if (loading || !user || !deadlineReady) return;
 
     // Check if we have already notified in this login session
     const notifiedKey = `qualitrack_sla_notified_${user.id}`;
@@ -567,7 +659,8 @@ export function DashboardProvider({
     const myTeamIds = user.team_ids || [];
     const now = new Date();
 
-    const pendingMonitorias = allMonitorias.filter(m => {
+    const alertRows = [...new Map([...allMonitorias, ...deadlineMonitorias].map(m => [m.id, m])).values()];
+    const pendingMonitorias = alertRows.filter(m => {
       if (!m.action_deadline_at) return false;
 
       // Filter by role scope
@@ -605,7 +698,7 @@ export function DashboardProvider({
 
     // Set flag in sessionStorage to run once per login session
     sessionStorage.setItem(notifiedKey, 'true');
-  }, [loading, user, allMonitorias, qualityConfig]);
+  }, [loading, user, allMonitorias, deadlineMonitorias, deadlineReady, qualityConfig]);
 
   // CORRECTION 8: Cooldown timer for manual refresh button
   useEffect(() => {
@@ -628,7 +721,6 @@ export function DashboardProvider({
   const refresh = useCallback(() => {
     if (refreshCooldownEnd && Date.now() < refreshCooldownEnd) return; // block during cooldown
     setRefreshCooldownEnd(Date.now() + 5 * 60 * 1000); // 5 minute cooldown
-    hasLoadedOnce.current = false;
     setRefreshTrigger(prev => prev + 1);
   }, [refreshCooldownEnd]);
 
@@ -640,11 +732,15 @@ export function DashboardProvider({
     filters,
     monitorias,
     allMonitorias,
+    qualityManagerQueue,
+    helpdeskSubmissions,
     users: staticData.users,
     teams: staticData.teams,
     forms: staticData.forms,
     loading,
+    refreshing,
     globalAvg,
+    aggregates,
     dissatisfactionFields: staticData.dissatisfactionFields,
     refreshCooldownEnd,
     refreshCooldownRemaining,
@@ -656,11 +752,15 @@ export function DashboardProvider({
     filters,
     monitorias,
     allMonitorias,
+    qualityManagerQueue,
+    helpdeskSubmissions,
     staticData.users,
     staticData.teams,
     staticData.forms,
     loading,
+    refreshing,
     globalAvg,
+    aggregates,
     staticData.dissatisfactionFields,
     refreshCooldownEnd,
     refreshCooldownRemaining,
@@ -679,11 +779,7 @@ export function DashboardProvider({
   return (
     <DashboardStateContext value={stateValue}>
       <DashboardDispatchContext value={dispatchValue}>
-        <EditingContext value={editingValue}>
-          <PresenceProvider user={user}>
-            {children}
-          </PresenceProvider>
-        </EditingContext>
+        <EditingContext value={editingValue}>{children}</EditingContext>
       </DashboardDispatchContext>
     </DashboardStateContext>
   );

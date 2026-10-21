@@ -1,18 +1,30 @@
 import React, { useMemo, useState, useRef, useEffect } from 'react';
-import { Calendar, X, RefreshCw } from 'lucide-react';
+import { Calendar, X, RefreshCw, FileText, Layers } from 'lucide-react';
 import { useDashboard } from './DashboardContext';
 import CustomSelect from '../ui/CustomSelect';
 import CustomDatepicker from '../ui/CustomDatepicker';
 import { useTheme } from '../../providers/ThemeProvider';
 import { m, AnimatePresence } from 'motion/react';
+import { getPresetDateRange, detectActivePreset } from '../../lib/dashboardDatePresets';
+import ExecutiveReportModal from './widgets/ExecutiveReportModal';
+import RootCauseAnalyzerModal from './widgets/RootCauseAnalyzerModal';
+import { useFeedbacks } from '../../hooks/useFeedbacks';
+import { useQualityConfig } from '../../lib/useQualityConfig';
+import { useStaticData } from '../../lib/StaticDataContext';
+import { matchesTicketGroup, MISSING_TICKET_GROUP } from '../../lib/dashboardGroupFilter';
 
 export default function FilterBar() {
   const { resolvedTheme } = useTheme();
-  const { filters, setFilters, users, teams, loading, refresh, user, allMonitorias, dashboardRole, refreshCooldownEnd, refreshCooldownRemaining } = useDashboard();
+  const { groups } = useStaticData();
+  const { filters, setFilters, users, teams, forms, loading, refreshing, refresh, user, allMonitorias, dashboardRole, refreshCooldownEnd, refreshCooldownRemaining } = useDashboard();
+  const { feedbacks } = useFeedbacks(user);
+  const { config } = useQualityConfig();
+  const hiddenActions = config.dashboardHiddenActions?.[dashboardRole] || [];
+  const [isReportOpen, setIsReportOpen] = useState(false);
+  const [isRootCauseOpen, setIsRootCauseOpen] = useState(false);
 
   const defaults = useMemo(() => ({
-    startDate: new Date(Date.now() - 30 * 24 * 3600000).toISOString().split('T')[0],
-    endDate: new Date().toISOString().split('T')[0],
+    ...getPresetDateRange('mes'),
     teamId: '',
     agentId: '',
     auditorId: '',
@@ -22,6 +34,7 @@ export default function FilterBar() {
     return filters.startDate !== defaults.startDate || 
            filters.endDate !== defaults.endDate || 
            filters.teamId !== defaults.teamId || 
+           Boolean(filters.groupId) ||
            filters.agentId !== defaults.agentId ||
            filters.auditorId !== defaults.auditorId ||
            filters.status !== '';
@@ -33,9 +46,31 @@ export default function FilterBar() {
       startDate: defaults.startDate,
       endDate: defaults.endDate,
       teamId: '',
+      groupId: '',
       agentId: '',
       auditorId: '',
       status: '',
+    }));
+  };
+
+  const activePreset = useMemo(() => {
+    return detectActivePreset(filters.startDate, filters.endDate);
+  }, [filters.startDate, filters.endDate]);
+
+  const handleApplyPreset = (preset: 'dia' | 'mes' | 'ano') => {
+    if (activePreset === preset) {
+      setFilters(prev => ({
+        ...prev,
+        startDate: defaults.startDate,
+        endDate: defaults.endDate,
+      }));
+      return;
+    }
+    const range = getPresetDateRange(preset);
+    setFilters(prev => ({
+      ...prev,
+      startDate: range.startDate,
+      endDate: range.endDate,
     }));
   };
 
@@ -61,10 +96,22 @@ export default function FilterBar() {
     let list = users.filter(u => u.role === 'suporte' && u.active !== false);
     if (dashboardRole === 'gestor_suporte') {
       const myTeamIds = user?.team_ids || [];
-      list = list.filter(u => u.team_ids?.some(tid => myTeamIds.includes(tid)));
+      list = list.filter(u => u.primary_team_id
+        ? myTeamIds.includes(u.primary_team_id)
+        : u.team_ids?.some(tid => myTeamIds.includes(tid)));
     }
     return [...list].sort((a, b) => a.name.localeCompare(b.name));
   }, [users, user, dashboardRole]);
+
+  const groupOptions = useMemo(() => {
+    const permittedIds = new Set(allMonitorias.map(row => row.ticket_group_team_id).filter(Boolean));
+    return [...groups, ...teams].filter(group => permittedIds.has(group.id))
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map(group => ({ value: group.id, label: group.name }));
+  }, [groups, teams, allMonitorias]);
+  const groupScopedMonitorias = useMemo(() => allMonitorias.filter(row => matchesTicketGroup(row, filters.groupId)), [allMonitorias, filters.groupId]);
+  const selectedGroupName = filters.groupId === MISSING_TICKET_GROUP ? 'Grupo não registrado'
+    : groupOptions.find(group => group.value === filters.groupId)?.label;
 
   const activeAuditors = useMemo(() => {
     const list = users.filter(u => (u.role === 'qualidade' || u.role === 'gestor_qualidade' || u.role === 'admin') && u.active !== false);
@@ -73,29 +120,104 @@ export default function FilterBar() {
 
   return (
     <div className="space-y-2">
-      <div className="flex justify-end">
+      <div className="grid grid-cols-2 gap-2 sm:flex sm:items-center sm:justify-end sm:gap-3">
+        {hasChanged && (
+          <button
+            type="button"
+            onClick={handleClear}
+            className="col-span-2 sm:col-span-1 flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold text-functional-error hover:bg-functional-error/10 rounded-xl transition-all cursor-pointer"
+            title="Limpar todos os filtros e retornar ao período padrão"
+          >
+            <X className="w-3.5 h-3.5" />
+            Limpar Filtros
+          </button>
+        )}
+        {user?.role !== 'suporte' && (
+          <>
+            {!hiddenActions.includes('root_cause') && (
+            <button
+              type="button"
+              onClick={() => setIsRootCauseOpen(true)}
+              className="min-w-0 min-h-10 flex items-center justify-center gap-1.5 px-2 sm:px-3 py-1.5 text-center text-xs font-bold text-purple-700 dark:text-purple-300 bg-purple-500/10 hover:bg-purple-500/20 border border-purple-500/25 rounded-xl transition-all cursor-pointer"
+              title="Indicadores das avaliações filtradas e comparação de notas antes e depois do feedback"
+            >
+              <Layers className="w-3.5 h-3.5 shrink-0 text-purple-600 dark:text-purple-400" />
+              <span>Análise das monitorias</span>
+            </button>
+            )}
+            {!hiddenActions.includes('executive_report') && (
+            <button
+              type="button"
+              onClick={() => setIsReportOpen(true)}
+              className="min-w-0 min-h-10 flex items-center justify-center gap-1.5 px-2 sm:px-3 py-1.5 text-center text-xs font-bold text-brand-primary bg-brand-accent/10 hover:bg-brand-accent/20 border border-brand-accent/25 rounded-xl transition-all cursor-pointer"
+              title="Gerar e imprimir relatório executivo consolidado em PDF para reunião e envio a gestores"
+            >
+              <FileText className="w-3.5 h-3.5 shrink-0 text-brand-accent" />
+              <span>Relatório Executivo (PDF)</span>
+            </button>
+            )}
+          </>
+        )}
         <button
+          type="button"
           onClick={refresh}
-          disabled={loading || !!refreshCooldownRemaining}
-          className="flex items-center gap-2 px-3 py-1.5 text-brand-muted hover:text-brand-primary transition-colors text-[10px] font-black uppercase tracking-widest disabled:opacity-50 disabled:cursor-not-allowed"
+          disabled={loading || refreshing || !!refreshCooldownRemaining}
+          className="col-span-2 sm:col-span-1 min-h-10 flex items-center justify-center gap-2 px-3 py-1.5 text-brand-muted hover:text-brand-primary transition-colors text-xs font-semibold tracking-wide disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
         >
-          <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
-          {loading ? 'Atualizando...' : refreshCooldownRemaining ? `Atualizar (${refreshCooldownRemaining})` : 'Atualizar Dados'}
+          <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+          {refreshing ? 'Atualizando...' : refreshCooldownRemaining ? `Atualizar (${refreshCooldownRemaining})` : 'Atualizar Dados'}
         </button>
       </div>
 
-      <div className="bg-surface-card rounded-3xl border border-surface-border shadow-premium p-6">
-        <div className="flex flex-wrap items-center gap-2">
+      <div className="bg-surface-card rounded-2xl sm:rounded-3xl border border-surface-border shadow-premium p-3.5 sm:p-5">
+        <div className="flex flex-col lg:flex-row flex-wrap items-stretch lg:items-center gap-3">
 
-          {/* Date Range Group (Always First) */}
-          <div className="flex items-center gap-x-2 flex-[1.8] min-w-[260px]">
+          {/* Quick Period Presets (Dia | Mês | Ano) (WQ-21) */}
+          <div className="inline-flex items-center justify-center sm:justify-start rounded-2xl bg-surface-subtle p-0.5 border border-surface-border shrink-0">
+            <button
+              type="button"
+              onClick={() => handleApplyPreset('dia')}
+              className={`flex-1 sm:flex-initial px-3 py-1.5 text-xs font-black rounded-xl transition-all cursor-pointer text-center ${
+                activePreset === 'dia'
+                  ? 'bg-brand-accent text-white shadow-sm'
+                  : 'text-brand-muted hover:text-brand-primary'
+              }`}
+            >
+              Dia
+            </button>
+            <button
+              type="button"
+              onClick={() => handleApplyPreset('mes')}
+              className={`flex-1 sm:flex-initial px-3 py-1.5 text-xs font-black rounded-xl transition-all cursor-pointer text-center ${
+                activePreset === 'mes'
+                  ? 'bg-brand-accent text-white shadow-sm'
+                  : 'text-brand-muted hover:text-brand-primary'
+              }`}
+            >
+              Mês
+            </button>
+            <button
+              type="button"
+              onClick={() => handleApplyPreset('ano')}
+              className={`flex-1 sm:flex-initial px-3 py-1.5 text-xs font-black rounded-xl transition-all cursor-pointer text-center ${
+                activePreset === 'ano'
+                  ? 'bg-brand-accent text-white shadow-sm'
+                  : 'text-brand-muted hover:text-brand-primary'
+              }`}
+            >
+              Ano
+            </button>
+          </div>
+
+          {/* Date Range Group (com gap explícito e separação garantida dos dropdowns) */}
+          <div className="flex flex-col min-[360px]:flex-row items-center gap-2 shrink-0 w-full sm:w-auto min-[360px]:min-w-[270px]">
             <CustomDatepicker
               value={filters.startDate}
               onChange={(val: string) => setFilters({ ...filters, startDate: val })}
               placeholder="Data inicial"
               size="sm"
             />
-            <span className="text-brand-muted/30 font-black text-[9px] uppercase tracking-widest shrink-0">até</span>
+            <span className="text-black dark:text-slate-200 font-bold text-xs shrink-0 px-0.5">até</span>
             <CustomDatepicker
               value={filters.endDate}
               onChange={(val: string) => setFilters({ ...filters, endDate: val })}
@@ -104,76 +226,105 @@ export default function FilterBar() {
             />
           </div>
 
-          {/* Dropdowns */}
-          <CustomSelect
-            value={filters.teamId}
-            options={[{ value: '', label: 'Equipe' }, ...activeTeams.map(t => ({ value: t.id, label: t.name }))]}
-            onChange={(val: string) => setFilters({ ...filters, teamId: val, agentId: '' })}
-            size="sm"
-          />
-
-          {dashboardRole !== 'suporte' && (
+          {/* Dropdowns com flex-1 e min-w para nunca sobrepor ou colar */}
+          <div className="flex-1 min-w-[130px]">
             <CustomSelect
-              value={filters.agentId}
-              options={[
-                { value: '', label: 'Agentes' },
-                ...activeAgents
-                  .filter(a => !filters.teamId || (a.team_ids && a.team_ids.includes(filters.teamId)))
-                  .map(a => ({ value: a.id, label: a.name }))
-              ]}
-              onChange={(val: string) => setFilters({ ...filters, agentId: val })}
+              value={filters.teamId}
+              aria-label="Equipe do agente"
+              options={[{ value: '', label: 'Equipe do agente' }, ...activeTeams.map(t => ({ value: t.id, label: t.name }))]}
+              onChange={(val: string) => setFilters({ ...filters, teamId: val, agentId: '' })}
               size="sm"
             />
+          </div>
+
+          <div className="flex-1 min-w-[170px]" title="Grupo registrado no atendimento, independentemente da equipe do agente. Os dois filtros combinam-se quando selecionados.">
+            <CustomSelect
+              aria-label="Grupo do atendimento"
+              value={filters.groupId || ''}
+              options={[{ value: '', label: 'Grupo do atendimento' }, ...groupOptions,
+                ...(allMonitorias.some(row => !row.ticket_group_team_id)
+                  ? [{ value: MISSING_TICKET_GROUP, label: 'Grupo não registrado' }] : [])]}
+              onChange={groupId => setFilters({ ...filters, groupId, agentId: '' })}
+              size="sm"
+            />
+          </div>
+
+          {dashboardRole !== 'suporte' && (
+            <div className="flex-1 min-w-[130px]">
+              <CustomSelect
+                value={filters.agentId}
+                options={[
+                  { value: '', label: 'Agentes' },
+                  ...activeAgents
+                    .filter(a => !filters.teamId || (a.team_ids && a.team_ids.includes(filters.teamId)))
+                    .filter(a => !filters.groupId || groupScopedMonitorias.some(row => row.evaluated_id === a.id))
+                    .map(a => ({ value: a.id, label: a.name }))
+                ]}
+                onChange={(val: string) => setFilters({ ...filters, agentId: val })}
+                size="sm"
+              />
+            </div>
           )}
 
           {dashboardRole !== 'suporte' && dashboardRole !== 'qualidade' && dashboardRole !== 'gestor_suporte' && (
-            <CustomSelect
-              value={filters.auditorId}
-              options={[
-                { value: '', label: 'Monitores' },
-                ...activeAuditors.map(a => ({ value: a.id, label: a.name }))
-              ]}
-              onChange={(val: string) => setFilters({ ...filters, auditorId: val })}
-              size="sm"
-            />
+            <div className="flex-1 min-w-[130px]">
+              <CustomSelect
+                value={filters.auditorId}
+                options={[
+                  { value: '', label: 'Monitores' },
+                  ...activeAuditors.map(a => ({ value: a.id, label: a.name }))
+                ]}
+                onChange={(val: string) => setFilters({ ...filters, auditorId: val })}
+                size="sm"
+              />
+            </div>
           )}
 
-          <CustomSelect
-            value={filters.status}
-            options={[
-              { value: '', label: 'Status' },
-              { value: 'pendente_revisao', label: 'Aguardando Revisão' },
-              { value: 'em_contestacao', label: 'Em Reanálise' },
-              { value: 'aguardando_gestor_suporte', label: 'Aguardando Gestor' },
-              { value: 'concluida', label: 'Concluída' },
-              { value: 'contestacao_negada', label: 'Contestação Negada' }
-            ]}
-            onChange={(val: string) => setFilters({ ...filters, status: val })}
-            size="sm"
-          />
+          <div className="flex-1 min-w-[130px]">
+            <CustomSelect
+              value={filters.status}
+              options={[
+                { value: '', label: 'Status' },
+                { value: 'pendente_revisao', label: 'Aguardando Revisão' },
+                { value: 'em_contestacao', label: 'Em Reanálise' },
+                { value: 'aguardando_gestor_suporte', label: 'Aguardando Gestor' },
+                { value: 'concluida', label: 'Concluída' },
+                { value: 'contestacao_negada', label: 'Contestação Negada' }
+              ]}
+              onChange={(val: string) => setFilters({ ...filters, status: val })}
+              size="sm"
+            />
+          </div>
 
-          {/* Action Buttons — animated clean button */}
-          <AnimatePresence>
-            {hasChanged && (
-              <m.div
-                initial={{ width: 0, opacity: 0 }}
-                animate={{ width: 28, opacity: 1 }}
-                exit={{ width: 0, opacity: 0 }}
-                transition={{ duration: 0.2, ease: 'easeInOut' }}
-                className="overflow-hidden flex-shrink-0 flex items-center justify-center"
-              >
-                <button
-                  onClick={handleClear}
-                  className="w-7 h-7 rounded-full bg-functional-error/10 text-functional-error hover:bg-functional-error hover:text-white transition-all flex items-center justify-center shadow-sm cursor-pointer"
-                  title="Limpar filtros"
-                >
-                  <X className="w-3 h-3" />
-                </button>
-              </m.div>
-            )}
-          </AnimatePresence>
         </div>
       </div>
+
+      {isReportOpen && (
+        <ExecutiveReportModal
+          isOpen={isReportOpen}
+          onClose={() => setIsReportOpen(false)}
+          monitorias={groupScopedMonitorias}
+          users={users}
+          teams={teams}
+          forms={forms}
+          initialTeamId={filters.teamId}
+          groupName={selectedGroupName}
+          initialStartDate={filters.startDate}
+          initialEndDate={filters.endDate}
+          currentUser={user}
+        />
+      )}
+
+      {isRootCauseOpen && (
+        <RootCauseAnalyzerModal
+          isOpen={isRootCauseOpen}
+          onClose={() => setIsRootCauseOpen(false)}
+          monitorias={groupScopedMonitorias}
+          forms={forms}
+          feedbacks={feedbacks}
+          teamName={[teams.find(t => t.id === filters.teamId)?.name || 'Operação Global', selectedGroupName && `Grupo: ${selectedGroupName}`].filter(Boolean).join(' · ')}
+        />
+      )}
     </div>
   );
 }

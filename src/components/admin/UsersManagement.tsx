@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { supabase, mockDb } from '../../lib/supabase';
+import { createPortal } from 'react-dom';
+import { supabase, mockDb, requireAccessToken } from '../../lib/supabase';
 import { User, Team, ROLE_LABELS } from '../../types';
 import { 
   Search, 
@@ -20,6 +21,8 @@ import Card from '../ui/Card';
 import Button from '../ui/Button';
 import Badge from '../ui/Badge';
 import CustomSelect from '../ui/CustomSelect';
+import { edgeFunctionErrorMessage } from '../../lib/edgeFunctionError';
+import { ProtectedAuthForm, readCaptchaToken } from '../ui/ProtectedAuthForm';
 
 const getInitials = (name: string) => {
   const parts = name.trim().split(/\s+/);
@@ -39,11 +42,22 @@ export default function UsersManagement({ users, teams, loadData }: UsersManagem
   const [statusFilter, setStatusFilter] = useState<'active' | 'inactive'>('active');
   const [editingUser, setEditingUser] = useState<{ name: string, email: string, role: string, team_ids: string[], primary_team_id?: string, password?: string, id?: string }>({ name: '', email: '', role: 'suporte', team_ids: [], primary_team_id: '', password: '' });
   const [saving, setSaving] = useState(false);
+  const [resetTarget, setResetTarget] = useState<{ name: string; email: string; role: string } | null>(null);
+  const [resetSending, setResetSending] = useState(false);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [teamSearch, setTeamSearch] = useState('');
   const [roleFilter, setRoleFilter] = useState('');
   const [teamFilter, setTeamFilter] = useState('');
+
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('qualitrack:modal', { detail: { open: isModalOpen } }));
+    return () => {
+      if (isModalOpen) {
+        window.dispatchEvent(new CustomEvent('qualitrack:modal', { detail: { open: false } }));
+      }
+    };
+  }, [isModalOpen]);
 
   const filteredUsers = useMemo(() => {
     return users
@@ -70,10 +84,14 @@ export default function UsersManagement({ users, teams, loadData }: UsersManagem
     const toAdd = teamIds.filter(id => !existingTeamIds.includes(id));
     const toRemove = existing.filter((ut: any) => !teamIds.includes(ut.team_id));
 
+    // supabase-js devolve { error } em vez de lançar: sem checar, o vínculo
+    // de equipes falharia em silêncio e o usuário ficaria sem equipe alguma,
+    // sem nenhum aviso na tela.
     if (toRemove.length > 0) {
       const removeIds = toRemove.map((ut: any) => ut.id);
       if (supabase) {
-        await supabase.from('user_teams').delete().in('id', removeIds);
+        const { error } = await supabase.from('user_teams').delete().in('id', removeIds);
+        if (error) throw error;
       } else {
         for (const rid of removeIds) await mockDb.delete('user_teams', rid);
       }
@@ -81,7 +99,8 @@ export default function UsersManagement({ users, teams, loadData }: UsersManagem
     if (toAdd.length > 0) {
       const inserts = toAdd.map(team_id => ({ user_id: userId, team_id }));
       if (supabase) {
-        await supabase.from('user_teams').insert(inserts);
+        const { error } = await supabase.from('user_teams').insert(inserts);
+        if (error) throw error;
       } else {
         for (const ins of inserts) await mockDb.insert('user_teams', ins);
       }
@@ -99,8 +118,11 @@ export default function UsersManagement({ users, teams, loadData }: UsersManagem
         if (!supabase) {
           const payload = { ...editingUser, email: emailLower, active: true, team_ids: teamIds };
           if (editingUser.id) {
-            await mockDb.update('users', editingUser.id, payload);
+            // Mesma ordem do branch Supabase, por consistência (mock não tem
+            // RLS, então aqui não há o mesmo risco, mas o comportamento fica
+            // previsível entre os dois modos).
             await syncUserTeams(editingUser.id, teamIds);
+            await mockDb.update('users', editingUser.id, payload);
           } else {
             const newUser = await mockDb.insert('users', { ...payload, id: emailLower });
             await syncUserTeams(newUser.data.id, teamIds);
@@ -108,7 +130,8 @@ export default function UsersManagement({ users, teams, loadData }: UsersManagem
           return;
         }
 
-        await supabase.auth.getSession();
+        // Falha cedo e com mensagem util se a sessao tiver expirado.
+        const accessToken = await requireAccessToken();
 
         const userPayload = {
           name: editingUser.name,
@@ -121,13 +144,40 @@ export default function UsersManagement({ users, teams, loadData }: UsersManagem
         const operation = (async () => {
           let userId = editingUser.id;
           if (editingUser.id) {
+            // E-mail muda o login de verdade (auth.users), não só o cadastro
+            // (public.users) — precisa passar pela Edge Function com service
+            // role. Feito ANTES do resto: se falhar (ex.: e-mail já em uso
+            // por outra conta), a operação para aqui sem deixar nome/papel/
+            // equipe já parcialmente salvos com o e-mail errado ainda exibido.
+            const originalEmail = users.find(u => u.id === editingUser.id)?.email?.toLowerCase();
+            if (originalEmail && originalEmail !== emailLower) {
+              const { data: emailData, error: emailFuncError } = await supabase.functions.invoke('admin-update-user-email', {
+                headers: { Authorization: `Bearer ${accessToken}` },
+                body: { id: editingUser.id, email: emailLower }
+              });
+              if (emailFuncError) throw new Error(await edgeFunctionErrorMessage(emailFuncError, 'Falha ao atualizar e-mail.'));
+              if (emailData?.success === false) throw new Error(emailData.error || 'Falha ao atualizar e-mail.');
+            }
+
+            // Ordem importa: user_teams_insert/update/delete autorizam por
+            // role de QUEM CHAMA no momento da chamada (admin/gestor_*), não
+            // por quem era antes. Se alguém se auto-editar rebaixando o
+            // próprio papel (ex.: admin -> qualidade) e a atualização de role
+            // for commitada primeiro, o sync de equipes que vem depois já
+            // roda como o papel novo — e falha com RLS se o papel novo não
+            // tiver permissão de escrita em user_teams. Sincronizar equipes
+            // ANTES da troca de role evita essa auto-exclusão a meio da
+            // própria operação.
+            await syncUserTeams(editingUser.id, teamIds);
             const { error } = await supabase.from('users').update(userPayload).eq('id', editingUser.id);
             if (error) throw error;
-            await syncUserTeams(editingUser.id, teamIds);
           } else {
-            const { data, error: funcError } = await supabase.functions.invoke('admin-invite-user', { body: { ...userPayload, team_ids: teamIds } });
-            if (funcError) throw funcError;
-            if (data?.success === false) throw new Error(data.details?.message || 'Erro ao convidar usuário');
+            const { data, error: funcError } = await supabase.functions.invoke('admin-invite-user', {
+              headers: { Authorization: `Bearer ${accessToken}` },
+              body: { ...userPayload, team_ids: teamIds }
+            });
+            if (funcError) throw new Error(await edgeFunctionErrorMessage(funcError, 'Falha ao convidar usuário.'));
+            if (data?.success === false) throw new Error(data.error || 'Falha ao convidar usuário.');
             userId = data?.user?.id || null;
             if (userId) await syncUserTeams(userId, teamIds);
           }
@@ -163,26 +213,46 @@ export default function UsersManagement({ users, teams, loadData }: UsersManagem
     }
   };
 
-  const handleResetPassword = async (email: string) => {
+  const handleResetPassword = async (event: React.FormEvent<HTMLFormElement>) => {
+    if (!resetTarget || resetSending) return;
+    setResetSending(true);
     try {
       if (!supabase) {
-        toast.info(`[MOCK] Email de recuperação enviado para ${email}`);
+        toast.info(`[MOCK] Email de recuperação enviado para ${resetTarget.email}`);
+        setResetTarget(null);
         return;
       }
-      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      const captchaToken = readCaptchaToken(event);
+      const { error } = await supabase.auth.resetPasswordForEmail(resetTarget.email, {
         redirectTo: window.location.origin,
+        captchaToken,
       });
       if (error) throw error;
       toast.success('Email de recuperação enviado!');
-    } catch (e: any) {
-      toast.error('Não foi possível enviar o email de recuperação.');
+      setResetTarget(null);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : '';
+      if (/rate limit|too many requests|security purposes/i.test(message)) {
+        toast.error('Limite temporário de envios atingido. Aguarde um minuto e tente novamente.');
+      } else if (/captcha|verificação de segurança/i.test(message)) {
+        toast.error('Confirme a verificação de segurança e tente novamente.');
+      } else if (/smtp|sending.*email|email.*sending/i.test(message)) {
+        toast.error('O serviço de e-mail não conseguiu enviar a recuperação. Verifique a configuração SMTP do Supabase Auth.');
+      } else {
+        toast.error(message || 'Não foi possível enviar o e-mail de recuperação.');
+      }
+    } finally {
+      setResetSending(false);
     }
   };
 
   const handleToggleStatus = async (id: string, active: boolean) => {
     try {
       if (!supabase) await mockDb.update('users', id, { active });
-      else await supabase.from('users').update({ active }).eq('id', id);
+      else {
+        const { error } = await supabase.from('users').update({ active }).eq('id', id);
+        if (error) throw error;
+      }
       toast.success(active ? 'Usuário reativado!' : 'Usuário desativado!');
       setDeleteConfirmId(null);
       loadData();
@@ -337,8 +407,9 @@ export default function UsersManagement({ users, teams, loadData }: UsersManagem
                     ) : (
                       <>
                         <button 
-                          onClick={() => handleResetPassword(u.email)} 
+                          onClick={() => setResetTarget({ name: u.name, email: u.email, role: u.role })}
                           title="Reenviar Senha"
+                          aria-label={`Enviar redefinição de senha para ${u.name}`}
                           className="group p-2.5 rounded-lg hover:bg-brand-subtle text-brand-muted hover:text-brand-primary transition-all duration-200 cursor-pointer"
                         >
                           <Key className="w-4 h-4 transition-transform duration-200 group-hover:scale-110" />
@@ -385,10 +456,40 @@ export default function UsersManagement({ users, teams, loadData }: UsersManagem
         </table>
       </Card>
 
-      <AnimatePresence>
+      {createPortal(
+        <AnimatePresence>
+          {resetTarget && (
+            <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/75 p-4 backdrop-blur-xs" role="dialog" aria-modal="true" aria-label="Redefinir senha">
+              <Card className="w-full max-w-md border border-surface-border shadow-2xl">
+                <div className="mb-5 flex items-start justify-between gap-4">
+                  <div>
+                    <h3 className="text-lg font-black text-brand-primary">Enviar redefinição de senha</h3>
+                    <p className="mt-1 text-xs text-brand-muted">Um link de recuperação será enviado para {resetTarget.name}.</p>
+                  </div>
+                  <button type="button" onClick={() => setResetTarget(null)} aria-label="Fechar" className="text-brand-muted hover:text-brand-primary"><X className="size-5" /></button>
+                </div>
+                <p className="mb-4 break-all rounded-xl bg-surface-subtle px-3 py-2 text-sm text-brand-primary">{resetTarget.email}</p>
+                {resetTarget.role === 'suporte' && (
+                  <p className="mb-4 text-xs text-brand-muted">O acesso dos Agentes de Atendimento ao sistema está temporariamente suspenso.</p>
+                )}
+                <ProtectedAuthForm onSubmit={handleResetPassword} className="space-y-4">
+                  <div className="flex justify-end gap-2">
+                    <Button type="button" variant="outline" onClick={() => setResetTarget(null)}>Cancelar</Button>
+                    <Button type="submit" disabled={resetSending}>{resetSending ? 'Enviando...' : 'Enviar e-mail'}</Button>
+                  </div>
+                </ProtectedAuthForm>
+              </Card>
+            </div>
+          )}
+        </AnimatePresence>,
+        document.body
+      )}
+
+      {createPortal(
+        <AnimatePresence>
         {isModalOpen && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
-            <Card className="max-w-md w-full animate-in zoom-in-95 duration-200">
+          <div className="fixed inset-0 z-[9999] flex items-center justify-center p-2 sm:p-4 md:p-6 bg-black/75 backdrop-blur-xs animate-fade-in">
+            <Card className="max-w-md w-full max-h-[92vh] flex flex-col shadow-2xl overflow-y-auto no-scrollbar border border-surface-border">
               <header className="flex items-center justify-between mb-6">
                 <h3 className="text-xl font-black text-brand-primary tracking-tight uppercase">{editingUser.id ? 'Editar Usuário' : 'Novo Usuário'}</h3>
                 <button onClick={() => { setIsModalOpen(false); setTeamSearch(''); }} className="text-brand-muted hover:text-brand-primary"><X className="w-6 h-6" /></button>
@@ -401,7 +502,12 @@ export default function UsersManagement({ users, teams, loadData }: UsersManagem
                 </div>
                 <div className="flex flex-col gap-1">
                   <label className="text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400 font-semibold mb-1.5 ml-0.5 block">Email</label>
-                  <input type="email" disabled={!!editingUser.id} className="w-full bg-white dark:bg-slate-900/40 border border-slate-200 dark:border-slate-800 rounded-lg py-2 px-3 text-sm font-medium text-slate-900 dark:text-slate-50 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:border-slate-400 dark:focus:border-slate-600 focus:outline-none focus:ring-0 transition-all shadow-sm disabled:opacity-50" value={editingUser.email} onChange={e => setEditingUser({ ...editingUser, email: e.target.value.toLowerCase() })} />
+                  <input type="email" className="w-full bg-white dark:bg-slate-900/40 border border-slate-200 dark:border-slate-800 rounded-lg py-2 px-3 text-sm font-medium text-slate-900 dark:text-slate-50 placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:border-slate-400 dark:focus:border-slate-600 focus:outline-none focus:ring-0 transition-all shadow-sm" value={editingUser.email} onChange={e => setEditingUser({ ...editingUser, email: e.target.value.toLowerCase() })} />
+                  {editingUser.id && (
+                    <p className="text-[10px] font-semibold text-brand-muted mt-1">
+                      Alterar o e-mail troca o login da pessoa imediatamente (não precisa de confirmação por e-mail).
+                    </p>
+                  )}
                 </div>
                 <CustomSelect 
                   label="Perfil"
@@ -501,7 +607,9 @@ export default function UsersManagement({ users, teams, loadData }: UsersManagem
             </Card>
           </div>
         )}
-      </AnimatePresence>
+        </AnimatePresence>,
+        document.body
+      )}
     </div>
   );
 }

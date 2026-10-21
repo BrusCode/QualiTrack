@@ -1,6 +1,9 @@
 import { useState, useMemo } from 'react';
 import { MonitoriaStatus, User } from '../types';
 
+export type MonitoriaSortField = 'created_at' | 'score' | 'action_deadline_at';
+export type MonitoriaSortDirection = 'asc' | 'desc';
+
 const DEFAULT_START_DATE = () => new Date(Date.now() - 30 * 24 * 3600000).toISOString().split('T')[0];
 const DEFAULT_END_DATE = () => new Date().toISOString().split('T')[0];
 
@@ -11,21 +14,25 @@ export function useMonitoriaFilters() {
   const [teamFilter, setTeamFilter] = useState<string>('');
   const [suporteFilter, setSuporteFilter] = useState<string>('');
   const [auditorFilter, setAuditorFilter] = useState<string>('');
+  const [ticketKindFilter, setTicketKindFilter] = useState<'all' | 'child' | 'service'>('all');
   const [dateType, setDateType] = useState<'analysis' | 'ticket'>('analysis');
   const [startDate, setStartDate] = useState(DEFAULT_START_DATE);
   const [endDate, setEndDate] = useState(DEFAULT_END_DATE);
+  const [sortField, setSortField] = useState<MonitoriaSortField>('created_at');
+  const [sortDirection, setSortDirection] = useState<MonitoriaSortDirection>('desc');
 
   const hasActiveFilters = useMemo(() => {
     const isDefaultDate = startDate === DEFAULT_START_DATE() &&
       endDate === DEFAULT_END_DATE();
-    return search !== '' || teamFilter !== '' || suporteFilter !== '' || auditorFilter !== '' || !isDefaultDate || statusFilter !== 'active';
-  }, [search, teamFilter, suporteFilter, auditorFilter, startDate, endDate, statusFilter]);
+    return search !== '' || teamFilter !== '' || suporteFilter !== '' || auditorFilter !== '' || ticketKindFilter !== 'all' || !isDefaultDate || statusFilter !== 'active';
+  }, [search, teamFilter, suporteFilter, auditorFilter, ticketKindFilter, startDate, endDate, statusFilter]);
 
   const clearFilters = () => {
     setSearch('');
     setTeamFilter('');
     setSuporteFilter('');
     setAuditorFilter('');
+    setTicketKindFilter('all');
     setStatusFilter('active');
     setStartDate(DEFAULT_START_DATE());
     setEndDate(DEFAULT_END_DATE());
@@ -39,9 +46,12 @@ export function useMonitoriaFilters() {
     teamFilter, setTeamFilter,
     suporteFilter, setSuporteFilter,
     auditorFilter, setAuditorFilter,
+    ticketKindFilter, setTicketKindFilter,
     dateType, setDateType,
     startDate, setStartDate,
     endDate, setEndDate,
+    sortField, setSortField,
+    sortDirection, setSortDirection,
     hasActiveFilters,
     clearFilters,
   };

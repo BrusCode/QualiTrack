@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import { supabase, mockDb } from '../../lib/supabase';
 import { User, Team, EvaluationForm, FormSection, Question } from '../../types';
 import { 
@@ -24,6 +25,7 @@ import Card from '../ui/Card';
 import Button from '../ui/Button';
 import Badge from '../ui/Badge';
 import CustomSelect from '../ui/CustomSelect';
+import { isChildFormId } from '../../lib/childTicketForm';
 
 interface FormsManagementProps {
   currentUser: User | null;
@@ -34,7 +36,7 @@ interface FormsManagementProps {
 export default function FormsManagement({ currentUser, teams, loadData }: FormsManagementProps) {
   const [forms, setForms] = useState<EvaluationForm[]>([]);
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [editingForm, setEditingForm] = useState<Partial<EvaluationForm>>({ title: '', description: '', team_id: '', sections: [], critical_errors: [] });
+  const [editingForm, setEditingForm] = useState<Partial<EvaluationForm>>({ title: '', description: '', team_id: '', team_ids: [], sections: [], critical_errors: [] });
   const [saving, setSaving] = useState(false);
   const [statusFilter, setStatusFilter] = useState<'active' | 'inactive'>('active');
   const [searchTerm, setSearchTerm] = useState('');
@@ -45,6 +47,15 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
   const [draftRecoveredOrDismissed, setDraftRecoveredOrDismissed] = useState(false);
   const lastSavedDraftRef = React.useRef<string | null>(null);
   const recoveringDraftRef = React.useRef(false);
+
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('qualitrack:modal', { detail: { open: isModalOpen } }));
+    return () => {
+      if (isModalOpen) {
+        window.dispatchEvent(new CustomEvent('qualitrack:modal', { detail: { open: false } }));
+      }
+    };
+  }, [isModalOpen]);
 
   // Auto-save logic with strict comparison to prevent immediate draft re-write
   useEffect(() => {
@@ -98,7 +109,51 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
 
   const loadForms = async () => {
     const res = supabase ? await supabase.from('forms').select('*') : await mockDb.get('forms');
-    setForms(res.data || []);
+    // Sem isto, uma falha de leitura virava "nenhum formulário cadastrado" —
+    // indistinguível de uma base realmente vazia.
+    if (res.error) {
+      console.error('[Forms] Falha ao carregar:', res.error);
+      toast.error('Não foi possível carregar os formulários: ' + res.error.message);
+      return;
+    }
+    const list: EvaluationForm[] = res.data || [];
+
+    if (supabase && list.length > 0) {
+      const { data: links } = await supabase
+        .from('form_teams')
+        .select('form_id, team_id')
+        .in('form_id', list.map(f => f.id));
+      const byForm = new Map<string, string[]>();
+      (links || []).forEach((l: any) => {
+        byForm.set(l.form_id, [...(byForm.get(l.form_id) || []), l.team_id]);
+      });
+      setForms(list.map(f => ({ ...f, team_ids: byForm.get(f.id) || [] })));
+    } else {
+      // Mock mode não tem form_teams; cai no legado de uma equipe só.
+      setForms(list.map(f => ({ ...f, team_ids: f.team_id ? [f.team_id] : [] })));
+    }
+  };
+
+  // Espelha syncUserTeams (UsersManagement.tsx): calcula o diff entre o
+  // vínculo atual em form_teams e o selecionado na tela, e aplica só a
+  // diferença — evita apagar e recriar tudo a cada salvamento.
+  const syncFormTeams = async (formId: string, teamIds: string[]) => {
+    if (!supabase) return; // mock mode: sem tabela form_teams, nada a sincronizar
+    const { data: existing } = await supabase.from('form_teams').select('id, team_id').eq('form_id', formId);
+    const existingTeamIds = (existing || []).map((ft: any) => ft.team_id);
+    const toAdd = teamIds.filter(id => !existingTeamIds.includes(id));
+    const toRemove = (existing || []).filter((ft: any) => !teamIds.includes(ft.team_id));
+
+    // supabase-js devolve { error } em vez de lançar: sem checar, o vínculo
+    // de equipes falharia em silêncio e o formulário salvaria "sem equipe".
+    if (toRemove.length > 0) {
+      const { error } = await supabase.from('form_teams').delete().in('id', toRemove.map((ft: any) => ft.id));
+      if (error) throw error;
+    }
+    if (toAdd.length > 0) {
+      const { error } = await supabase.from('form_teams').insert(toAdd.map(team_id => ({ form_id: formId, team_id })));
+      if (error) throw error;
+    }
   };
 
   useEffect(() => {
@@ -108,7 +163,10 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
   const handleToggleStatus = async (id: string, active: boolean) => {
     try {
       if (!supabase) await mockDb.update('forms', id, { active });
-      else await supabase.from('forms').update({ active }).eq('id', id);
+      else {
+        const { error } = await supabase.from('forms').update({ active }).eq('id', id);
+        if (error) throw error;
+      }
       toast.success(active ? 'Formulário ativado!' : 'Formulário desativado!');
       setDeleteConfirmId(null);
       loadForms();
@@ -118,25 +176,41 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
   const handleSaveForm = async () => {
     if (!editingForm.title || !editingForm.sections?.length) return toast.error('Por favor, preencha o título e as seções do formulário.');
     setSaving(true);
-    const executeWithRetry = async (retryCount = 0): Promise<void> => {
+    const teamIds = editingForm.team_ids || [];
+    // forms.team_id (coluna legada, uma equipe só) é mantida em sincronia com
+    // a primeira equipe selecionada — nenhum código lê team_id além deste
+    // componente hoje, mas evita deixar a coluna obsoleta com lixo antigo.
+    const legacyTeamId = teamIds[0] || null;
+
+    const executeWithRetry = async (retryCount = 0): Promise<string | undefined> => {
       try {
+        // forms.created_by é UUID REFERENCES users(id) — gravar o e-mail aqui
+        // fazia o Postgres recusar com
+        //   invalid input syntax for type uuid: "fulano@empresa.com.br"
+        // impedindo salvar qualquer formulário.
+        const { team_ids: _omit, ...rest } = editingForm;
+        const payload = { ...rest, active: true, created_by: currentUser?.id, team_id: legacyTeamId };
+
         if (!supabase) {
-          const payload = { ...editingForm, active: true, created_by: currentUser?.email };
-          if (editingForm.id) await mockDb.update('forms', editingForm.id, payload);
-          else await mockDb.insert('forms', payload);
-          return;
+          if (editingForm.id) { await mockDb.update('forms', editingForm.id, payload); return editingForm.id; }
+          const { data } = await mockDb.insert('forms', payload);
+          return data?.id;
         }
 
         await supabase.auth.getSession();
-        const payload = { ...editingForm, active: true, created_by: currentUser?.email };
 
-        const operation = (async () => {
-          const { error } = await supabase.from('forms').upsert([{ ...(editingForm.id ? { id: editingForm.id } : {}), ...payload }]);
+        const operation = (async (): Promise<string | undefined> => {
+          const { data, error } = await supabase
+            .from('forms')
+            .upsert([{ ...(editingForm.id ? { id: editingForm.id } : {}), ...payload }])
+            .select('id')
+            .single();
           if (error) throw error;
+          return data?.id;
         })();
 
-        const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 15000));
-        await Promise.race([operation, timeoutPromise]);
+        const timeoutPromise = new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 15000));
+        return await Promise.race([operation, timeoutPromise]);
       } catch (err: any) {
         if (err.message === 'timeout' && retryCount < 2) {
           await new Promise(res => setTimeout(res, 1000 * (retryCount + 1)));
@@ -147,17 +221,18 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
     };
 
     try {
-      await executeWithRetry();
+      const formId = await executeWithRetry();
+      if (formId) await syncFormTeams(formId, teamIds);
       toast.success('Formulário salvo com sucesso!');
       clearDraft();
       setIsModalOpen(false);
       loadForms();
       loadData();
-    } catch (e: any) { 
+    } catch (e: any) {
       console.error('Erro definitivo ao salvar formulário:', e);
       toast.error(e.message === 'timeout' ? 'O servidor não respondeu. Seu rascunho continua salvo localmente.' : (e.message || 'Não foi possível salvar o formulário.'));
-    } finally { 
-      setSaving(false); 
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -224,12 +299,15 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
   const totalWeight = useMemo(() => {
     return (editingForm.sections || []).reduce((acc, s) => acc + (Number(s.weight) || 0), 0);
   }, [editingForm.sections]);
+  const isChildForm = isChildFormId(editingForm.id);
 
   const isValid = useMemo(() => {
-    return totalWeight === 100 && 
-           !(editingForm.sections || []).some(s => (Number(s.weight) || 0) <= 0) &&
-           !(editingForm.sections || []).some(s => !s.questions || s.questions.length === 0);
-  }, [totalWeight, editingForm.sections]);
+    const hasCriteria = Boolean(editingForm.sections?.length)
+      && !(editingForm.sections || []).some(s => !s.questions || s.questions.length === 0);
+    if (isChildFormId(editingForm.id)) return hasCriteria;
+    return totalWeight === 100 &&
+      !(editingForm.sections || []).some(s => (Number(s.weight) || 0) <= 0) && hasCriteria;
+  }, [editingForm.id, editingForm.sections, totalWeight]);
 
   return (
     <div className="space-y-6">
@@ -257,7 +335,7 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
         <div className="flex gap-2">
         <Button 
           onClick={() => { 
-            setEditingForm({ title: '', description: '', team_id: '', sections: [], critical_errors: [] }); 
+            setEditingForm({ title: '', description: '', team_id: '', team_ids: [], sections: [], critical_errors: [] }); 
             setDraftRecoveredOrDismissed(false);
             setShowDraftBanner(!!localStorage.getItem('qualitrack_form_draft')); 
             setIsModalOpen(true); 
@@ -280,7 +358,13 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
                 </div>
                 <div onClick={() => { setEditingForm(f); setIsModalOpen(true); }} className="cursor-pointer">
                   <h4 className="font-black text-brand-primary uppercase tracking-tight">{f.title}</h4>
-                  <Badge variant="neutral">{f.team_id ? teams.find(t => t.id === f.team_id)?.name : 'Geral'}</Badge>
+                  <div className="flex flex-wrap gap-1.5">
+                    {(f.team_ids && f.team_ids.length > 0)
+                      ? f.team_ids.map(tid => (
+                          <Badge key={tid} variant="neutral">{teams.find(t => t.id === tid)?.name || '—'}</Badge>
+                        ))
+                      : <Badge variant="neutral">Geral</Badge>}
+                  </div>
                 </div>
               </div>
               <div className="flex gap-1">
@@ -304,18 +388,19 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
             <div onClick={() => { setEditingForm(f); setIsModalOpen(true); }} className="cursor-pointer">
               <p className="text-xs text-brand-muted line-clamp-2 mb-4">{f.description}</p>
               <div className="flex items-center gap-4">
-                <span className="text-[10px] font-black uppercase text-slate-500 dark:text-slate-300">{f.sections.length} Pilares</span>
-                <span className="text-[10px] font-black uppercase text-slate-500 dark:text-emerald-400">Peso Total: {f.sections.reduce((acc, s) => acc + (s.weight || 0), 0)}%</span>
+                <span className="text-[10px] font-black uppercase text-slate-500 dark:text-slate-300">{(f.sections || []).length} Pilares</span>
+                {!isChildFormId(f.id) && <span className="text-[10px] font-black uppercase text-slate-500 dark:text-emerald-400">Peso Total: {(f.sections || []).reduce((acc, s) => acc + (s.weight || 0), 0)}%</span>}
               </div>
             </div>
           </Card>
         ))}
       </div>
 
-      <AnimatePresence>
+      {createPortal(
+        <AnimatePresence>
         {isModalOpen && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm">
-            <m.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }} className="max-w-3xl w-full min-h-[600px] h-[650px] max-h-[90vh] overflow-hidden flex flex-col bg-surface-card border border-surface-border rounded-[32px] shadow-2xl">
+          <div className="fixed inset-0 z-[9999] flex items-center justify-center p-2 sm:p-4 md:p-6 bg-black/75 backdrop-blur-xs animate-fade-in">
+            <m.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }} className="max-w-3xl w-full min-h-[600px] h-[92vh] max-h-[92vh] overflow-hidden flex flex-col bg-surface-card border border-surface-border rounded-2xl shadow-2xl">
               <header className="flex items-center justify-between p-6 border-b border-surface-border bg-surface-card sticky top-0 z-10">
                 <div className="flex items-center gap-4">
                   <div className="w-11 h-11 rounded-xl bg-surface-subtle flex items-center justify-center text-brand-primary">
@@ -324,10 +409,12 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
                   <div>
                     <h3 className="text-lg font-black text-brand-primary tracking-tight uppercase">Editor de Formulário</h3>
                     <div className="flex items-center gap-2 mt-0.5">
-                      <span className={`px-2 py-0.5 rounded-md text-[9px] font-black uppercase tracking-widest ${totalWeight === 100 ? 'bg-functional-success text-functional-success' : 'bg-functional-warning text-functional-warning'}`}>
-                        Peso Total: {totalWeight}% {totalWeight !== 100 && '(Incompleto)'}
-                      </span>
-                      <span className="text-brand-muted opacity-30">•</span>
+                      {!isChildForm && <>
+                        <span className={`px-2 py-0.5 rounded-md text-[9px] font-black uppercase tracking-widest ${totalWeight === 100 ? 'bg-functional-success text-functional-success' : 'bg-functional-warning text-functional-warning'}`}>
+                          Peso Total: {totalWeight}% {totalWeight !== 100 && '(Incompleto)'}
+                        </span>
+                        <span className="text-brand-muted opacity-30">•</span>
+                      </>}
                       <p className="text-[10px] font-bold text-brand-muted uppercase tracking-widest">{editingForm.title || 'Novo Formulário'}</p>
                     </div>
                   </div>
@@ -377,12 +464,39 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
                           />
                         </div>
                         <div className="flex flex-col">
-                          <label className="uppercase tracking-widest text-[10px] font-black text-brand-muted opacity-80 dark:opacity-70 mb-1.5 ml-0.5 block">Equipe Vinculada</label>
-                          <CustomSelect 
-                            value={editingForm.team_id || ''} 
-                            onChange={val => setEditingForm({...editingForm, team_id: val})} 
-                            options={[{ value: '', label: 'Geral (Todas as Equipes)' }, ...teams.map(t => ({ value: t.id, label: t.name }))]} 
-                          />
+                          <label className="uppercase tracking-widest text-[10px] font-black text-brand-muted opacity-80 dark:opacity-70 mb-1.5 ml-0.5 block">
+                            Equipes Vinculadas
+                          </label>
+                          <p className="text-[10px] text-brand-muted mb-2 ml-0.5 leading-relaxed">
+                            Marque uma ou mais. Nenhuma marcada = formulário geral, disponível para todas as equipes.
+                          </p>
+                          <div className="flex flex-col gap-1 px-4 pb-4 pt-3 bg-white dark:bg-surface-bg border border-surface-border rounded-lg max-h-40 overflow-y-auto scrollbar-thin">
+                            {teams.map(t => {
+                              const checked = (editingForm.team_ids || []).includes(t.id);
+                              return (
+                                <label key={t.id} className="flex items-center gap-3 py-2.5 px-1 cursor-pointer group">
+                                  <input
+                                    type="checkbox"
+                                    className="w-4 h-4 rounded border-surface-border text-brand-primary focus:ring-brand-accent/20 focus:ring-offset-0 accent-brand-primary transition-all cursor-pointer"
+                                    checked={checked}
+                                    onChange={e => {
+                                      const current = editingForm.team_ids || [];
+                                      const next = e.target.checked
+                                        ? [...current, t.id]
+                                        : current.filter(id => id !== t.id);
+                                      setEditingForm({ ...editingForm, team_ids: next });
+                                    }}
+                                  />
+                                  <span className="text-[11px] font-bold text-brand-primary uppercase tracking-wide group-hover:opacity-80 transition-opacity">
+                                    {t.name}
+                                  </span>
+                                </label>
+                              );
+                            })}
+                            {teams.length === 0 && (
+                              <p className="text-[10px] font-bold text-brand-muted uppercase italic p-2 text-center">Nenhuma equipe cadastrada.</p>
+                            )}
+                          </div>
                         </div>
                         <div className="flex flex-col">
                           <label className="uppercase tracking-widest text-[10px] font-black text-brand-muted opacity-80 dark:opacity-70 mb-1.5 ml-0.5 block">Descrição do Propósito</label>
@@ -403,7 +517,7 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
                     <div className="flex items-center justify-between">
                       <div>
                         <h4 className="text-sm font-black text-brand-primary uppercase tracking-widest">Definição da Estrutura</h4>
-                        <p className="text-[10px] font-bold text-brand-muted uppercase mt-1">Crie os pilares de avaliação e distribua os pesos.</p>
+                        <p className="text-[10px] font-bold text-brand-muted uppercase mt-1">{isChildForm ? 'Critérios do manual, avaliados individualmente como sim ou não.' : 'Crie os pilares de avaliação e distribua os pesos.'}</p>
                       </div>
                     </div>
                     
@@ -422,7 +536,7 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
                               />
                             </div>
                             <div className="flex items-center gap-4">
-                              <div className="flex flex-col items-end">
+                              {!isChildForm && <div className="flex flex-col items-end">
                                 <label className="uppercase tracking-widest text-[10px] font-black text-brand-muted opacity-80 dark:opacity-70 mb-1.5 block">Peso do Pilar</label>
                                 <div className="flex items-center gap-1.5">
                                   <input 
@@ -434,7 +548,7 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
                                   />
                                   <span className="text-xs font-bold text-brand-muted">%</span>
                                 </div>
-                              </div>
+                              </div>}
                               <button onClick={() => removeSection(section.id)} className="p-2 rounded-lg hover:bg-surface-subtle text-brand-muted opacity-40 hover:opacity-100 hover:text-error transition-all cursor-pointer"><Trash2 className="w-4 h-4" /></button>
                             </div>
                           </div>
@@ -455,11 +569,11 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
                                       onChange={e => updateQuestion(section.id, q.id, 'text', e.target.value)}
                                       placeholder="Ex: Utilizou a saudação padrão corretamente?"
                                     />
-                                    <div className="flex items-center gap-4 mt-1">
+                                    {!isChildForm && <div className="flex items-center gap-4 mt-1">
                                       <span className="text-[10px] font-bold text-brand-muted opacity-80 dark:opacity-60 uppercase tracking-wider">Peso no Pilar: {itemWeightInPilar}%</span>
                                       <span className="text-brand-muted opacity-30">•</span>
                                       <span className="text-[10px] font-bold text-brand-muted opacity-80 dark:opacity-60 uppercase tracking-wider">Impacto Global: {itemImpactInTotal}%</span>
-                                    </div>
+                                    </div>}
                                     {expandedDescriptions[q.id] && (
                                       <div className="mt-2.5">
                                         <textarea
@@ -532,11 +646,11 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
                       <div>
                         <h4 className="text-sm font-black text-error uppercase tracking-widest flex items-center gap-2">
                           <AlertOctagon className="w-5 h-5" />
-                          Erros Críticos (Zeradores)
+                          Pontos de Atenção para Revisão
                         </h4>
-                        <p className="text-[10px] font-bold text-brand-muted dark:text-brand-muted/80 uppercase mt-1">Itens que, se marcados como 'NÃO', zeram automaticamente a monitoria.</p>
+                        <p className="text-[10px] font-bold text-brand-muted dark:text-brand-muted/80 uppercase mt-1">Sinalizam itens para análise humana. Não zeram nem alteram a pontuação.</p>
                       </div>
-                      <Button variant="outline" size="sm" onClick={addCriticalError} icon={<Plus className="w-4 h-4" />} className="border-error text-error hover:bg-level-ruim hover:border-error">Novo Erro Crítico</Button>
+                      <Button variant="outline" size="sm" onClick={addCriticalError} icon={<Plus className="w-4 h-4" />} className="border-error text-error hover:bg-level-ruim hover:border-error">Novo Ponto de Atenção</Button>
                     </div>
 
                     <div className="grid grid-cols-1 gap-4">
@@ -571,6 +685,17 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
                 {/* EXTREMA ESQUERDA: Status/Alerta do Peso */}
                 <div className="flex-1 flex items-center justify-start min-w-[200px]">
                   {(() => {
+                    if (isChildForm) return (editingForm.sections || []).some(s => !s.questions?.length) ? (
+                      <div className="flex items-center gap-2 text-error animate-pulse">
+                        <AlertTriangle className="w-4 h-4" />
+                        <span className="text-[10px] font-black uppercase tracking-widest">Cada pilar precisa de pelo menos um critério</span>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-2 text-success">
+                        <Check className="w-4 h-4" />
+                        <span className="text-[10px] font-black uppercase tracking-widest">Critérios válidos</span>
+                      </div>
+                    );
                     if (totalWeight !== 100) return (
                       <div className="flex items-center gap-2 text-error animate-pulse">
                         <AlertTriangle className="w-4 h-4" />
@@ -633,7 +758,9 @@ export default function FormsManagement({ currentUser, teams, loadData }: FormsM
             </m.div>
           </div>
         )}
-      </AnimatePresence>
+        </AnimatePresence>,
+        document.body
+      )}
     </div>
   );
 }

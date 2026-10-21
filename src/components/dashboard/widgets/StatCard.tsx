@@ -1,9 +1,13 @@
 import React, { useState } from 'react';
+import { Info } from 'lucide-react';
 import Card from '../../ui/Card';
 import { m, AnimatePresence } from 'motion/react';
-import { useDashboard, usePresence, useEditing } from '../DashboardContext';
+import { useDashboard, useEditing } from '../DashboardContext';
+import { usePresence } from '../../../providers/PresenceProvider';
 import { useQualityConfig } from '../../../lib/useQualityConfig';
 import { toast } from 'sonner';
+import { User } from '../../../types';
+import { withDashboardTile } from '../DashboardTileLayout';
 
 interface StatCardProps {
   title: string;
@@ -20,7 +24,19 @@ interface StatCardProps {
   setActiveEditingId?: (id: string | null) => void;
   valueColorClass?: string;
   onlineUsersOverride?: any[];
+  methodology?: string;
+  comparisonDelta?: { value: number; label?: string };
 }
+
+const DEFAULT_METHODOLOGIES: Record<string, string> = {
+  'Média Geral': 'Média aritmética simples das notas de todas as monitorias avaliadas no período selecionado.',
+  'Nota Média Geral': 'Média acumulada de todas as monitorias concluídas de todas as equipes no período.',
+  'Nota Média Individual': 'Média aritmética das notas obtidas pelo avaliado nas monitorias do período.',
+  'Índice de Excelência': 'Percentual de avaliações que atingiram nota na faixa Excelente em relação ao total.',
+  'Taxa de Reversão': 'Percentual de contestações com parecer Deferido sobre o total de contestações analisadas.',
+  'Taxa de Contestação': 'Percentual de monitorias que foram contestadas em relação ao total de monitorias.',
+  'Taxa de Conformidade': 'Percentual de monitorias que atingiram pontuação igual ou superior à meta de qualidade.',
+};
 
 const BG_MAP: Record<string, string> = {
   'text-functional-error': 'bg-functional-error',
@@ -53,7 +69,7 @@ function getIconBg(accent: string): string {
   return 'bg-slate-100 dark:bg-white/[0.04]';
 }
 
-export default function StatCard({ 
+function StatCard({
   title, 
   value, 
   sub, 
@@ -66,8 +82,11 @@ export default function StatCard({
   activeEditingId,
   setActiveEditingId,
   valueColorClass,
-  onlineUsersOverride
+  onlineUsersOverride,
+  methodology,
+  comparisonDelta,
 }: StatCardProps) {
+  const resolvedMethodology = methodology || DEFAULT_METHODOLOGIES[title];
   const { config, saveConfig } = useQualityConfig();
   
   let dashboardContext = null;
@@ -82,6 +101,7 @@ export default function StatCard({
   }
   const user = dashboardContext?.user;
   const onlineUsers = onlineUsersOverride || presenceContext?.onlineUsers || [];
+  const terminateSession = presenceContext?.terminateSession;
 
   const iconBg = getIconBg(accent);
   const [isHovered, setIsHovered] = useState(false);
@@ -89,19 +109,11 @@ export default function StatCard({
   const [showOnlineModal, setShowOnlineModal] = useState(false);
 
   const isOnlineUsersCard = title === 'Usuários Online' || title === 'Usuários online';
+  const canTerminateSessions = ['admin', 'gestor_qualidade'].includes(user?.role || '');
 
-  const displayedOnlineUsers = isCustomizing
-    ? [
-        { id: user?.id || 'mock-admin', name: user?.name || 'Marcos Freitas', role: user?.role || 'admin' },
-        { id: 'mock-2', name: 'Ana Silva', role: 'gestor_qualidade' },
-        { id: 'mock-3', name: 'Bruno Costa', role: 'suporte' },
-        { id: 'mock-4', name: 'Clara Santos', role: 'qualidade' },
-        { id: 'mock-5', name: 'Diego Oliveira', role: 'gestor_suporte' },
-        { id: 'mock-6', name: 'Elena Souza', role: 'suporte' },
-        { id: 'mock-7', name: 'Felipe Rocha', role: 'suporte' },
-        { id: 'mock-8', name: 'Gabriela Lima', role: 'suporte' }
-      ]
-    : onlineUsers;
+  // Presença nunca usa dados ilustrativos, nem durante a personalização do
+  // dashboard: este card é um indicador operacional, não decorativo.
+  const displayedOnlineUsers = onlineUsers;
   const canEdit = isCustomizing && !isOnlineUsersCard;
   const isEditable = (typeof sub === 'string' || sub === undefined || sub === null) && !isOnlineUsersCard;
   
@@ -161,6 +173,16 @@ export default function StatCard({
     }
   };
 
+  const handleTerminateSession = async (target: User) => {
+    if (!terminateSession) return;
+    try {
+      await terminateSession(target.id);
+      toast.success(`Sessão de ${target.name} encerrada.`);
+    } catch (error: any) {
+      toast.error(error?.message || 'Não foi possível encerrar a sessão.');
+    }
+  };
+
   if (isEditing) {
     return (
       <Card padding="none" className="px-5 py-4 flex flex-col justify-between min-h-[135px] border-brand-accent/50 bg-surface-card shadow-lg animate-fade-in relative z-50">
@@ -211,7 +233,7 @@ export default function StatCard({
 
   return (
     <>
-      <Card onClick={onClick} padding="none" className="px-5 py-4 flex flex-col justify-between min-h-[100px] relative z-10 hover:z-30 transition-all duration-200">
+      <Card onClick={onClick} padding="none" className={`px-5 py-4 flex flex-col justify-between min-h-[100px] relative z-10 hover:z-30 transition-all duration-200 ${onClick ? 'cursor-pointer active:scale-[0.99]' : ''}`}>
         <div className="flex items-center gap-3 mb-3 min-w-0">
         <div
           onClick={canEdit ? handleEditClick : undefined}
@@ -227,7 +249,7 @@ export default function StatCard({
         >
           {clonedIcon}
           <AnimatePresence>
-            {isHovered && tooltipText && (
+            {isHovered && (tooltipText || resolvedMethodology) && (
               <m.div
                 id={`tooltip-${myUniqueId}`}
                 role="tooltip"
@@ -235,18 +257,31 @@ export default function StatCard({
                 animate={{ opacity: 1, y: 0, scale: 1 }}
                 exit={{ opacity: 0, y: -8, scale: 0.95 }}
                 transition={{ duration: 0.12, ease: 'easeOut' }}
-                className="absolute top-full left-0 mt-2 z-50 whitespace-nowrap bg-slate-900 text-white dark:bg-slate-50 dark:text-slate-900 text-[10px] font-semibold px-2.5 py-1.5 rounded-lg shadow-xl shadow-slate-900/10 border border-slate-800/10 dark:border-slate-200/10 pointer-events-none"
+                className="absolute top-full left-0 mt-2 z-50 min-w-[200px] max-w-xs bg-slate-900 text-white dark:bg-slate-50 dark:text-slate-900 text-[10px] font-semibold px-2.5 py-1.5 rounded-lg shadow-xl shadow-slate-900/10 border border-slate-800/10 dark:border-slate-200/10 pointer-events-none"
               >
-                {tooltipText}{canEdit ? " (Clique para editar)" : ""}
+                {tooltipText && <div>{tooltipText}{canEdit ? " (Clique para editar)" : ""}</div>}
+                {resolvedMethodology && (
+                  <div className="text-[9px] text-slate-300 dark:text-slate-600 font-normal mt-1 pt-1 border-t border-white/10 dark:border-black/10">
+                    <span className="font-semibold text-brand-accent">Cálculo:</span> {resolvedMethodology}
+                  </div>
+                )}
                 <div className="absolute -top-1 left-4 w-2 h-2 bg-slate-900 dark:bg-slate-50 rotate-45" />
               </m.div>
             )}
           </AnimatePresence>
           </div>
-          <div className="min-w-0 flex-1">
-            <span className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider whitespace-normal leading-snug block">
+          <div className="min-w-0 flex-1 flex items-center justify-between gap-1.5">
+            <span className="text-sm font-bold text-brand-primary tracking-normal whitespace-normal leading-snug block">
               {title}
             </span>
+            {resolvedMethodology && !onClick && (
+              <span 
+                className="text-brand-muted hover:text-brand-primary opacity-60 hover:opacity-100 transition-opacity flex-shrink-0 cursor-help"
+                title={`Cálculo: ${resolvedMethodology}`}
+              >
+                <Info className="w-3.5 h-3.5" />
+              </span>
+            )}
           </div>
         </div>
         <div className="flex items-center gap-2 mt-auto">
@@ -255,13 +290,28 @@ export default function StatCard({
               e.stopPropagation();
               setShowOnlineModal(true);
             } : undefined}
-            className={`text-3xl font-black leading-none ${valueColorClass || 'text-slate-900 dark:text-slate-50'} ${
+            className={`text-3xl font-bold leading-none tracking-tight tabular-nums font-mono ${valueColorClass || 'text-brand-primary'} ${
               isOnlineUsersCard ? 'cursor-pointer hover:opacity-80' : ''
             }`}
           >
             {value}
           </p>
           {badge}
+          {comparisonDelta && (
+            <span
+              className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md text-[10px] font-bold shrink-0 ${
+                comparisonDelta.value > 0
+                  ? 'text-emerald-600 dark:text-emerald-400 bg-emerald-500/10'
+                  : comparisonDelta.value < 0
+                  ? 'text-rose-600 dark:text-rose-400 bg-rose-500/10'
+                  : 'text-brand-muted bg-surface-subtle'
+              }`}
+              title={comparisonDelta.label || 'Comparativo em relação ao período anterior'}
+            >
+              {comparisonDelta.value > 0 ? '↑ +' : comparisonDelta.value < 0 ? '↓ ' : '• '}
+              {comparisonDelta.value > 0 ? comparisonDelta.value : Math.abs(comparisonDelta.value)}%
+            </span>
+          )}
         </div>
       </Card>
 
@@ -331,6 +381,16 @@ export default function StatCard({
                             {label}
                           </span>
                         </div>
+                        {canTerminateSessions && user?.id !== u.id && !isCustomizing && (
+                          <button
+                            type="button"
+                            onClick={() => handleTerminateSession(u)}
+                            className="shrink-0 px-2.5 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-wide text-functional-error border border-functional-error/30 hover:bg-functional-error/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-functional-error/50 transition-colors"
+                            title={`Encerrar a sessão de ${u.name}`}
+                          >
+                            Encerrar
+                          </button>
+                        )}
                       </div>
                     );
                   })
@@ -343,3 +403,5 @@ export default function StatCard({
     </>
   );
 }
+
+export default withDashboardTile(StatCard, 'StatCard');

@@ -1,6 +1,13 @@
 import React, { useState } from 'react';
-import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from 'recharts';
+import {
+  Cell,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+} from 'recharts';
 import Card from '../../ui/Card';
+import { withDashboardTile } from '../DashboardTileLayout';
 import { PieChart as PieChartIcon } from 'lucide-react';
 import { useQualityConfig } from '../../../lib/useQualityConfig';
 import { useDashboard, useEditing } from '../DashboardContext';
@@ -28,7 +35,9 @@ interface DistributionChartProps {
   setActiveEditingId?: (id: string | null) => void;
 }
 
-export default function DistributionChart({ 
+const QUALITY_DISTRIBUTION_TITLE = 'Insatisfação — Visão da Qualidade';
+
+function DistributionChart({
   title, 
   data,
   isCustomizing = false,
@@ -107,10 +116,54 @@ export default function DistributionChart({
 
   const total = data.reduce((a, b) => a + b.value, 0);
 
+  const renderCustomLabel = ({ cx, cy, midAngle, innerRadius, outerRadius, percent }: any) => {
+    if (!percent || percent < 0.08) return null;
+    const RADIAN = Math.PI / 180;
+    const radius = innerRadius + (outerRadius - innerRadius) * 0.5;
+    const x = cx + radius * Math.cos(-midAngle * RADIAN);
+    const y = cy + radius * Math.sin(-midAngle * RADIAN);
+
+    return (
+      <text
+        x={x}
+        y={y}
+        fill="#ffffff"
+        textAnchor="middle"
+        dominantBaseline="central"
+        className="text-[9px] font-black drop-shadow-[0_1px_2px_rgba(0,0,0,0.8)] select-none pointer-events-none"
+      >
+        {`${(percent * 100).toFixed(0)}%`}
+      </text>
+    );
+  };
+
+  const renderChart = () => {
+    return (
+      <PieChart>
+        <Tooltip content={<CustomTooltip total={total} />} wrapperStyle={{ zIndex: 30 }} />
+        <Pie
+          data={data}
+          cx="50%"
+          cy="50%"
+          innerRadius={36}
+          outerRadius={54}
+          paddingAngle={3}
+          dataKey="value"
+          label={renderCustomLabel}
+          labelLine={false}
+          isAnimationActive={false} // Optimized to save CPU cycles
+        >
+          {data.map((entry, index) => (
+            <Cell key={`cell-${index}`} fill={entry.color} />
+          ))}
+        </Pie>
+      </PieChart>
+    );
+  };
 
 
   return (
-    <Card padding="lg" className="h-full flex flex-col print:shadow-none print:border print:border-slate-300 print:bg-white print:text-black print:p-4">
+    <Card padding="lg" className="@container h-full min-h-0 flex flex-col print:shadow-none print:border print:border-slate-300 print:bg-white print:text-black print:p-4">
         {isEditing ? (
           <div className="flex flex-col gap-2 mb-4 animate-fade-in print:hidden" onClick={(e) => e.stopPropagation()}>
             <span className="text-[10px] font-black uppercase tracking-widest text-brand-muted">
@@ -179,35 +232,42 @@ export default function DistributionChart({
           </div>
         )}
         {data.length > 0 ? (
-          <div className="flex-1 flex flex-col">
-            <div className="flex-1 min-h-[150px] print:h-[180px]" style={{ minWidth: 0, minHeight: 150 }}>
+          <div className="flex-1 min-h-0 flex flex-row items-center justify-between gap-2">
+            <div className="w-[120px] @min-[380px]:w-[140px] h-[160px] shrink-0 relative flex items-center justify-center">
               <ResponsiveContainer width="100%" height="100%">
-                <PieChart>
-                  <Tooltip content={<CustomTooltip total={total} />} />
-                  <Pie
-                    data={data}
-                    cx="50%"
-                    cy="50%"
-                    innerRadius={55}
-                    outerRadius={75}
-                    paddingAngle={4}
-                    dataKey="value"
-                    isAnimationActive={false} // Optimized to save CPU cycles
-                  >
-                    {data.map((entry, index) => (
-                      <Cell key={`cell-${index}`} fill={entry.color} />
-                    ))}
-                  </Pie>
-                </PieChart>
+                {renderChart()}
               </ResponsiveContainer>
+              {/* Totalizador Central no Miolo da Rosca */}
+              <div className="absolute inset-0 z-0 flex flex-col items-center justify-center pointer-events-none select-none">
+                <span className="text-base sm:text-lg font-black text-brand-primary leading-none tracking-tight">
+                  {total}
+                </span>
+                <span className="text-[8px] sm:text-[9px] font-black uppercase tracking-widest text-brand-muted mt-0.5">
+                  Total
+                </span>
+              </div>
             </div>
-            <div className="flex flex-wrap justify-center gap-x-4 gap-y-2 mt-3 pt-3 border-t border-surface-border/40 print:border-slate-300 print:mt-1 print:pt-1">
+            <div className="min-w-0 max-h-[220px] flex-1 flex flex-col justify-start gap-2 pl-2 border-l border-surface-border/40 overflow-y-auto no-scrollbar pr-1">
               {data.map((entry, index) => {
                 const percent = total > 0 ? ((entry.value / total) * 100).toFixed(1) : '0';
                 return (
-                  <div key={index} className="flex items-center gap-1.5 text-[10px] text-brand-muted font-black uppercase tracking-tight print:text-slate-800">
-                    <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: entry.color }} />
-                    {entry.name}: {entry.value} ({percent}%)
+                  <div key={index} className="flex flex-col gap-1 text-[10px] text-brand-muted font-bold tracking-tight print:text-slate-800">
+                    <div className="flex flex-wrap items-start justify-between gap-1.5">
+                      <div className="flex items-start gap-1.5 min-w-[80px] flex-1">
+                        <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ backgroundColor: entry.color }} />
+                        <span className="min-w-0 break-words uppercase font-black leading-tight" title={entry.name}>{entry.name}</span>
+                      </div>
+                      <span className="text-brand-primary whitespace-nowrap font-black shrink-0">
+                        {entry.value} ({percent}%)
+                      </span>
+                    </div>
+                    {/* Barra de Proporção Colorida */}
+                    <div className="w-full h-1 bg-surface-subtle rounded-full overflow-hidden">
+                      <div
+                        className="h-full rounded-full transition-all duration-300"
+                        style={{ width: `${percent}%`, backgroundColor: entry.color }}
+                      />
+                    </div>
                   </div>
                 );
               })}
@@ -221,3 +281,5 @@ export default function DistributionChart({
       </Card>
   );
 }
+
+export default withDashboardTile(DistributionChart, 'DistributionChart');

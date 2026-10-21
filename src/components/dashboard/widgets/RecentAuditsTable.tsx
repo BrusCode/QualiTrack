@@ -3,9 +3,12 @@ import { useDashboard } from '../DashboardContext';
 import { useQualityConfig } from '../../../lib/useQualityConfig';
 import { Monitoria, User } from '../../../types';
 import Card from '../../ui/Card';
+import { withDashboardTile } from '../DashboardTileLayout';
 import Badge from '../../ui/Badge';
+import MonitoriaIdBadge from '../../ui/MonitoriaIdBadge';
 import ActionDeadlineClock from '../../ui/ActionDeadlineClock';
-import { Clock, ClipboardList } from 'lucide-react';
+import { isChildTicketMonitoria } from '../../../lib/childTicketForm';
+import { Clock, ClipboardList, ChevronRight } from 'lucide-react';
 import { getStatusConfig } from '../../../lib/statusHelper';
 
 interface RecentAuditsTableProps {
@@ -16,7 +19,7 @@ interface RecentAuditsTableProps {
 }
 
 
-export default function RecentAuditsTable({ monitorias, users, title = 'Monitorias Recentes', isCustomizing = false }: RecentAuditsTableProps) {
+function RecentAuditsTable({ monitorias, users, title = 'Monitorias Recentes', isCustomizing = false }: RecentAuditsTableProps) {
   let dashboardContext = null;
   try {
     dashboardContext = useDashboard();
@@ -78,22 +81,36 @@ export default function RecentAuditsTable({ monitorias, users, title = 'Monitori
               <th className="sticky top-0 z-10 bg-surface-card border-b border-surface-border px-6 py-3">Status</th>
               <th className="sticky top-0 z-10 bg-surface-card border-b border-surface-border px-6 py-3">Prazo</th>
               <th className="sticky top-0 z-10 bg-surface-card border-b border-surface-border px-6 py-3">Data</th>
+              <th className="sticky top-0 z-10 bg-surface-card border-b border-surface-border px-6 py-3 text-right">Ação</th>
             </tr>
           </thead>
           <tbody>
             {displayList.map((m) => {
               const config = getStatusConfig(m.status);
               const sc = m.score || 0;
+              const child = isChildTicketMonitoria(m);
+              const childVerdict = m.child_verdict || (m.form_snapshot as { child_verdict?: 'valido' | 'invalido' } | undefined)?.child_verdict;
               const level = getLevelForScore(sc);
               return (
-                <tr key={m.id} className="border-t border-surface-border/60 hover:bg-surface-subtle/30 transition-colors">
-                  <td className="px-6 py-3.5 font-mono font-black text-[10px] text-brand-muted">#{m.display_id || m.id.slice(0,4)}</td>
+                <tr
+                  key={m.id}
+                  onClick={() => {
+                    window.dispatchEvent(
+                      new CustomEvent('qualitrack:focus_monitoria', {
+                        detail: { monitoriaId: m.id, ticketId: m.ticket_id },
+                      })
+                    );
+                  }}
+                  className="border-t border-surface-border/60 hover:bg-surface-subtle/70 transition-colors cursor-pointer group"
+                  title={`Clique para visualizar os detalhes da monitoria #${m.ticket_id}`}
+                >
+                  <td className="px-6 py-3.5"><MonitoriaIdBadge displayId={m.display_id} id={m.id} /></td>
                   <td className="px-6 py-3.5 font-mono font-black text-sm text-brand-primary">#{m.ticket_id}</td>
                   <td className="px-6 py-3.5 text-sm font-semibold text-brand-primary">{getName(m.evaluator_id)}</td>
                   <td className="px-6 py-3.5 text-sm font-medium text-brand-muted">{getName(m.evaluated_id)}</td>
                   <td className="px-6 py-3.5">
                     <span className={`inline-flex items-center px-2.5 py-1 rounded-lg text-[10px] font-black uppercase tracking-wider ${level.bgColor} ${level.color}`}>
-                      {sc.toFixed(2)}%
+                      {child ? (childVerdict === 'valido' ? 'Válido' : childVerdict === 'invalido' ? 'Inválido' : '—') : `${sc.toFixed(2)}%`}
                     </span>
                   </td>
                 <td className="px-6 py-3.5">
@@ -110,12 +127,18 @@ export default function RecentAuditsTable({ monitorias, users, title = 'Monitori
                   <td className="px-6 py-3.5 text-[10px] font-bold text-brand-muted uppercase tracking-wider">
                     {new Date(m.created_at).toLocaleDateString('pt-BR')}
                   </td>
+                  <td className="px-6 py-3.5 text-right">
+                    <span className="inline-flex items-center gap-1 text-[11px] font-bold text-brand-muted group-hover:text-brand-accent transition-colors">
+                      <span>Ver</span>
+                      <ChevronRight className="w-3.5 h-3.5 group-hover:translate-x-0.5 transition-transform" />
+                    </span>
+                  </td>
                 </tr>
               );
             })}
             {displayList.length === 0 && (
               <tr>
-                <td colSpan={8} className="px-6 py-12 text-center text-brand-muted text-xs font-bold uppercase tracking-widest">
+                <td colSpan={9} className="px-6 py-12 text-center text-brand-muted text-xs font-bold uppercase tracking-widest">
                   Nenhuma monitoria encontrada
                 </td>
               </tr>
@@ -126,3 +149,5 @@ export default function RecentAuditsTable({ monitorias, users, title = 'Monitori
     </Card>
   );
 }
+
+export default withDashboardTile(RecentAuditsTable, 'RecentAuditsTable', 'Monitorias Recentes');

@@ -1,6 +1,8 @@
 import { useState, useMemo } from 'react';
-import { EvaluationForm, Monitoria, DissatisfactionField } from '../types';
+import { ChildTicketAiEvaluation, EvaluationForm, Monitoria, DissatisfactionField } from '../types';
 import { calculateQualityScore } from '../utils/qualityMath';
+import { toTicketDateInput } from '../lib/ticketDateTime';
+import { childEvaluationFormPrefill, childFormForReevaluation, isChildFormId, shouldUseChildFormForReevaluation } from '../lib/childTicketForm';
 
 const DEFAULT_HEADER = (initialData?: Monitoria) => {
   const today = new Date().toISOString().split('T')[0];
@@ -10,14 +12,15 @@ const DEFAULT_HEADER = (initialData?: Monitoria) => {
     team_id: initialData?.team_id || '',
     ticket_id: initialData?.ticket_id || '',
     channel: (initialData?.channel as any) || 'Chat',
-    ticket_date: initialData?.ticket_date || today,
-    analysis_date: initialData?.analysis_date || today,
+    ticket_date: toTicketDateInput(initialData?.ticket_date) || today,
+    analysis_date: toTicketDateInput(initialData?.analysis_date) || today,
     satisfaction_result: (initialData?.satisfaction_result as any) || '',
     satisfaction_has_record: initialData?.satisfaction_has_record || false,
     satisfaction_record_text: initialData?.satisfaction_record_text || '',
     evaluator_note: initialData?.evaluator_note || '',
     client_contact_log: initialData?.client_contact_log || '',
     client_contact_success: initialData?.client_contact_success || false,
+    client_contact_channel: initialData?.client_contact_channel || [],
     reevaluation_justification: '',
   };
 };
@@ -27,22 +30,36 @@ export function useMonitoriaFormState(
   forms: EvaluationForm[],
   dissatisfactionFields: DissatisfactionField[]
 ) {
+  const childEvaluation = (initialData as Monitoria & { childAiEvaluation?: ChildTicketAiEvaluation } | undefined)?.childAiEvaluation;
+  const childPrefill = isChildFormId(initialData?.form_id) && !initialData?.id && childEvaluation
+    ? childEvaluationFormPrefill(childEvaluation) : undefined;
+  const reevaluationFormId = childFormForReevaluation(initialData, forms)?.id;
+  const reevalChildWithWrongForm = shouldUseChildFormForReevaluation(initialData)
+    && !!reevaluationFormId && initialData?.form_id !== reevaluationFormId;
   const [step, setStep] = useState(1);
   const [dissatisfactionAnswers, setDissatisfactionAnswers] = useState<Record<string, string[]>>(initialData?.dissatisfaction_answers || {});
-  const [header, setHeader] = useState(() => DEFAULT_HEADER(initialData));
-  const [scores, setScores] = useState<Record<string, 'SIM' | 'NAO' | 'NA'>>(initialData?.answers || {});
-  const [observations, setObservations] = useState<Record<string, string>>(initialData?.question_observations || {});
-  const [criticalErrorObservations, setCriticalErrorObservations] = useState<Record<string, string>>(initialData?.critical_error_observations || {});
+  const [header, setHeader] = useState(() => ({
+    ...DEFAULT_HEADER(initialData),
+    ...(childPrefill && !initialData?.evaluator_note ? { evaluator_note: childPrefill.evaluator_note } : {}),
+    ...(reevaluationFormId ? { form_id: reevaluationFormId } : {}),
+  }));
+  const [scores, setScores] = useState<Record<string, 'SIM' | 'NAO' | 'NA'>>(
+    reevalChildWithWrongForm ? {} : { ...childPrefill?.answers, ...initialData?.answers });
+  const [observations, setObservations] = useState<Record<string, string>>(
+    reevalChildWithWrongForm ? {} : { ...childPrefill?.question_observations, ...initialData?.question_observations });
+  const [criticalErrorObservations, setCriticalErrorObservations] = useState<Record<string, string>>(
+    reevalChildWithWrongForm ? {} : initialData?.critical_error_observations || {});
   const [criticalErrors, setCriticalErrors] = useState<Record<string, boolean>>(
-    (initialData?.selected_critical_errors || []).reduce((acc: any, id: string) => ({ ...acc, [id]: true }), {})
+    (reevalChildWithWrongForm ? [] : initialData?.selected_critical_errors || [])
+      .reduce((acc: Record<string, boolean>, id: string) => ({ ...acc, [id]: true }), {})
   );
 
   const selectedForm = useMemo(() => {
-    if (initialData?.form_snapshot) return initialData.form_snapshot;
+    if (initialData?.form_snapshot && initialData.form_id === header.form_id) return initialData.form_snapshot;
     return forms.find(f => f.id === header.form_id);
   }, [initialData, forms, header.form_id]);
 
-  const score = calculateQualityScore(selectedForm, scores, criticalErrors);
+  const score = isChildFormId(selectedForm?.id) ? 0 : calculateQualityScore(selectedForm, scores);
 
   const clientFieldsToShow = useMemo(() => {
     return dissatisfactionFields.filter(f =>

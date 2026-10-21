@@ -1,17 +1,19 @@
+import { publicApiKey, secretApiKey } from '../_shared/keys.ts';
+import { corsFor, rejectRequest, configuredOrigin } from '../_shared/http.ts';
+import { emailRecipientAllowed, canManageIdentity } from '../_shared/email-policy.ts';
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.108.2'
 import { z } from "https://deno.land/x/zod@v3.22.4/mod.ts"
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': Deno.env.get('FRONTEND_URL') || '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-}
+const corsHeaders = corsFor(Deno.env.get('FRONTEND_URL'));
+
 
 const InviteSchema = z.object({
   email: z.string().email(),
   name: z.string().min(1),
   role: z.enum(['admin', 'gestor_qualidade', 'qualidade', 'gestor_suporte', 'suporte']).optional(),
-  team_ids: z.array(z.string().uuid()).optional()
+  team_ids: z.array(z.string().uuid()).optional(),
+  primary_team_id: z.string().uuid().nullable().optional()
 })
 
 // Rate limiting store (in-memory, resets on cold start)
@@ -61,6 +63,8 @@ async function syncUserTeams(supabaseAdmin: any, userId: string, teamIds: string
 }
 
 serve(async (req) => {
+  const rejected = rejectRequest(req, corsHeaders);
+  if (rejected) return rejected;
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders })
   }
@@ -99,22 +103,26 @@ serve(async (req) => {
 
     const supabaseClient = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_ANON_KEY') ?? '',
+      publicApiKey(),
       { global: { headers: { Authorization: authHeader } } }
     )
 
-    const { data: { user }, error: userError } = await supabaseClient.auth.getUser()
+    const { data: { user }, error: userError } = await supabaseClient.auth.getUser(authHeader.replace(/^Bearer\s+/i, ''))
 
     if (userError || !user) {
-      return new Response(JSON.stringify({ success: false, error: 'Unauthorized', details: userError }), {
+      return new Response(JSON.stringify({ success: false, error: 'Sessão inválida ou expirada.' }), {
         status: 401,
         headers: { ...corsHeaders, ...rateLimitHeaders, 'Content-Type': 'application/json' },
       })
     }
 
-    const { data: adminUser } = await supabaseClient.from('users').select('role').eq('id', user.id).single()
-    if (!adminUser || !['admin', 'gestor_qualidade', 'gestor_suporte'].includes(adminUser.role)) {
-      return new Response(JSON.stringify({ success: false, error: 'Forbidden: Admins only. User role is: ' + (adminUser?.role || 'none') }), {
+    // gestor_suporte foi removido da lista: a interface restringe o painel
+    // administrativo a role === 'admin' (App.tsx), entao ele nunca convida
+    // usuarios pela tela — mas podia chamar esta funcao direto e criar uma
+    // conta com role 'admin', escalando privilegio.
+    const { data: adminUser } = await supabaseClient.from('users').select('role, active').eq('id', user.id).single()
+    if (!adminUser || !adminUser.active || !['admin', 'gestor_qualidade'].includes(adminUser.role)) {
+      return new Response(JSON.stringify({ success: false, error: 'Sem permissão para convidar usuários.' }), {
         status: 403,
         headers: { ...corsHeaders, ...rateLimitHeaders, 'Content-Type': 'application/json' },
       })
@@ -133,36 +141,70 @@ serve(async (req) => {
       )
     }
 
-    const { email, name, role, team_ids } = result.data
+    const { email, name, role, team_ids, primary_team_id } = result.data
+    if (primary_team_id && !team_ids?.includes(primary_team_id)) {
+      return new Response(JSON.stringify({ success: false, error: 'A equipe principal deve estar entre as equipes selecionadas.' }), {
+        status: 400,
+        headers: { ...corsHeaders, ...rateLimitHeaders, 'Content-Type': 'application/json' },
+      })
+    }
+    if (!emailRecipientAllowed(email.toLowerCase(), Deno.env.get('EMAIL_ALLOWED_RECIPIENTS'))) {
+      return new Response(JSON.stringify({ success: false, error: 'Envio não habilitado para este destinatário no ambiente.' }), {
+        status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      })
+    }
+
+    // Defesa em profundidade: o papel vem do cliente e o InviteSchema aceita
+    // 'admin'. Sem esta checagem, um gestor_qualidade poderia criar uma conta
+    // administrativa. Conceder 'admin' fica restrito a quem ja e admin.
+    if (role === 'admin' && adminUser.role !== 'admin') {
+      return new Response(JSON.stringify({ success: false, error: 'Forbidden: apenas administradores podem conceder o papel admin' }), {
+        status: 403,
+        headers: { ...corsHeaders, ...rateLimitHeaders, 'Content-Type': 'application/json' },
+      })
+    }
 
     const supabaseAdmin = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+      secretApiKey()
     )
 
     const userPayload = {
       name: name,
       role: role || 'suporte',
       active: true,
-      must_change_password: true
+      must_change_password: true,
+      ...(primary_team_id !== undefined ? { primary_team_id } : {}),
     }
 
     const { data: existingUser, error: searchError } = await supabaseAdmin
       .from('users')
-      .select('id, active')
+      .select('id, active, role, is_provisional')
       .eq('email', email.toLowerCase())
       .maybeSingle()
 
     if (searchError) {
-      console.warn('Search User Error (non-fatal):', searchError)
+      throw new Error('Não foi possível verificar a identidade existente')
     }
 
-    if (existingUser) {
+    if (existingUser && !canManageIdentity(adminUser.role, existingUser.role)) {
+      return new Response(JSON.stringify({ success: false, error: 'Apenas administradores podem alterar outro administrador.' }), {
+        status: 403, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      })
+    }
+    const limit = await supabaseAdmin.rpc('consume_security_rate_limit', { bucket_key: `invite-user:${user.id}`, max_requests: 10, window_seconds: 900 });
+    if (limit.error || !limit.data) {
+      return new Response(JSON.stringify({ success: false, error: limit.error ? 'Serviço indisponível' : 'Limite de convites atingido' }), {
+        status: limit.error ? 503 : 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      })
+    }
+
+    if (existingUser && !existingUser.is_provisional) {
       const { error: dbError } = await supabaseAdmin.from('users').update(userPayload).eq('id', existingUser.id)
 
       if (dbError) {
         console.error('DB Update Error for existing user:', dbError)
-        return new Response(JSON.stringify({ success: false, error: 'Failed to update existing user in public users table', details: dbError }), {
+        return new Response(JSON.stringify({ success: false, error: 'Não foi possível atualizar o cadastro.' }), {
           status: 500,
           headers: { ...corsHeaders, ...rateLimitHeaders, 'Content-Type': 'application/json' },
         })
@@ -170,14 +212,14 @@ serve(async (req) => {
 
       await syncUserTeams(supabaseAdmin, existingUser.id, team_ids || [])
 
-      const origin = req.headers.get('Origin') || Deno.env.get('FRONTEND_URL') || 'http://localhost:3000'
+      const origin = configuredOrigin(Deno.env.get('FRONTEND_URL'))
       const { error: resetError } = await supabaseAdmin.auth.resetPasswordForEmail(email.toLowerCase(), {
         redirectTo: origin
       })
 
       if (resetError) {
         console.error('Reset Password Error:', resetError)
-        return new Response(JSON.stringify({ success: false, error: 'Failed to send password reset email to existing user', details: resetError }), {
+        return new Response(JSON.stringify({ success: false, error: 'Não foi possível enviar o e-mail de recuperação.' }), {
           status: 500,
           headers: { ...corsHeaders, ...rateLimitHeaders, 'Content-Type': 'application/json' },
         })
@@ -188,8 +230,17 @@ serve(async (req) => {
       })
     }
 
+    // redirectTo é obrigatório aqui: sem ele o Supabase usa o Site URL do
+    // projeto, que vem como http://localhost:3000 por padrão — o convidado
+    // recebia um link para localhost e não conseguia criar a senha. O caminho
+    // de usuário já existente (resetPasswordForEmail acima) já fazia isso.
+    // Observação: o Supabase valida este valor contra a lista de Redirect URLs
+    // do projeto; se a URL não estiver liberada lá, ele cai no Site URL de
+    // qualquer forma. Configurar ambos no painel continua sendo necessário.
+    const inviteOrigin = configuredOrigin(Deno.env.get('FRONTEND_URL'))
     const { data: authData, error: inviteError } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
-      data: { name }
+      data: { name },
+      redirectTo: inviteOrigin
     })
 
     if (inviteError) {
@@ -207,7 +258,7 @@ serve(async (req) => {
 
           if (dbError) {
             console.error('DB Upsert Fallback Error:', dbError)
-            return new Response(JSON.stringify({ success: false, error: 'Failed to save to public users table in fallback', details: dbError }), {
+            return new Response(JSON.stringify({ success: false, error: 'Não foi possível salvar o cadastro.' }), {
               status: 500,
               headers: { ...corsHeaders, ...rateLimitHeaders, 'Content-Type': 'application/json' },
             })
@@ -215,14 +266,14 @@ serve(async (req) => {
 
           await syncUserTeams(supabaseAdmin, foundUser.id, team_ids || [])
 
-          const origin = req.headers.get('Origin') || Deno.env.get('FRONTEND_URL') || 'http://localhost:3000'
+          const origin = configuredOrigin(Deno.env.get('FRONTEND_URL'))
           const { error: resetError } = await supabaseAdmin.auth.resetPasswordForEmail(email.toLowerCase(), {
             redirectTo: origin
           })
 
           if (resetError) {
             console.error('Reset Password Fallback Error:', resetError)
-            return new Response(JSON.stringify({ success: false, error: 'Failed to send password reset email in fallback', details: resetError }), {
+            return new Response(JSON.stringify({ success: false, error: 'Não foi possível enviar o e-mail de recuperação.' }), {
               status: 500,
               headers: { ...corsHeaders, ...rateLimitHeaders, 'Content-Type': 'application/json' },
             })
@@ -235,7 +286,7 @@ serve(async (req) => {
       }
 
       console.error('Invite Error:', inviteError)
-      return new Response(JSON.stringify({ success: false, error: 'Failed to invite user via Auth', details: inviteError }), {
+      return new Response(JSON.stringify({ success: false, error: 'Não foi possível enviar o convite.' }), {
         status: 500,
         headers: { ...corsHeaders, ...rateLimitHeaders, 'Content-Type': 'application/json' },
       })
@@ -250,7 +301,7 @@ serve(async (req) => {
 
     if (dbError) {
       console.error('DB Insert Error:', dbError)
-      return new Response(JSON.stringify({ success: false, error: 'Failed to save to public users table', details: dbError }), {
+      return new Response(JSON.stringify({ success: false, error: 'Não foi possível salvar o cadastro.' }), {
         status: 500,
         headers: { ...corsHeaders, ...rateLimitHeaders, 'Content-Type': 'application/json' },
       })
@@ -264,9 +315,9 @@ serve(async (req) => {
 
   } catch (error) {
     console.error('Catch Error:', error)
-    return new Response(JSON.stringify({ success: false, error: 'Internal Server Error', message: error.message }), {
+    return new Response(JSON.stringify({ success: false, error: 'Não foi possível processar o convite.' }), {
       status: 500,
-      headers: { ...corsHeaders, ...rateLimitHeaders, 'Content-Type': 'application/json' },
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     })
   }
 })

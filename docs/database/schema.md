@@ -2,7 +2,7 @@
 
 ## Visão Geral
 
-O banco de dados é **PostgreSQL** gerenciado pelo **Supabase**. O schema utiliza `public` para tabelas de aplicação e `auth` para autenticação (gerenciado pelo Supabase). Total: **11 tabelas** no schema `public`.
+O banco de dados é **PostgreSQL** gerenciado pelo **Supabase**. O schema utiliza `public` para tabelas de aplicação e `auth` para autenticação (gerenciado pelo Supabase). Total: **12 tabelas** no schema `public`.
 
 ## Diagrama ER
 
@@ -14,6 +14,10 @@ erDiagram
     FORMS ||--o{ MONITORIAS : "form_id"
     USERS }o--o{ TEAMS : "user_teams (N:N)"
     USERS ||--o| TEAMS : "primary_team_id"
+    USERS ||--o{ AGENT_FEEDBACKS : "agent_id"
+    USERS ||--o{ AGENT_FEEDBACKS : "manager_id"
+    TEAMS ||--o{ AGENT_FEEDBACKS : "team_id"
+    MONITORIAS ||--o{ AGENT_FEEDBACKS : "monitoria_id"
 
     USERS {
         uuid id PK
@@ -133,7 +137,12 @@ erDiagram
 | `primary_team_id` | UUID | FK → teams | ID da equipe principal do usuário (único badge renderizado por padrão) |
 | `active` | BOOLEAN | `true` | Soft-delete |
 | `must_change_password` | BOOLEAN | `false` | Flag para forçar troca de senha |
+| `external_id` | TEXT | — | ID do agente na plataforma de origem (ex.: id do agente no Zendesk) |
+| `source_system` | TEXT | — | Sistema de origem do vínculo (ex.: `'zendesk'`, `'manual'`) |
+| `is_provisional` | BOOLEAN | `false` | `true` = conta criada automaticamente pela triagem, sem onboarding formal ainda |
 | `created_at` | TIMESTAMPTZ | `now()` | Data de criação |
+
+> **Contas provisórias** (migration `20260825000001` + `20260825000003`): quando a triagem (`helpdesk-queue`) encontra um e-mail de agente sem conta, cria uma linha aqui com `is_provisional: true`. Ao criar a conta formal com o mesmo e-mail, o trigger `handle_new_user()` migra `monitorias`/`user_teams`/`helpdesk_submissions` da provisória para a definitiva e apaga a provisória. Ver [`docs/flows/central-de-filas.md`](../flows/central-de-filas.md#identidade-universal-de-agentes).
 
 > **Nota**: A coluna `team_ids` foi removida (migration M5). O relacionamento N:N entre usuários e equipes é feito via tabela `user_teams`. O frontend enriquece o objeto `User` com `team_ids: string[]` via `enrichUserWithTeamIds()`, mas **nunca** envia `team_ids` em payloads Supabase da tabela `users`. Use `syncUserTeams()` para sincronizar.
 >
@@ -258,6 +267,33 @@ erDiagram
 >
 > **Fallback `user_metadata`**: Na primeira leitura, se `sidebar_color` não existir no JSONB mas existir em `auth.users.user_metadata.sidebar_color`, o sistema migra automaticamente para o banco.
 
+### `public.ai_evaluation_guidelines`
+| Coluna | Tipo | Default | Descrição |
+|---|---|---|---|
+| `id` | UUID | PK, `gen_random_uuid()` | Identificador único |
+| `title` | TEXT | — | Título do manual |
+| `content` | TEXT | `''` | Texto efetivamente enviado no prompt da IA (colado ou extraído de PDF/.txt/.md/.csv no navegador) |
+| `file_name` / `file_path` | TEXT | — | Referência ao PDF original no bucket de storage `ai-guidelines` (opcional, só para download humano) |
+| `active` | BOOLEAN | `true` | Soft-delete |
+| `created_by` | UUID | FK → users | Quem cadastrou |
+| `created_at` / `updated_at` | TIMESTAMPTZ | `now()` | — |
+
+> **RLS**: leitura para admin/gestor_qualidade/qualidade/gestor_suporte (mesmo grupo que acessa a Central de Filas); escrita restrita a admin/gestor_qualidade.
+
+### `public.ai_evaluation_drafts`
+| Coluna | Tipo | Default | Descrição |
+|---|---|---|---|
+| `id` | UUID | PK, `gen_random_uuid()` | Identificador único |
+| `ticket_id` | TEXT | UNIQUE | Um rascunho por ticket; reavaliação sobrescreve |
+| `form_id` | UUID | FK → forms | — |
+| `agent_name` / `agent_email` / `agent_id` / `team_id` / `channel` / `satisfaction_comment` | — | — | Snapshot dos dados do ticket no momento da avaliação |
+| `result` | JSONB | — | `AIEvaluationResult` completo (score, summary, strengths, improvements, suggested_answers/observations/critical_errors) |
+| `guideline_ids` | UUID[] | `'{}'` | Manuais usados nessa avaliação |
+| `created_by` | UUID | FK → users | — |
+| `created_at` / `updated_at` | TIMESTAMPTZ | `now()` | — |
+
+> Apagado automaticamente quando o ticket vira monitoria de verdade. Ver [`docs/flows/central-de-filas.md`](../flows/central-de-filas.md#rascunho-de-avaliação-ai_evaluation_drafts).
+
 ## Campos Denormalizados
 
 As seguintes colunas são **denormalizadas** (duplicam dados de outras tabelas) para performance:
@@ -306,6 +342,8 @@ FROM monitorias;
 | `supabase/migrations/20260617000006_cleanup_users_table.sql` | Remove colunas legadas `password`, `reset_token`, `team_id` de `public.users`; adiciona CHECK constraint em `role` |
 | `supabase/migrations/20260617000007_cleanup_orphan_tables_columns.sql` | Remove tabela órfã `critical_criteria` (nunca usada pelo app) |
 | `supabase/migrations/20260617000008_drop_monitorias_satisfaction.sql` | Remove coluna `satisfaction` (solta) de `monitorias` — app usa `satisfaction_result`, `satisfaction_has_record`, `satisfaction_record_text` |
+| `supabase/migrations/20260926000001_create_agent_feedbacks.sql` | Cria tabela `agent_feedbacks` (1:1, PDI, ciência digital) com RLS e triggers |
+| `supabase/migrations/20260926000002_harden_feedbacks_security.sql` | Endurecimento de segurança, trigger anti-tampering e blindagem de assinaturas digitais em feedbacks |
 
 ## RLS por Tabela
 
@@ -320,3 +358,4 @@ FROM monitorias;
 | `access_requests` | Admin, gestores | Anônimo (com field validation: name/email NOT NULL) | Admin, gestores | Admin |
 | `dissatisfaction_fields` | Todos autenticados | Admin, gestor_qualidade | Admin, gestor_qualidade | Admin, gestor_qualidade |
 | `user_preferences` | Próprio usuário (`user_id = auth.uid()`) | Próprio usuário | Próprio usuário | Próprio usuário |
+| `agent_feedbacks` | RBAC por role (atendente apenas os seus; gestores por equipe; admin/qualidade todos) | Admin, gestores | Admin, gestores (status/conclusão) e atendente (ciência e notas) | Admin, gestores |

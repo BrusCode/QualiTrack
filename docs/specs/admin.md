@@ -1,7 +1,7 @@
 # SPEC: Módulo Admin
 
 ## Arquivo Principal
-- `src/components/AdminPanel.tsx` (222 linhas, 6 sub-tabs)
+- `src/components/AdminPanel.tsx` (10 subabas)
 
 ## Sub-módulos (Tabs Internas)
 
@@ -11,8 +11,12 @@
 | 2 | `teams` | Equipes | `Shield` | `TeamsManagement` |
 | 3 | `forms` | Formulários | `ClipboardList` | `FormsManagement` |
 | 4 | `requests` | Solicitações | `UserPlus` | `RequestsManagement` |
-| 5 | `qualidade` | Configurações | `BarChart3` | `QualityConfigManagement` |
-| 6 | `campos_extras` | Campos Extras | `Sliders` | `DissatisfactionFieldsManagement` |
+| 5 | `operacao` | Operação | `Calendar` | `QualityConfigManagement` |
+| 6 | `metas` | Metas | `Target` | `QualityConfigManagement` |
+| 7 | `campos_extras` | Campos Extras | `Sliders` | `DissatisfactionFieldsManagement` |
+| 8 | `ia_hub` | Inteligência Artificial | `Brain` | `AIHubManagement` |
+| 9 | `emails` | E-mails & Disparos | `Mail` | `EmailConfigManagement` |
+| 10 | `removed_monitorias` | Monitorias removidas | `RotateCcw` | `RemovedMonitoriasManagement` |
 
 > Tab bar: pill buttons em `bg-surface-card` container com `rounded-2xl`. Conteúdo: `AnimatePresence mode="wait"` + `motion.div` (fade + y-slide, 0.2s).
 
@@ -42,9 +46,12 @@
 - Reativação e desativação via `supabase.from('users').update()`
 
 ### Reset de Senha
-- `handleResetPassword` chama `supabase.auth.resetPasswordForEmail()`
+- O administrador confirma o destinatário em um modal com Turnstile antes do envio. `handleResetPassword` passa o `captchaToken` a `supabase.auth.resetPasswordForEmail()`, exigido pela configuração de Auth em produção. O modal mostra erros específicos para CAPTCHA, limite temporário e SMTP.
 
 ## Gestão de Equipes (`TeamsManagement.tsx`)
+
+O modelo atual distingue equipes de pessoas e grupos de tickets do Zendesk. Veja [Equipes e grupos de tickets](equipes-e-grupos.md) para regras de vínculo, conversão de cadastros antigos e visibilidade de gestores.
+O painel de Equipes possui abas internas **Equipes** e **Grupos do Zendesk**.
 
 ### Modelo
 ```typescript
@@ -55,10 +62,14 @@ interface Team {
   description?: string;
   sigla?: string;
   icon?: string;
+  kind?: 'team' | 'group';
+  zendesk_group_id?: number | null;
 }
 ```
-- CRUD simples
-- Soft-delete (toggle `active`)
+- CRUD de equipes reais; grupos sincronizados pelo ID do Zendesk
+- Vínculo N:N entre equipes e grupos via `team_groups`
+- Conversão segura de um cadastro antigo em grupo via `convert_team_to_group`
+- Soft-delete (toggle `active`) apenas após remover pessoas e grupos vinculados
 
 ## Editor de Formulários (`FormsManagement.tsx`)
 
@@ -146,6 +157,17 @@ Redireciona para `QualityConfigManagement.tsx` (ver SPEC: Quality Config).
 
 ## Permissões
 
+### Controles das avaliações automáticas
+
+Na aba **Inteligência Artificial → Automações**, admin e gestor de qualidade podem
+ligar ou desligar separadamente as filas Positivas e Chamados Filhos. Monitores de
+qualidade podem consultar o estado, sem alterá-lo. O comando usa RPC autenticada
+com checagem de papel ativo, compara o estado esperado para evitar sobrescrita entre
+operadores e registra usuário e horário da alteração. As tabelas de configuração
+continuam sem acesso direto pelo navegador. Ligar exige auditor ativo; no staging,
+o limite total de avaliações não é zerado nem contornado. Desligar interrompe novos
+jobs, preservando fila e avaliações já iniciadas. O MockDb mantém estado local.
+
 | Ação | Roles Permitidos |
 |---|---|
 | Ver Admin Panel | `admin` (Administrador) |
@@ -155,6 +177,18 @@ Redireciona para `QualityConfigManagement.tsx` (ver SPEC: Quality Config).
 | Aprovar solicitações | `admin`, `gestor_qualidade`, `gestor_suporte` |
 | Config. qualidade | `admin`, `gestor_qualidade` |
 | Campos de insatisfação | `admin`, `gestor_qualidade` |
+
+| Restaurar monitoria removida | `admin` (Administrador) |
+
+## Monitorias removidas
+
+A subaba `removed_monitorias` é exclusiva do administrador. Exibe as 50 remoções
+mais recentes e permite buscar pelo número exato do ticket. Para restaurar, o
+administrador confirma a ação e informa um motivo obrigatório. A RPC
+`restore_removed_monitoria` verifica o papel ativo no banco, impede que dois
+registros ativos usem o mesmo ticket, reativa a monitoria, registra autor e
+motivo no histórico e conclui a atribuição da fila. O prazo de ação original
+é preservado. No modo de desenvolvimento, o MockDb reproduz esse fluxo.
 
 ## Data Loading (AdminPanel)
 

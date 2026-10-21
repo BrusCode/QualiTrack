@@ -4,6 +4,28 @@
 
 QualiTrack não possui servidor backend tradicional. Toda comunicação é feita diretamente do frontend para o **Supabase** (BaaS). Operações privilegiadas são delegadas a Edge Functions (Deno).
 
+## Limites da avaliação por IA
+
+A função `helpdesk-queue` usa a sequência GLM → Gemma. `ai-targets.ts` define limites independentes: `AI_PRIMARY_TIMEOUT_MS` (60 segundos), `AI_GEMMA_TIMEOUT_MS` (40 segundos). Cada limite é compartilhado entre até duas tentativas do respectivo modelo; ao esgotá-lo, a chamada é abortada e o próximo modelo é acionado. O limite do principal não se aplica ao fallback.
+
+Secrets configurados no Supabase prevalecem sobre os defaults. Ao atualizar esses limites, publique a função e atualize os dois secrets; um valor antigo de `AI_PRIMARY_TIMEOUT_MS=30000` continuaria interrompendo o GLM aos 30 segundos. Os logs `attempts` registram o modelo, duração e motivo de cada falha para verificar o resultado em produção.
+
+## Automação de positivas
+
+### Limite de disparo das avaliações automáticas
+
+As filas de CSAT positivo e chamados filhos compartilham um limite de **um disparo de avaliação por janela móvel de 60 segundos**. A migração `20261020145122_automation_dispatch_rate_limit.sql` alterna os crons `qwp-positive-ai` (minutos pares) e `qwp-child-ai` (minutos ímpares). Antes de chamar a Edge Function, cada cron disputa a mesma linha em `_private.auto_monitoria_dispatch`. A atualização atômica impede dois disparos simultâneos e registra o último tipo e horário. As filas preservam os itens pendentes para os ciclos seguintes.
+
+Esse limite controla os **disparos automáticos agendados** de `helpdesk-queue`; não limita avaliações manuais, retentativas de jobs já iniciados ou publicações no Zendesk. Para acompanhar a saúde do fluxo, compare em janelas de 24 horas: jobs iniciados, monitorias persistidas, filas `review_required`/`blocked`, publicações `sent`/`skipped`/`failed` e tickets elegíveis ainda sem ficha. Um job concluído pode exigir revisão humana e, portanto, não implica monitoria salva ou publicada.
+
+`positive-automation.ts` captura uma página da view por execução e preserva o cursor. A tabela `positive_ai_queue` mantém o ticket, a ficha e o contexto necessário mesmo após a saída da view. As reservas no banco impedem execuções concorrentes do mesmo item. O worker privado `process_positive_ai` reutiliza a fila de retentativas existente.
+
+A conclusão de `ai_evaluation_jobs` aciona `finish_positive_ai_job`: valida respostas e erros críticos, recalcula a nota pela ficha congelada e conclui a monitoria interna a partir de 75%, sem teto mensal por agente. Notas inferiores e pendências de evidência permanecem como rascunhos para revisão. A captura e a avaliação fazem somente leituras no Zendesk.
+
+Na preparação, dados inválidos geram `PositivePreparationError` e deixam o ticket bloqueado para conferência, com `next_attempt_at='infinity'`. Falhas temporárias têm espera progressiva e no máximo cinco tentativas. Tickets `pending` têm prioridade sobre retentativas. O monitor pode usar o fluxo manual após conferir os dados; a captura periódica não reinicia esses bloqueios. Os jobs de IA já iniciados continuam sob responsabilidade da fila própria de retentativas.
+
+Para ativação por ambiente, configure o auditor em `positive_ai_config`, os secrets Zendesk/OpenRouter e, no Vault, `positive_ai_project_url`/`positive_ai_service_key` e `ai_retry_project_url`/`ai_retry_service_key`. As URLs e chaves devem pertencer ao próprio ambiente. Os agendamentos são `qwp-positive-ai` e `wp-quality-ai-retries`. `enabled=false` impede novos jobs automáticos; o limite opcional total pausa automaticamente ao atingir `max_evaluations`.
+
 ## Autenticação — Supabase Auth
 
 - **Método**: Email + Senha (`signInWithPassword`)
